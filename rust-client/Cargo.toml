@@ -1,0 +1,38 @@
+[package]
+name = "mail-core"
+version = "0.1.0"
+edition = "2021"
+description = "IMAP client core compiled to WASM (rustls in-WASM TLS over ws-tcp bridge)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+futures = "0.3"
+futures-timer = "3"
+send_wrapper = "0.6"
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+imap-proto = "0.16"
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+rustls-pki-types = { version = "1.12", features = ["web", "std"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1"
+log = "0.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[patch.crates-io]
+# wasm32-unknown-unknown support: trimmed tokio features (no net/time),
+# stop-token removed, idle timeouts via futures-timer.
+async-imap = { path = "vendor/async-imap" }

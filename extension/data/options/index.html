@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Libre Email Client :: Options Page</title>
+  <link rel="stylesheet" href="index.css">
+  <link rel="stylesheet" href="../client/theme.css">
+</head>
+<body>
+  <main>
+    <h1>Libre Email Client</h1>
+
+    <div id="tabs" role="tablist" aria-label="Options sections">
+      <button type="button" role="tab" id="tab-global" aria-controls="panel-global" aria-selected="true" tabindex="0">Global Settings</button>
+      <button type="button" role="tab" id="tab-accounts" aria-controls="panel-accounts" aria-selected="false" tabindex="-1">Accounts</button>
+      <button type="button" role="tab" id="tab-actions" aria-controls="panel-actions" aria-selected="false" tabindex="-1">Actions</button>
+      <button type="button" role="tab" id="tab-filters" aria-controls="panel-filters" aria-selected="false" tabindex="-1">Filters</button>
+    </div>
+
+    <div id="panel-global" role="tabpanel" aria-labelledby="tab-global">
+    <section id="global">
+      <fieldset>
+        <legend>WS/TCP bridge</legend>
+        <label class="check">
+          <input type="radio" name="ws-mode" id="f-ws-native" value="native" checked>
+          Built-in (uses native messaging)
+        </label>
+        <label class="check">
+          <input type="radio" name="ws-mode" id="f-ws-external" value="external">
+          External WS server
+        </label>
+        <label>Server URL
+          <input type="text" id="f-ws-url" placeholder="ws://.../token or wss://.../token" disabled>
+        </label>
+        <p class="hint">The external server must speak the ws → TCP/TLS bridge protocol. Read FAQs page for a sample server. In this mode, the extension does not require native client to operate.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Master password</legend>
+        <label>Password
+          <input type="password" id="f-master" autocomplete="new-password" placeholder="Not configured">
+        </label>
+        <p class="hint">Optional. When set, saved account passwords are stored encrypted with it; leave empty to store them in plain text. Setting, changing or removing it re-encrypts saved passwords automatically. The password itself is kept in session storage only, so it is asked for once per browser session.</p>
+        <div class="row">
+          <button type="button" id="save-master">Save Master Password</button>
+          <button type="button" id="clear-master" disabled>Remove Master Password</button>
+          <span id="master-saved" hidden>Saved</span>
+        </div>
+        <p class="hint">Removing the master password decrypts all saved account passwords back to plain text.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Debugging</legend>
+        <label class="check">
+          <input type="checkbox" id="f-mail-debug"> Debug IMAP connection
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-ws-debug"> Debug WebSocket bridge (connections + dial requests)
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-badge-debug"> Debug badge counter (log check failures to the console)
+        </label>
+        <p class="hint">Bridge debug applies when the built-in bridge (re)starts; in external mode the external server does its own logging.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Email list</legend>
+        <label>Emails per page
+          <input type="number" id="f-page-size" min="1" max="500" placeholder="50">
+        </label>
+        <p class="hint">Maximum number of emails shown in the message list before paging applies to every account. Prev/next controls appear in the list when there are more emails.</p>
+        <label class="check">
+          <input type="checkbox" id="f-flagged-top"> Show flagged conversations on top
+        </label>
+        <p class="hint">When on, starred conversations are grouped above unstarred ones; the selected sort order applies within each group.</p>
+        <label>Cache expiry
+          <select id="f-cache-policy">
+            <option value="epoch">Content-keyed (recommended)</option>
+            <option value="short">Short (15 minutes)</option>
+            <option value="keys">No time expiry (keys only)</option>
+          </select>
+        </label>
+        <p class="hint">Caches message bodies and conversation lists between sessions so reopening is instant. Content-keyed: bodies never expire (message content is immutable per mailbox epoch), cached conversation lists refresh after an hour, on any flag/move action, or when new mail arrives. Short: everything expires after 15 minutes. Keys only: no time-based expiry at all.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Badge counter</legend>
+        <label class="check">
+          <input type="checkbox" id="f-badge-enabled" checked> Enable the badge counter
+        </label>
+        <label>Check every
+          <input type="number" id="f-badge-interval" min="1" max="120" placeholder="5">
+          minutes
+        </label>
+        <label>Count only emails newer than
+          <select id="f-badge-max-age">
+            <option value="0" selected>No limit (ignore)</option>
+            <option value="15">15 minutes</option>
+            <option value="30">30 minutes</option>
+            <option value="60">1 hour</option>
+            <option value="120">2 hours</option>
+            <option value="360">6 hours</option>
+            <option value="720">12 hours</option>
+          </select>
+        </label>
+        <div class="row">
+          <button type="button" id="check-badge">Check now</button>
+          <span id="badge-status" class="hint"></span>
+        </div>
+        <p class="hint">The service worker asks every badge-enabled account for unread mail on this interval. The badge shows the combined unread total when it is not zero, and its title lists each account's count. Accounts without a usable password in this browser session are reported there but skipped.</p>
+        <p class="hint">The age limit restricts the badge to unread mail newer than the chosen window; older unread mail no longer counts. It applies to the folder mode and to search-query mode alike. When the IMAP core build lacks search support, the coarse folder fallback count cannot be age-filtered and ignores the limit.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Preferences backup</legend>
+        <div class="row">
+          <button type="button" id="export-prefs">Export preferences</button>
+          <button type="button" id="import-prefs">Import preferences</button>
+          <input type="file" id="import-file" accept=".json,application/json" hidden>
+        </div>
+        <p class="hint">Export downloads every setting stored by the extension — accounts, filters, UI preferences and action overrides — as a JSON file. Import restores such a file; you are asked whether to merge it with the current settings or replace everything. Account passwords are included only when a master password encrypts them, or when you explicitly agree to export them in plain text. Importing an export that used a different master password leaves its passwords unreadable until re-entered.</p>
+      </fieldset>
+      <div class="row">
+        <button type="button" id="save-global">Save Global Settings</button>
+        <span id="global-saved" hidden>Saved</span>
+      </div>
+    </section>
+    </div>
+
+    <div id="panel-accounts" role="tabpanel" aria-labelledby="tab-accounts" hidden>
+    <section id="accounts">
+      <select id="account-select"></select>
+      <div class="row">
+        <button type="button" id="add-account">Add account</button>
+        <button type="button" id="delete-account" disabled>Delete</button>
+      </div>
+      <p class="hint">Check "Primary account" in Edit Account to pick the primary one. Order can be changed with drag &amp; drop later.</p>
+    </section>
+
+    <section id="editor">
+      <h2>Edit Account</h2>
+      <form id="account-form">
+        <fieldset>
+          <legend>Account</legend>
+          <label>Label
+            <input type="text" id="f-label" placeholder="Work, Gmail, ...">
+          </label>
+          <label class="check">
+            <input type="checkbox" id="f-primary"> Primary account
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>IMAP</legend>
+          <label>Host
+            <input type="text" id="f-host" required placeholder="imap.example.com">
+          </label>
+          <label>Port
+            <input type="number" id="f-port" required min="1" max="65535" placeholder="993">
+          </label>
+          <label class="check">
+            <input type="checkbox" id="f-secure" checked> Use TLS/SSL (secure connection)
+          </label>
+          <label class="check">
+            <input type="checkbox" id="f-allow-self-signed"> Allow self-signed certificates
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>User</legend>
+          <label>Name
+            <input type="text" id="f-name" required autocomplete="off">
+          </label>
+          <label>Password
+            <input type="password" id="f-pass" autocomplete="new-password">
+          </label>
+          <p class="hint">Password is optional. If left empty you will be asked once per browser session. When a master password is configured it is stored encrypted.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Email</legend>
+          <label>Display mode
+            <select id="f-remote">
+              <option value="remote">Show remote content (images, fonts, ...)</option>
+              <option value="block" selected>Block remote content (no remote resources)</option>
+              <option value="text">Text-only view</option>
+            </select>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="f-badge" checked> Include this account in the badge counter
+          </label>
+          <label>Badge counts
+            <select id="f-badge-mode">
+              <option value="folder" selected>Unread in folder</option>
+              <option value="query">Unread matching search query</option>
+            </select>
+          </label>
+          <label>Folder
+            <input type="text" id="f-badge-folder" placeholder="INBOX">
+          </label>
+          <label>Search query
+            <input type="text" id="f-badge-query" placeholder="from:news@example.com or subject:invoice" disabled>
+          </label>
+          <p class="hint">Badge counter: "folder" counts unread messages in the folder; "search query" counts unread messages matching the query inside that folder (an empty query falls back to the folder's unread count).</p>
+        </fieldset>
+
+        <div class="row">
+          <button type="submit">Save This Account</button>
+          <span id="saved" hidden>Saved</span>
+        </div>
+      </form>
+    </section>
+    </div>
+
+    <div id="panel-actions" role="tabpanel" aria-labelledby="tab-actions" hidden>
+    <section id="actions">
+      <fieldset>
+        <legend>Native client</legend>
+        <p class="hint" id="native-status">Checking for the native client…</p>
+        <div class="row">
+          <button type="button" id="check-native">Check again</button>
+        </div>
+        <p class="hint">Overriding the Spam, Archive or Trash buttons needs the native messaging client (com.add0n.node) to write files on this computer. Without it the overrides stay disabled.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Spam button</legend>
+        <label class="check">
+          <input type="checkbox" id="f-spam-enabled"> Replace the default Spam action
+        </label>
+        <label>Destination directory
+          <input type="text" id="f-spam-path" placeholder="/home/user/Mail/spam or C:\Mail\spam" disabled>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-spam-delete" disabled> Delete from IMAP after saving
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Archive button</legend>
+        <label class="check">
+          <input type="checkbox" id="f-archive-enabled"> Replace the default Archive action
+        </label>
+        <label>Destination directory
+          <input type="text" id="f-archive-path" placeholder="/home/user/Mail/archive or C:\Mail\archive" disabled>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-archive-delete" disabled> Delete from IMAP after saving
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Trash button</legend>
+        <label class="check">
+          <input type="checkbox" id="f-trash-enabled"> Replace the default Trash action
+        </label>
+        <label>Destination directory
+          <input type="text" id="f-trash-path" placeholder="/home/user/Mail/trash or C:\Mail\trash" disabled>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-trash-delete" disabled> Delete from IMAP after saving
+        </label>
+      </fieldset>
+
+      <div class="row">
+        <button type="button" id="save-actions">Save Action Overrides</button>
+        <span id="actions-saved" hidden>Saved</span>
+      </div>
+      <p class="hint">When an override is enabled, the button first copies every selected email as a raw .eml file (named date-uid.eml) into the destination directory — existing files are never overwritten. Only then the server is touched: with "Delete from IMAP" checked the copied emails are deleted from the mailbox; without it a dialog asks whether to mark them \Deleted, move them to the server's normal spam/archive/trash folder, or leave them untouched. If copying fails, nothing is deleted on the server and the error is shown in the mail client.</p>
+    </section>
+    </div>
+
+    <div id="panel-filters" role="tabpanel" aria-labelledby="tab-filters" hidden>
+    <section id="filters">
+      <fieldset>
+        <legend>Scheduling</legend>
+        <p class="hint">Filters run in the extension's background worker: before every badge update and whenever the mail client opens. Each enabled filter is applied to new messages in INBOX, first match wins. When the first filter for an account is saved you are asked whether to process its existing unread mail.</p>
+        <label>Run filters now applies to
+          <select id="f-filter-scope">
+            <option value="unread" selected>All unread emails in INBOX</option>
+            <option value="new">New emails since the last run</option>
+          </select>
+        </label>
+        <p class="hint">"All unread" applies the filters to every unread message currently in INBOX — including older mail that arrived before the filters existed — without changing what the automatic runs consider new. "New" processes only the messages that arrived after the previous run. The choice affects this manual run only; the automatic runs (before every badge update and on client open) always filter new mail.</p>
+        <label><input type="checkbox" id="f-filter-skip" checked> Skip mail the filters already handled</label>
+        <p class="hint">Messages the filters acted on carry a $Filtered flag on the server, so mail you manually moved back into INBOX is left alone — the automatic runs always skip it. Uncheck to make this manual run re-evaluate everything, including mail you moved back.</p>
+        <div class="row">
+          <button type="button" id="run-filters">Run filters now</button>
+          <button type="button" id="check-native-filters">Check native client</button>
+          <span id="filters-status" class="hint">Not checked yet.</span>
+        </div>
+        <p class="hint" id="filters-native-status">Checking for the native client…</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Filters</legend>
+        <div class="row">
+          <button type="button" id="add-filter">Add filter</button>
+          <span class="hint">Order matters: filters are evaluated top to bottom and the first match wins. Drag a row to move it.</span>
+        </div>
+        <div id="filter-list"></div>
+        <p class="hint" id="filter-list-empty">No filters yet.</p>
+      </fieldset>
+
+      <fieldset id="filter-editor" hidden>
+        <legend>Edit Filter</legend>
+        <form id="filter-form">
+          <label>Account
+            <select id="ff-account"></select>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="ff-enabled" checked> Enabled
+          </label>
+          <label>Description
+            <input type="text" id="ff-description" placeholder="Optional description shown in the filter list">
+          </label>
+          <fieldset>
+            <legend>Rule</legend>
+            <label>Query
+              <textarea id="ff-query" class="ff-query" rows="4" wrap="off" spellcheck="false" autocomplete="off" placeholder='subject:"MyB :: " and not "IP Blocking"
+from:news@example.com'></textarea>
+            </label>
+            <p class="hint">Fields: <code>subject:</code> <code>from:</code> (or <code>sender:</code>) <code>to:</code> <code>body:</code> — each applies to the word or "quoted phrase" after it. A bare word matches anywhere (subject, sender, to and body). Combine terms with <code>and</code>, <code>or</code>, <code>not</code> and parentheses; <code>and</code> is implied between adjacent terms. Matching is case-insensitive "contains". Each line is a separate rule: a message is acted on when it matches any one line (lines act as OR).</p>
+            <p class="hint">Examples: <code>subject:"MyB :: " and not "IP Blocking"</code> — subject contains "MyB :: " but not "IP Blocking"; <code>(from: "DDD" or from: "FFF") and (to:"mdrov@gmail.com" or to:"qe@gmail.com")</code>. With one rule per line, a second line like <code>from:"newsletter@example.com"</code> filters that sender too — either line matching is enough. An empty query matches every new message.</p>
+          </fieldset>
+          <fieldset>
+            <legend>Action</legend>
+            <label>Do
+              <select id="ff-action">
+                <option value="move">Move to a server folder</option>
+                <option value="eml">Save as .eml to a local directory and delete from server</option>
+              </select>
+            </label>
+            <label>Destination server folder
+              <input type="text" id="ff-folder" placeholder="Newsletters, Work, ...">
+            </label>
+            <p class="hint">Use the full path for sub directories, e.g. <code>Work/Projects</code>.</p>
+            <label class="check">
+              <input type="checkbox" id="ff-create-folder"> Create the folder if it is missing
+            </label>
+            <label>Destination local directory
+              <input type="text" id="ff-dir" placeholder="/home/user/Mail/filtered or C:\Mail\filtered">
+            </label>
+            <p class="hint" id="ff-native-hint">Saving .eml files requires the native client (com.add0n.node).</p>
+          </fieldset>
+          <div class="row">
+            <button type="submit">Save Filter</button>
+            <button type="button" id="cancel-filter">Cancel</button>
+            <span id="filter-saved" hidden>Saved</span>
+          </div>
+        </form>
+      </fieldset>
+    </section>
+    </div>
+  </main>
+  <prompt-view id="prompt" hidden></prompt-view>
+  <dialog id="choice-dialog">
+    <form>
+      <p class="message" id="choice-message"></p>
+      <div class="row" id="choice-buttons"></div>
+    </form>
+  </dialog>
+  <script src="../libs/Sortable.js"></script>
+  <script type="module" src="index.mjs"></script>
+</body>
+</html>

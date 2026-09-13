@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Libre Email Client :: Setup</title>
+  <link rel="stylesheet" href="index.css">
+  <link rel="stylesheet" href="../client/theme.css">
+</head>
+<body>
+  <main>
+    <h1>Libre Email Client</h1>
+    <p class="lead" id="lead">Before the client can talk to your IMAP servers it
+    needs a network bridge. Choose how to connect — you can change this later
+    in the options page.</p>
+    <p class="progress" id="progress">Step 1 of 2 &middot; Connection mode</p>
+
+    <!-- step 1: pick the mode, nothing else -->
+    <section id="step-mode">
+      <label class="mode">
+        <input type="radio" name="setup-mode" value="native">
+        <span>
+          <strong>Native client</strong>
+          <small>The extension installs a small helper on this computer
+          (com.add0n.node) which hosts the built-in ws &rarr; TCP/TLS bridge.
+          No server to run yourself.</small>
+        </span>
+      </label>
+      <label class="mode">
+        <input type="radio" name="setup-mode" value="external">
+        <span>
+          <strong>Remote WS server</strong>
+          <small>Point the extension at a running ws &rarr; TCP/TLS bridge
+          server on your network. Nothing is installed locally.</small>
+        </span>
+      </label>
+      <div class="row">
+        <button type="button" id="next" disabled>Next</button>
+        <button type="button" id="skip">Skip for now</button>
+        <span class="hint">You can run this setup again from the options page
+        whenever the client cannot connect.</span>
+      </div>
+    </section>
+
+    <!-- step 2a: the chosen mode is a remote ws server -->
+    <section id="step-external" hidden>
+      <fieldset>
+        <legend>Remote WS server</legend>
+        <p class="hint">Enter the address of a running ws &rarr; TCP/TLS bridge
+        server. The server must speak the ws-to-tls protocol.</p>
+        <div class="row">
+          <button type="button" id="download-sample">Download sample server (Node.js)</button>
+          <span class="hint">Runs standalone on any Node.js: <code>node ws-to-tls.js --ws-port 8080</code> &mdash; paste the printed ws:// URL below.</span>
+        </div>
+        <label>Server URL
+          <input type="text" id="f-ws-url" placeholder="ws://.../token or wss://.../token">
+        </label>
+        <fieldset class="sub">
+          <legend>Test target</legend>
+          <p class="hint">The test connects to your server and asks it to dial
+          this TCP target. Any reachable host proves tunneling works; your
+          IMAP server is the best choice.</p>
+          <div class="row">
+            <label>Host
+              <input type="text" id="f-test-host" placeholder="imap.example.com">
+            </label>
+            <label>Port
+              <input type="number" id="f-test-port" min="1" max="65535" placeholder="993">
+            </label>
+          </div>
+        </fieldset>
+        <div class="row">
+          <button type="button" id="test-ws">Test &amp; Save</button>
+          <span id="ws-status" class="status"></span>
+        </div>
+      </fieldset>
+      <div class="row">
+        <button type="button" id="back-external" class="secondary">Back</button>
+      </div>
+    </section>
+
+    <!-- step 2b: the chosen mode is the native client -->
+    <section id="step-native" hidden>
+      <fieldset>
+        <legend>Native client</legend>
+        <div id="native-box">
+          <p class="hint" id="native-release">Loading the latest release&hellip;</p>
+          <div class="row">
+            <a id="native-download" class="button" href="#" download hidden>Download for <span id="native-os"></span></a>
+            <button type="button" id="check-native">I've installed it &mdash; check again</button>
+          </div>
+          <div id="native-guide">
+            <h2>Installation</h2>
+            <div id="guide-windows" hidden>
+              <ol>
+                <li>Extract the downloaded <code>windows.zip</code>.</li>
+                <li>Run <code>install.bat</code> from the extracted folder. It
+                uses your installed Node.js (>= 6) or downloads one
+                automatically, then registers the host for Chrome, Edge,
+                Firefox and friends.</li>
+                <li>Uninstall any time with <code>uninstall.bat</code>.</li>
+              </ol>
+            </div>
+            <div id="guide-linux" hidden>
+              <ol>
+                <li>Extract the downloaded <code>linux.zip</code>.</li>
+                <li>Run <code>./install.sh</code> from the extracted folder. It
+                uses your installed Node.js (>= 6) or downloads one
+                automatically, then registers the host for your browsers.
+                Optional: <code>./install.sh --custom-dir=~/Desktop/</code>.</li>
+                <li>Uninstall any time with <code>./uninstall.sh</code>.</li>
+              </ol>
+            </div>
+            <div id="guide-mac" hidden>
+              <ol>
+                <li>Extract the downloaded <code>mac.zip</code>.</li>
+                <li>Run <code>./install.sh</code> from the extracted folder. It
+                uses your installed Node.js (>= 6) or downloads one
+                automatically, then registers the host for your browsers.</li>
+                <li>Uninstall any time with <code>./uninstall.sh</code>.</li>
+              </ol>
+            </div>
+            <h2>Links</h2>
+            <p class="hint">
+              <a href="https://github.com/andy-portmen/native-client" target="_blank">Repository</a> &middot;
+              <a href="https://github.com/andy-portmen/native-client/releases" target="_blank">All releases</a> &middot;
+              <a href="https://www.youtube.com/watch?v=yZAoy8SOd7o" target="_blank">Video (Windows)</a> &middot;
+              <a href="https://www.youtube.com/watch?v=2asPoW2gJ-c" target="_blank">Video (Linux/Mac)</a>
+            </p>
+          </div>
+        </div>
+        <p class="hint" id="native-status" hidden></p>
+      </fieldset>
+      <div class="row">
+        <button type="button" id="back-native" class="secondary">Back</button>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="setup.mjs"></script>
+</body>
+</html>

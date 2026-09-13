@@ -1,0 +1,270 @@
+:root {
+  color-scheme: light dark;
+
+  --bg: light-dark(#f5f5f7, #1c1c1e);
+  --bg-light: light-dark(rgba(128, 128, 128, 0.1), rgba(128, 128, 128, 0.2));
+  --card: light-dark(#fff, #2c2c2e);
+  --border: light-dark(#d9d9de, #48484a);
+  --text: light-dark(#1d1d1f, #f2f2f7);
+  --muted: light-dark(#6e6e73, #98989d);
+  --accent: light-dark(#0a84ff, #0a84ff);
+  --ok: light-dark(#1a7f37, #30d158);
+  --danger: light-dark(#d70015, #ff453a);
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* when a reader-view theme is active (body[data-theme] in ../client/theme.css)
+   the palette follows it; the light-dark() values are the fallbacks */
+body {
+  --text: var(--fg, light-dark(#1d1d1f, #f2f2f7));
+  --muted: var(--dim, light-dark(#6e6e73, #98989d));
+  --card: var(--pane-bg, light-dark(#fff, #2c2c2e));
+  --border: var(--line, light-dark(#d9d9de, #48484a));
+  --bg-light: color-mix(in srgb, var(--dim, #808080) 15%, transparent);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+main {
+  max-width: 560px;
+  margin: 24px auto;
+  padding: 0 16px;
+}
+
+h1 {
+  font-size: 20px;
+  margin: 0 0 10px;
+  text-align: center;
+}
+
+.lead {
+  color: var(--muted);
+  margin: 0 0 6px;
+  text-align: center;
+}
+
+.progress {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  margin: 0 0 16px;
+}
+
+/* step 1: selectable mode cards */
+label.mode {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 10px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+label.mode:hover {
+  border-color: var(--accent);
+}
+
+label.mode:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--bg-light);
+}
+
+label.mode input {
+  margin: 3px 0 0;
+}
+
+label.mode small {
+  display: block;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+section {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+fieldset {
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  margin: 0 0 14px;
+  padding: 0 0 14px;
+}
+
+fieldset:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+/* nested test-target block inside option 1 */
+fieldset.sub {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 12px 0;
+  padding: 0 12px 12px;
+}
+
+legend {
+  color: var(--muted);
+  background-color: var(--bg-light);
+  font-weight: 600;
+  width: 100%;
+  padding: 5px;
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+label {
+  display: block;
+  margin-bottom: 10px;
+  color: var(--muted);
+}
+
+input[type="text"],
+input[type="number"] {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font: inherit;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* host + port side by side in the test-target block */
+fieldset.sub .row label {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+button,
+.button {
+  font: inherit;
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+
+button:hover:not(:disabled),
+.button:hover:not(:disabled) {
+  filter: brightness(0.95);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#test-ws,
+#check-native,
+#next {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.secondary {
+  color: var(--muted);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+.hint code,
+pre {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: var(--bg-light);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+pre {
+  padding: 8px 10px;
+  overflow-x: auto;
+  line-height: 1.45;
+}
+
+.status {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.status.ok {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.status.error {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+#native-status.error {
+  color: var(--danger);
+}
+
+#native-status.ok {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+#native-guide {
+  margin-top: 14px;
+}
+
+#native-guide h2 {
+  font-size: 13px;
+  margin: 14px 0 6px;
+}
+
+#native-guide ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+#native-guide li {
+  margin-bottom: 6px;
+}
