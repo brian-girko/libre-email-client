@@ -166,6 +166,7 @@ function predictedTotal(result) {
 async function badgeConfig() {
   const res = await chrome.storage.local.get({
     'badge.enabled': true,
+    'badge.idleCheck': true,
     'badge.interval': 5,
     'badge.maxAge': 0,
     accounts: []
@@ -173,6 +174,7 @@ async function badgeConfig() {
   const accounts = Array.isArray(res.accounts) ? res.accounts : [];
   return {
     enabled: res['badge.enabled'] !== false,
+    idleCheck: res['badge.idleCheck'] !== false,
     interval: Math.max(1, Number(res['badge.interval']) || 5),
     maxAge: Math.max(0, Math.round(Number(res['badge.maxAge']) || 0)),
     accounts
@@ -573,6 +575,7 @@ async function schedule(interval) {
 function relevantKeys(changes) {
   return Object.keys(changes).some(k =>
     k === 'badge.enabled' ||
+    k === 'badge.idleCheck' ||
     k === 'badge.interval' ||
     k === 'badge.maxAge' ||
     k === 'accounts' ||
@@ -627,6 +630,26 @@ chrome.alarms.onAlarm.addListener(alarm => {
     runCheck().catch(e => warnDebug('[badge] check failed', e));
   }
 });
+
+// Idle-wake trigger, beside the periodic alarm: whenever the machine turns
+// active again ("active" covers waking from idle, screen unlock and system
+// resume), run one silent badge check so the icon is fresh the moment the
+// user returns. Closed when the pref or the badge counter is disabled; the
+// runCheck() single-flight coalesces this with any check already in flight.
+if (chrome.idle?.onStateChanged) {
+  chrome.idle.onStateChanged.addListener(state => {
+    if (state !== 'active') {
+      return;
+    }
+    badgeConfig()
+      .then(cfg => {
+        if (cfg.enabled && cfg.idleCheck) {
+          runCheck().catch(e => warnDebug('[badge] idle check failed', e));
+        }
+      })
+      .catch(e => warnDebug('[badge] idle check failed', e));
+  });
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'badge-predict') {

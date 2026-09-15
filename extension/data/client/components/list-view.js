@@ -105,11 +105,16 @@ class ListView extends HTMLElement {
   #moveMessage;
   #moveTarget;
   #movePending = null;
+  #moveQueue = Promise.resolve();
   #afterSaveDialog;
   #afterSaveMessage;
   #afterSaveSub;
   #afterSaveMove;
   #afterSavePending = null;
+  #afterSaveQueue = Promise.resolve();
+  // per-message save errors (uid -> message) from a native save job; rows
+  // carrying one get a visible failure marker until the folder reloads
+  #failures = new Map();
   #busy = false;
   #pager = null;
   #pagerEl;
@@ -119,13 +124,21 @@ class ListView extends HTMLElement {
   #pageNext;
   #pageLast;
   #unreadToggle;
+  #threadToggle;
   #refreshBtn;
   #unreadOnly = false;
+  #threadMode = true;
   #actions;
   #btnsWrap;
   #searchWrap;
   #stacked = false;
   #ro;
+  #selectAll;
+  // uids of the row last toggled by a plain click; anchor for shift-click
+  // range selection
+  #lastChecked = null;
+  // shiftKey captured from the click that precedes a checkbox change event
+  #lastShift = false;
 
   constructor() {
     super();
@@ -217,6 +230,15 @@ class ListView extends HTMLElement {
           font-size: calc(12px * var(--font-scale, 1));
           min-width: calc(72px * var(--font-scale, 1));
         }
+        .all {
+          flex: none;
+          display: inline-flex;
+          align-items: center;
+        }
+        .all input {
+          margin: 0;
+          cursor: pointer;
+        }
         .btns {
           flex: 1 1 0;
           min-width: 0;
@@ -281,6 +303,13 @@ class ListView extends HTMLElement {
           stroke-linejoin: round;
         }
         .action.icon[data-action="unread-only"] svg {
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 2;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        .action.icon[data-action="thread-mode"] svg {
           fill: none;
           stroke: currentColor;
           stroke-width: 2;
@@ -358,6 +387,10 @@ class ListView extends HTMLElement {
         }
         .row.sub {
           min-height: calc(32px * var(--font-scale, 1));
+        }
+        .row.sub.failed {
+          outline: 1px solid light-dark(#b3261e, #f2b8b5);
+          outline-offset: -1px;
         }
         .row:focus {
           outline: none;
@@ -600,6 +633,9 @@ class ListView extends HTMLElement {
         }
       </style>
       <div class="actions" title="Message list — Alt+2 focus · ↑/↓ move · Space check · Enter/double-click preview · Ctrl+A select all">
+        <label class="all">
+          <input type="checkbox" aria-label="Select all messages" title="Check all; unchecked clears all. Shift-click rows to check a range." hidden>
+        </label>
         <span class="count"></span>
         <span class="btns">
           <button class="action icon" type="button" data-action="archive" accesskey="a" title="Archive (A)" aria-label="Archive"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 10C7.44772 10 7 10.4477 7 11C7 11.5523 7.44772 12 8 12H16C16.5523 12 17 11.5523 17 11C17 10.4477 16.5523 10 16 10H8Z"/><path fill-rule="evenodd" clip-rule="evenodd" d="M23 4C23 2.34315 21.6569 1 20 1H4C2.34315 1 1 2.34315 1 4V5C1 6.30622 1.83481 7.41746 3 7.82929V20C3 21.6569 4.34315 23 6 23H18C19.6569 23 21 21.6569 21 20V7.82929C22.1652 7.41746 23 6.30622 23 5V4ZM20 6H4C3.44772 6 3 5.55228 3 5V4C3 3.44772 3.44772 3 4 3H20C20.5523 3 21 3.44772 21 4V5C21 5.55228 20.5523 6 20 6ZM5 20V8H19V20C19 20.5523 18.5523 21 18 21H6C5.44772 21 5 20.5523 5 20Z"/></svg></button>
@@ -608,6 +644,7 @@ class ListView extends HTMLElement {
           <button class="action icon" type="button" data-action="move" accesskey="m" title="Move (M)" aria-label="Move"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="M 4.1139706,4.8308824 C 3.9819908,4.8308824 3.875,4.9378731 3.875,5.0698529 V 18.930147 c 0,0.131912 0.1070588,0.238971 0.2389706,0.238971 H 19.886029 c 0.13198,0 0.238971,-0.106991 0.238971,-0.238971 V 7.8772794 c 0,-0.1319798 -0.106991,-0.2389706 -0.238971,-0.2389706 H 11.78875 c -0.553658,1.677e-4 -1.071532,-0.2736219 -1.383162,-0.73125 L 9.0635294,4.9360294 C 9.0189217,4.8700335 8.9443628,4.8306033 8.8647059,4.8308824 Z M 2,4.75 C 2,3.784 2.784,3 3.75,3 h 4.971 c 0.58,0 1.12,0.286 1.447,0.765 l 1.404,2.063 c 0.04647,0.068748 0.12402,0.1099591 0.207,0.11 h 8.471 c 0.966,0 1.75,0.783 1.75,1.75 V 19.25 C 22,20.216498 21.216498,21 20.25,21 H 3.75 C 2.7835017,21 2,20.216498 2,19.25 Z"/></svg></button>
           <button class="action icon" type="button" data-action="preview" accesskey="p" title="Preview (P)" aria-label="Preview"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M 4,3 C 2.9,3 2,3.9 2,5 v 14 c 0,1.1 0.9,2 2,2 h 16 c 1.1,0 2,-0.9 2,-2 V 5 C 22,3.9 21.1,3 20,3 Z M 4,5 H 20 V 19 H 4 Z m 8,3 c -3.3,0 -6,3.3 -6,4 0,0.7 2.7,4 6,4 3.3,0 6,-3.5 6,-4 0,-0.5 -2.7,-4 -6,-4 z m 0,1.5 V 11 c 0,0.6 0.4,1 1,1 h 1.5 c 0,1.6 -1.5,2.8 -3.2,2.4 C 10.5,14.2 9.8,13.5 9.5,12.6 9.2,11 10.4,9.5 12,9.5 Z"/></svg></button>
           <button class="action icon" type="button" data-action="unread-only" accesskey="n" title="Show unread only (N)" aria-label="Show unread only" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.8874 5.17157C7.46546 4.59351 7.75449 4.30448 8.12203 4.15224C8.48957 4 8.89832 4 9.71582 4H14.326C15.1517 4 15.5646 4 15.9351 4.15505C16.3056 4.31011 16.5954 4.60419 17.175 5.19234L18.849 6.89105C19.4171 7.46745 19.7011 7.75566 19.8505 8.12024C20 8.48482 20 8.88945 20 9.69871V14.3431C20 15.1606 20 15.5694 19.8478 15.9369C19.6955 16.3045 19.4065 16.5935 18.8284 17.1716L17.1716 18.8284C16.5935 19.4065 16.3045 19.6955 15.9369 19.8478C15.5694 20 15.1606 20 14.3431 20H9.69871C8.88945 20 8.48482 20 8.12024 19.8505C7.75566 19.7011 7.46745 19.4171 6.89105 18.849L5.19235 17.175C4.60419 16.5954 4.31011 16.3056 4.15505 15.9351C4 15.5646 4 15.1517 4 14.326V9.71583C4 8.89832 4 8.48957 4.15224 8.12203C4.30448 7.75449 4.59351 7.46546 5.17157 6.8874L6.8874 5.17157Z"/><path d="M8 11L8.42229 11.2111C10.6745 12.3373 13.3255 12.3373 15.5777 11.2111L16 11"/><path d="M12 12.5V14"/><path d="M9 12L8.5 13"/><path d="M15 12L15.5 13"/></svg></button>
+          <button class="action icon" type="button" data-action="thread-mode" accesskey="r" title="Show single messages (R)" aria-label="Show single messages" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15h13.01m0 0a6 6 0 0 1-5.23-3.058l-1.06-1.884A6 6 0 0 0 4.49 7H3m13.01 8H21m0 0-3 3m3-3-3-3"/></svg></button>
           <button class="action icon" type="button" data-action="refresh" title="Refresh (fetch from server)" aria-label="Refresh list from server"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg></button>
           <combo-view label="Mark as" type="button">
             <button data-action="mark-read" accesskey="r"><u>r</u>ead</button>
@@ -670,9 +707,11 @@ class ListView extends HTMLElement {
     this.#setupButton = root.querySelector('.setup');
     this.#grid = root.querySelector('.grid');
     this.#count = root.querySelector('.count');
+    this.#selectAll = root.querySelector('.all input');
     this.#note = root.querySelector('.note');
-    this.#buttons = [...root.querySelectorAll('[data-action]')].filter(button => button.dataset.action !== 'unread-only' && button.dataset.action !== 'refresh');
+    this.#buttons = [...root.querySelectorAll('[data-action]')].filter(button => button.dataset.action !== 'unread-only' && button.dataset.action !== 'thread-mode' && button.dataset.action !== 'refresh');
     this.#unreadToggle = root.querySelector('[data-action="unread-only"]');
+    this.#threadToggle = root.querySelector('[data-action="thread-mode"]');
     this.#refreshBtn = root.querySelector('[data-action="refresh"]');
     this.#filter = root.querySelector('.filter');
     this.#clearFilter = root.querySelector('.clear-filter');
@@ -732,6 +771,10 @@ class ListView extends HTMLElement {
     // view toggle: independent of the selection, always clickable
     this.#unreadToggle.addEventListener('click', () => {
       this.unreadOnly = !this.#unreadOnly;
+    });
+    // thread-mode toggle: independent of the selection, always clickable
+    this.#threadToggle.addEventListener('click', () => {
+      this.threadMode = !this.#threadMode;
     });
     // refresh: independent of the selection, always clickable
     this.#refreshBtn.addEventListener('click', () => {
@@ -812,6 +855,11 @@ class ListView extends HTMLElement {
         this.#settleAfterSave(null);
       }
     });
+    // global select-all: on when anything is checked and not everything is,
+    // on-click clears; when nothing is checked, on-click checks all visible
+    this.#selectAll.addEventListener('change', () => {
+      this.#toggleAll();
+    });
     this.addEventListener('keydown', e => {
       // typing in the filter box is text editing, not list navigation; the
       // native select owns its own arrow/type-ahead keys
@@ -853,10 +901,65 @@ class ListView extends HTMLElement {
     this.#ro.disconnect();
   }
 
+  // When on (default), conversations are grouped into thread rows; when off,
+  // every message renders as its own flat single-message row. Persistence is
+  // the host's job via the "thread-changed" event.
+  get threadMode() {
+    return this.#threadMode;
+  }
+
+  set threadMode(on) {
+    const next = !!on;
+    this.#threadToggle.setAttribute('aria-pressed', String(next));
+    if (this.#threadMode === next) {
+      return;
+    }
+    this.#threadMode = next;
+    this.#render();
+    this.dispatchEvent(new CustomEvent('thread-changed', {
+      detail: {on: next},
+      bubbles: true,
+      composed: true
+    }));
+  }
+
+  // Map server threads into the rows the view builds on. Thread mode keeps
+  // them as-is; flat mode reshapes each thread into one pseudo-row per
+  // message (single-message "conversation"), so all selection, action,
+  // filter and rollback logic below works unchanged on both shapes.
+  #flatten(rows) {
+    if (this.#threadMode) {
+      return rows;
+    }
+    const out = [];
+    for (const thread of Array.isArray(rows) ? rows : []) {
+      const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+      if (!messages.length) {
+        out.push(thread);
+        continue;
+      }
+      for (const item of messages) {
+        const flags = Array.isArray(item.flags) ? item.flags.map(String) : [];
+        out.push({
+          uids: [Number(item.uid)],
+          messages: [item],
+          count: 1,
+          unread: flags.includes('\\Seen') ? 0 : 1,
+          flagged: flags.includes('\\Flagged'),
+          subject: item.subject || thread.subject || '',
+          from: item.from || thread.from || '',
+          date: item.date || thread.date || ''
+        });
+      }
+    }
+    return out;
+  }
+
   build(rows) {
-    this.#rows = Array.isArray(rows) ? rows : [];
+    this.#rows = this.#flatten(rows);
     this.#selected = new Set();
     this.#expanded = new Set();
+    this.#lastChecked = null;
     this.#mode = 'ready';
     this.#message = '';
     this.busy(false);
@@ -888,7 +991,7 @@ class ListView extends HTMLElement {
     this.#selected = new Set([...this.#selected].filter(uid => present.has(Number(uid))));
     const keys = new Set(next.map(thread => thread.uids[0]));
     this.#expanded = new Set([...this.#expanded].filter(key => keys.has(key)));
-    this.#rows = next;
+    this.#rows = this.#flatten(next);
     this.#mode = 'ready';
     this.#message = '';
     const scrollTop = this.scrollTop;
@@ -969,12 +1072,14 @@ class ListView extends HTMLElement {
   // \NoSelect cannot receive mail and are omitted; the current folder is
   // disabled (moving onto itself would lose mail).
   askDestination(dirs, {current = null, count = 0} = {}) {
-    return new Promise(resolve => {
+    // prompts from concurrent jobs queue up instead of resolving null
+    const turn = this.#moveQueue.then(() => new Promise(resolve => {
+      let list;
       if (this.#movePending) {
         resolve(null);
         return;
       }
-      const list = (Array.isArray(dirs) ? dirs : [])
+      list = (Array.isArray(dirs) ? dirs : [])
         .filter(d => d && d.name && !hasFlag(d.attrs, '\\NoSelect'))
         .sort((a, b) => String(a.name).localeCompare(String(b.name)));
       if (!list.length) {
@@ -998,7 +1103,9 @@ class ListView extends HTMLElement {
       this.#movePending = resolve;
       this.#moveDialog.showModal();
       this.#moveTarget.focus();
-    });
+    }));
+    this.#moveQueue = turn.then(() => {}, () => {});
+    return turn;
   }
 
   #settleMove(result) {
@@ -1020,7 +1127,8 @@ class ListView extends HTMLElement {
   // 'move' (normal move to the server's special folder) or null when
   // dismissed; the copies on disk stay untouched either way.
   askAfterSave(count, label) {
-    return new Promise(resolve => {
+    // prompts from concurrent save jobs queue up instead of resolving null
+    const turn = this.#afterSaveQueue.then(() => new Promise(resolve => {
       if (this.#afterSavePending) {
         resolve(null);
         return;
@@ -1033,7 +1141,9 @@ class ListView extends HTMLElement {
       this.#afterSavePending = resolve;
       this.#afterSaveDialog.showModal();
       this.#afterSaveMove.focus();
-    });
+    }));
+    this.#afterSaveQueue = turn.then(() => {}, () => {});
+    return turn;
   }
 
   #settleAfterSave(result) {
@@ -1052,6 +1162,7 @@ class ListView extends HTMLElement {
   loading(message = 'Loading emails...') {
     this.#mode = 'loading';
     this.#message = String(message);
+    this.#failures.clear();
     this.#render();
     this.#clearFilter.hidden = !this.#filter.value;
   }
@@ -1312,6 +1423,41 @@ class ListView extends HTMLElement {
     return thread;
   }
 
+  // Mark rows whose native save failed: the message stays on the server, so
+  // the row is restored (or already present) and tagged with the reason.
+  markRowError(uids, message) {
+    const wanted = (Array.isArray(uids) ? uids : []).map(Number);
+    let visible = false;
+    for (const uid of wanted) {
+      this.#failures.set(uid, String(message ?? 'save failed'));
+      const row = this.#grid.querySelector('.row.sub[data-uid="' + uid + '"]');
+      if (row) {
+        this.#applyFailure(row, uid, false);
+      }
+    }
+    // rows may be hidden (collapsed thread, unseen-only view): rebuild and
+    // #msgRow re-applies the stored marker
+    if (this.#mode === 'ready' && wanted.some(uid =>
+      !this.#grid.querySelector('.row.sub[data-uid="' + uid + '"]'))) {
+      this.#rerenderKeepingFocus();
+    }
+  }
+
+  #applyFailure(row, uid, fromRender) {
+    const message = this.#failures.get(Number(uid));
+    if (message == null) {
+      return;
+    }
+    row.classList.add('failed');
+    if (!fromRender) {
+      // rerender-safe: #msgRow also sets it for rows built later
+      row.title = (row.title ? row.title + ' — ' : '') + 'Save failed: ' + message;
+    }
+    else {
+      row.title = 'Save failed: ' + message;
+    }
+  }
+
   // Replace the whole selection with exactly the given uids: everything
   // previously checked is unchecked, the given uids are checked. Used by
   // double-click/Enter so the open/previewed email is also the only one
@@ -1414,8 +1560,45 @@ class ListView extends HTMLElement {
         this.#selected.add(item.uid);
       }
     }
+    this.#lastChecked = null;
     this.#render();
     this.#updateActions();
+  }
+
+  // Toolbar select-all: acts on the rows currently visible. Checking checks
+  // every visible message; unchecking (any click while some are checked)
+  // clears the whole selection.
+  #toggleAll() {
+    if (this.#mode !== 'ready') {
+      return;
+    }
+    const visible = this.#visibleRows();
+    const anyChecked = visible.some(thread => thread.messages.some(item => this.#selected.has(item.uid)));
+    if (anyChecked) {
+      this.#selected = new Set();
+    }
+    else {
+      for (const thread of visible) {
+        for (const item of thread.messages) {
+          this.#selected.add(item.uid);
+        }
+      }
+    }
+    this.#lastChecked = null;
+    this.#rerenderKeepingFocus();
+    this.status('');
+    this.#updateActions();
+  }
+
+  // Selected set of every visible message uid; drives the toolbar checkbox.
+  #visibleUids() {
+    const uids = [];
+    for (const thread of this.#visibleRows()) {
+      for (const item of thread.messages) {
+        uids.push(item.uid);
+      }
+    }
+    return uids;
   }
 
   #updateActions() {
@@ -1427,6 +1610,17 @@ class ListView extends HTMLElement {
     const enabled = ready && count > 0;
     for (const button of this.#buttons) {
       button.disabled = !enabled;
+    }
+    this.#selectAll.hidden = !ready;
+    if (ready) {
+      const visible = this.#visibleUids();
+      const checkedCount = visible.reduce((n, uid) => n + (this.#selected.has(uid) ? 1 : 0), 0);
+      this.#selectAll.checked = visible.length > 0 && checkedCount === visible.length;
+      this.#selectAll.indeterminate = checkedCount > 0 && checkedCount < visible.length;
+    }
+    else {
+      this.#selectAll.checked = false;
+      this.#selectAll.indeterminate = false;
     }
     this.#count.textContent = count
       ? count + ' selected'
@@ -1543,8 +1737,68 @@ class ListView extends HTMLElement {
     }
   }
 
-  #toggleUids(uids, input, row) {
+  // Shift-click range: rows are in visible render order, so the range walks
+  // the DOM between the anchor row (#lastChecked from the last plain click)
+  // and the clicked row, applying the clicked row's resulting checked state
+  // to every row in between (inclusive). Thread rows participate with their
+  // whole conversation.
+  #applyRange(uids, checked) {
+    const anchor = this.#lastChecked;
+    if (!anchor || !anchor.length) {
+      return;
+    }
+    const rows = [...this.#grid.querySelectorAll('.row')];
+    const rowUids = row => row.classList.contains('thread')
+      ? String(row.dataset.uids || '').split(',').filter(Boolean).map(Number)
+      : (row.dataset.uid != null ? [Number(row.dataset.uid)] : []);
+    const has = (row, uid) => rowUids(row).includes(Number(uid));
+    const a = rows.find(row => has(row, anchor[0]));
+    const t = rows.find(row => has(row, uids[0]));
+    if (!a || !t) {
+      return;
+    }
+    let lo = rows.indexOf(a);
+    let hi = rows.indexOf(t);
+    if (lo > hi) {
+      [lo, hi] = [hi, lo];
+    }
+    for (const row of rows.slice(lo, hi + 1)) {
+      const span = rowUids(row);
+      if (checked) {
+        for (const uid of span) {
+          this.#selected.add(uid);
+        }
+      }
+      else {
+        for (const uid of span) {
+          this.#selected.delete(uid);
+        }
+      }
+    }
+  }
+
+  // Shared shift-click path for row and message toggles: applies the range,
+  // re-renders so thread/sub checkboxes stay consistent, and moves the
+  // anchor to the clicked row. Returns false when there is nothing to range
+  // against (no anchor, or shift-clicking the anchor itself).
+  #shiftToggle(uids, checked) {
+    const anchor = this.#lastChecked;
+    if (!anchor || !anchor.length || anchor.length === uids.length && anchor.every((uid, i) => Number(uid) === Number(uids[i]))) {
+      return false;
+    }
+    this.#applyRange(uids, checked);
+    this.#rerenderKeepingFocus();
+    this.status('');
+    this.#updateActions();
+    return true;
+  }
+
+  #toggleUids(uids, input, row, shift = false) {
     const checked = !uids.every(uid => this.#selected.has(uid));
+    if (shift && this.#shiftToggle(uids, checked)) {
+      return;
+    }
+    this.#lastChecked = [...uids];
     if (checked) {
       for (const uid of uids) {
         this.#selected.add(uid);
@@ -1613,8 +1867,11 @@ class ListView extends HTMLElement {
     input.checked = checked;
     input.setAttribute('aria-label', 'Select conversation');
     check.append(input);
-    check.addEventListener('click', e => e.stopPropagation());
-    input.addEventListener('change', () => this.#toggleUids(uids, input, row));
+    check.addEventListener('click', e => {
+      e.stopPropagation();
+      this.#lastShift = e.shiftKey;
+    });
+    input.addEventListener('change', () => this.#toggleUids(uids, input, row, this.#lastShift));
 
     const star = document.createElement('button');
     star.type = 'button';
@@ -1669,7 +1926,10 @@ class ListView extends HTMLElement {
     if (chev) {
       chevSlot.append(chev);
     }
-    row.addEventListener('click', () => this.#toggleUids(uids, input, row));
+    row.addEventListener('click', e => {
+      this.#lastShift = e.shiftKey;
+      this.#toggleUids(uids, input, row, this.#lastShift);
+    });
     row.addEventListener('dblclick', e => {
       if (e.target.closest('.check, .star, .chev')) {
         return;
@@ -1684,7 +1944,8 @@ class ListView extends HTMLElement {
       }
       else if (e.key === ' ') {
         e.preventDefault();
-        this.#toggleUids(uids, input, row);
+        this.#lastShift = false;
+        this.#toggleUids(uids, input, row, false);
       }
       else if (multi && e.key === 'ArrowRight' && !expanded) {
         e.preventDefault();
@@ -1710,9 +1971,13 @@ class ListView extends HTMLElement {
     const flagged = hasFlag(item.flags, '\\Flagged');
     const unread = !hasFlag(item.flags, '\\Seen');
     const checked = this.#selected.has(item.uid);
+    const failed = this.#failures.has(Number(item.uid));
     const row = document.createElement('div');
-    row.className = 'row sub' + (unread ? ' unread' : '') + (checked ? ' checked' : '');
+    row.className = 'row sub' + (unread ? ' unread' : '') + (checked ? ' checked' : '') + (failed ? ' failed' : '');
     row.dataset.uid = item.uid;
+    if (failed) {
+      this.#applyFailure(row, item.uid, true);
+    }
     row.tabIndex = 0;
     row.setAttribute('aria-selected', String(checked));
     row.setAttribute('aria-label', senderName(item.from) + ' - ' + (item.subject || 'no subject'));
@@ -1724,8 +1989,11 @@ class ListView extends HTMLElement {
     input.checked = checked;
     input.setAttribute('aria-label', 'Select message');
     check.append(input);
-    check.addEventListener('click', e => e.stopPropagation());
-    input.addEventListener('change', () => this.#toggleMsg(item, input, row));
+    check.addEventListener('click', e => {
+      e.stopPropagation();
+      this.#lastShift = e.shiftKey;
+    });
+    input.addEventListener('change', () => this.#toggleMsg(item, input, row, this.#lastShift));
 
     const star = document.createElement('button');
     star.type = 'button';
@@ -1761,7 +2029,10 @@ class ListView extends HTMLElement {
     date.textContent = formatDate(item.date);
 
     row.append(check, star, tcountSlot, indent, sender, title, date);
-    row.addEventListener('click', () => this.#toggleMsg(item, input, row));
+    row.addEventListener('click', e => {
+      this.#lastShift = e.shiftKey;
+      this.#toggleMsg(item, input, row, this.#lastShift);
+    });
     row.addEventListener('dblclick', e => {
       if (e.target.closest('.check, .star')) {
         return;
@@ -1776,7 +2047,8 @@ class ListView extends HTMLElement {
       }
       else if (e.key === ' ') {
         e.preventDefault();
-        this.#toggleMsg(item, input, row);
+        this.#lastShift = false;
+        this.#toggleMsg(item, input, row, false);
       }
       else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault();
@@ -1790,8 +2062,12 @@ class ListView extends HTMLElement {
     return row;
   }
 
-  #toggleMsg(item, input, row) {
+  #toggleMsg(item, input, row, shift = false) {
     const checked = !this.#selected.has(item.uid);
+    if (shift && this.#shiftToggle([item.uid], checked)) {
+      return;
+    }
+    this.#lastChecked = [item.uid];
     if (checked) {
       this.#selected.add(item.uid);
     }

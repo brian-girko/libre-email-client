@@ -31,6 +31,7 @@ const cachePolicyEl = document.getElementById('f-cache-policy');
 const badgeEnabledEl = document.getElementById('f-badge-enabled');
 const badgeIntervalEl = document.getElementById('f-badge-interval');
 const badgeMaxAgeEl = document.getElementById('f-badge-max-age');
+const badgeIdleEl = document.getElementById('f-badge-idle');
 const checkBadgeBtn = document.getElementById('check-badge');
 const badgeStatusEl = document.getElementById('badge-status');
 const saveGlobalBtn = document.getElementById('save-global');
@@ -496,6 +497,7 @@ async function loadGlobalPrefs() {
     'ui.mailFlaggedTop': false,
     'ui.cachePolicy': 'epoch',
     'badge.enabled': true,
+    'badge.idleCheck': true,
     'badge.interval': 5,
     'badge.maxAge': 0
   });
@@ -511,6 +513,7 @@ async function loadGlobalPrefs() {
     ? res['ui.cachePolicy']
     : 'epoch';
   badgeEnabledEl.checked = res['badge.enabled'] !== false;
+  badgeIdleEl.checked = res['badge.idleCheck'] !== false;
   const interval = Number(res['badge.interval']);
   badgeIntervalEl.value = Number.isInteger(interval) && interval > 0 ? interval : 5;
   badgeMaxAgeEl.value = BADGE_MAX_AGES.includes(Number(res['badge.maxAge']))
@@ -563,6 +566,7 @@ saveGlobalBtn.addEventListener('click', async () => {
       ? cachePolicyEl.value
       : 'epoch',
     'badge.enabled': badgeEnabledEl.checked,
+    'badge.idleCheck': badgeIdleEl.checked,
     'badge.interval': badgeInterval,
     'badge.maxAge': BADGE_MAX_AGES.includes(Number(badgeMaxAgeEl.value))
       ? Number(badgeMaxAgeEl.value)

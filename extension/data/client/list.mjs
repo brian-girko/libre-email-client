@@ -1,10 +1,11 @@
 import './components/list-view.js';
 import {getMailApi} from './mail.mjs';
 import {getPref, setPref} from './prefs.mjs';
-import {writeFile} from '../../core/native/native-client.mjs';
+import {writeFiles} from '../../core/native/native-client.mjs';
 import {enqueue, updateJob, uidBusy} from './jobs.mjs';
 import {currentDirs, setupIncomplete} from './dirs.mjs';
 import * as counters from './counters.mjs';
+import * as logger from './logger.mjs';
 
 let el = null;
 let accountId = null;
@@ -75,6 +76,27 @@ function reportFailures(failed) {
   const first = failed[0];
   return 'failed: uid ' + first.uid + ' (' + first.message + ')'
     + (failed.length > 1 ? ' +' + (failed.length - 1) + ' more' : '');
+}
+
+// Cut the pre-removal snapshots down to the given uids: after a job only the
+// uids that failed to save were never touched on the server, so only those
+// belong back in the list (their conversation siblings stay away).
+function subsetSnapshot(snapshot, keepSet) {
+  const out = [];
+  for (const snap of snapshot) {
+    const messages = snap.messages.filter(m => keepSet.has(Number(m.uid)));
+    if (messages.length) {
+      out.push({
+        ...snap,
+        messages,
+        uids: messages.map(m => m.uid),
+        count: messages.length,
+        unread: messages.filter(m => !hasFlag(m.flags, '\\Seen')).length,
+        flagged: messages.some(m => hasFlag(m.flags, '\\Flagged'))
+      });
+    }
+  }
+  return out;
 }
 
 // ---- optimistic background actions (jobs) ----
@@ -338,29 +360,99 @@ async function runSaveAction(action, override, spec, id, name, uids, token) {
       const copied = [];
       const failed = [];
       const total = candidates.length;
-      let index = 0;
-      for (const uid of candidates) {
+      const numbers = candidates.map(Number);
+      // speed: reads run in a windowed pipeline (overlap the IMAP fetches of
+      // the next slice with the disk writes of the previous one) and copies
+      // leave in batched write-batch calls (10 files per IPC round trip)
+      const WINDOW = 10;
+      const BATCH = 10;
+      let doneCount = 0;
+      const buffer = [];
+      let flusher = Promise.resolve();
+
+      const flush = () => {
+        if (!buffer.length) {
+          return;
+        }
+        const batch = buffer.splice(0, BATCH);
+        flusher = flusher.then(async () => {
+          const res = await writeFiles(batch.map(entry => entry.file));
+          const results = res?.results ?? [];
+          for (let j = 0; j < batch.length; j++) {
+            const entry = batch[j];
+            const r = results[j];
+            doneCount++;
+            job.label = `Saving ${doneCount}/${total} to ${dir}…`;
+            updateJob(job.id, {label: job.label, progress: {done: doneCount, total}});
+            if (r && r.ok) {
+              copied.push(entry.uid);
+            }
+            else {
+              failed.push({uid: entry.uid, message: (r && r.error) || 'native client write failed'});
+            }
+          }
+        });
+      };
+      const drain = () => flusher;
+
+      for (let i = 0; i < total; i += WINDOW) {
         if (job.state === 'cancelled') {
           break;
         }
-        // report progress on the shared logger line: "Saving 2/10 to <dir>…"
-        index++;
-        job.label = `Saving ${index}/${total} to ${dir}…`;
-        updateJob(job.id, {label: job.label, progress: {done: index, total}});
-        try {
-          const raw = await api.readFile(uid);
-          if (job.state === 'cancelled') {
-            break;
+        const slice = numbers.slice(i, i + WINDOW);
+        const reads = await Promise.allSettled(slice.map(uid => api.readFile(uid)));
+        for (let j = 0; j < slice.length; j++) {
+          const uid = slice[j];
+          const read = reads[j];
+          if (read.status === 'fulfilled') {
+            if (job.state === 'cancelled') {
+              break;
+            }
+            // queue the .eml; the write itself runs through the shared
+            // batched chain, fully overlapping the next slice's fetches
+            buffer.push({
+              uid,
+              file: {dir, name: saveStamp() + '-' + uid + '.eml', data: read.value}
+            });
+            flush();
           }
-          await writeFile({dir, name: saveStamp() + '-' + Number(uid) + '.eml', data: raw});
-          copied.push(Number(uid));
-        }
-        catch (e) {
-          failed.push({uid, message: e?.message || String(e)});
+          else {
+            // this one email failed; every other email still runs
+            const e = read.reason;
+            failed.push({uid, message: e?.message || String(e)});
+            doneCount++;
+            job.label = `Saving ${doneCount}/${total} to ${dir}…`;
+            updateJob(job.id, {label: job.label, progress: {done: doneCount, total}});
+          }
         }
       }
+      await drain();
       if (job.state === 'cancelled') {
         return;
+      }
+
+      // failed emails remain harmless on the server: put their rows back (so
+      // they do not silently disappear) and tag them with the reason
+      if (failed.length) {
+        const intactView = id === accountId && name === dirName;
+        if (intactView) {
+          const failedSet = new Set(failed.map(f => Number(f.uid)));
+          el.restoreRows(subsetSnapshot(snapshot, failedSet));
+          for (const f of failed) {
+            el.markRowError([f.uid], f.message);
+          }
+        }
+        // one activity-logger line per failed email
+        for (const f of failed) {
+          const lid = job.id + '-' + f.uid;
+          logger.begin({
+            id: lid,
+            kind: 'save',
+            label: 'Saving uid ' + f.uid + ' to ' + dir,
+            doneLabel: 'Saved uid ' + f.uid + ' to ' + dir
+          });
+          logger.fail(lid, f.message);
+        }
       }
       job.cancelable = false;
 
@@ -442,6 +534,7 @@ async function applyViewPrefs() {
   el.sortMode = SORT_MODES.includes(sort) ? sort : '';
   el.flaggedOnTop = !!(await getPref('mailFlaggedTop', false));
   el.unreadOnly = !!(await getPref('mailUnreadOnly', false));
+  el.threadMode = (await getPref('mailThreadMode', true)) !== false;
 }
 
 // active search state; null = normal folder view
@@ -711,6 +804,12 @@ function init(element) {
   });
   el.addEventListener('unread-changed', e => {
     setPref('mailUnreadOnly', !!e.detail?.on);
+  });
+  el.addEventListener('thread-changed', e => {
+    setPref('mailThreadMode', e.detail?.on !== false);
+    if (accountId && dirName) {
+      load(accountId, dirName);
+    }
   });
   el.addEventListener('refresh', () => {
     if (accountId && dirName) {

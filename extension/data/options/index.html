@@ -105,6 +105,7 @@
           <span id="badge-status" class="hint"></span>
         </div>
         <p class="hint">The service worker asks every badge-enabled account for unread mail on this interval. The badge shows the combined unread total when it is not zero, and its title lists each account's count. Accounts without a usable password in this browser session are reported there but skipped.</p>
+        <p class="hint">With the return-from-idle check on, the badge also runs one silent check whenever the machine becomes active again (wake, unlock or resume), so the count is fresh the moment you are back.</p>
         <p class="hint">The age limit restricts the badge to unread mail newer than the chosen window; older unread mail no longer counts. It applies to the folder mode and to search-query mode alike. When the IMAP core build lacks search support, the coarse folder fallback count cannot be age-filtered and ignores the limit.</p>
       </fieldset>
       <fieldset>
@@ -339,7 +340,10 @@ from:news@example.com'></textarea>
             </label>
             <p class="hint" id="ff-native-hint">Saving .eml files requires the native client (com.add0n.node).</p>
           </fieldset>
-          <div class="row">
+        <label class="check">
+          <input type="checkbox" id="f-badge-idle" checked> Check again when the computer returns from idle
+        </label>
+        <div class="row">
             <button type="submit">Save Filter</button>
             <button type="button" id="cancel-filter">Cancel</button>
             <span id="filter-saved" hidden>Saved</span>

@@ -203,6 +203,9 @@ function reconcile(accountId, folder, counts) {
 
 // Arrived mail detected by the badge pass (uidnext/exists grew): not a user
 // action, so nothing records a job; the next sweep/badge-end resolves it.
+// Tree counts only: the badge total in the same end event already includes
+// the arrived mail, so a badge delta here would double-count it (icon text
+// above the tooltip's fresh count until the next real check).
 function arrival(accountId, folder, delta) {
   if (!Number.isInteger(delta) || delta <= 0) {
     return;
@@ -213,10 +216,6 @@ function arrival(accountId, folder, delta) {
   }
   s.du += delta;
   s.dt += delta;
-  if (badgeFolders.get(accountId) === folder) {
-    s.db += delta;
-    sendBadgePredict(accountId, delta);
-  }
   emit(accountId, [folder]);
 }
 

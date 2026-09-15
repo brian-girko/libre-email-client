@@ -9,10 +9,15 @@
 // Requests (each carries an id; every reply echoes it):
 //   {id, op:'ping'}                          -> {id, ok:true, version:1}
 //   {id, op:'write', dir, name, data(b64)}   -> {id, ok:true, path}
+//   {id, op:'write-batch', files:[{dir, name, data(b64)}]}
+//       -> {id, ok:true, results:[{ok:true, path}|{ok:false, error}]}
 //
 // 'write' mkdir -p's the destination directory and never overwrites: when
 // the requested name exists a -1/-2/... suffix is inserted before the
 // extension, and the final wx write makes the pick race-free.
+// 'write-batch' does the same for many files in one round trip: the mkdir
+// per distinct directory is shared, and each entry reports independently so
+// one bad entry never fails the batch.
 
 'use strict';
 
@@ -52,24 +57,50 @@ if (typeof push === 'function' && typeof connect === 'function' && typeof args !
     throw new Error('no free file name found in ' + dir);
   };
 
+  const writeOne = ({dir, name, data}) => {
+    if (typeof dir !== 'string' || !dir.trim()) {
+      throw new Error('dir is required');
+    }
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new Error('name is required');
+    }
+    if (typeof data !== 'string') {
+      throw new Error('base64 data is required');
+    }
+    fs.mkdirSync(dir, {recursive: true});
+    const path = pickPath(dir, name);
+    fs.writeFileSync(path, Buffer.from(data, 'base64'), {flag: 'wx'});
+    return {path};
+  };
+
   const handlers = {
     ping() {
       return {version: 1};
     },
-    write({dir, name, data}) {
-      if (typeof dir !== 'string' || !dir.trim()) {
-        throw new Error('dir is required');
+    write(req) {
+      return writeOne(req);
+    },
+    'write-batch'({files}) {
+      if (!Array.isArray(files)) {
+        throw new Error('files array is required');
       }
-      if (typeof name !== 'string' || !name.trim()) {
-        throw new Error('name is required');
+      const results = [];
+      const made = new Set();
+      for (const file of files) {
+        try {
+          // share one mkdir per distinct directory across the batch
+          const dir = typeof file?.dir === 'string' ? file.dir : '';
+          if (dir.trim() && !made.has(dir)) {
+            fs.mkdirSync(dir, {recursive: true});
+            made.add(dir);
+          }
+          results.push({ok: true, ...writeOne({...file, dir})});
+        }
+        catch (e) {
+          results.push({ok: false, error: e && e.message ? e.message : String(e)});
+        }
       }
-      if (typeof data !== 'string') {
-        throw new Error('base64 data is required');
-      }
-      fs.mkdirSync(dir, {recursive: true});
-      const path = pickPath(dir, name);
-      fs.writeFileSync(path, Buffer.from(data, 'base64'), {flag: 'wx'});
-      return {path};
+      return {results};
     }
   };
 

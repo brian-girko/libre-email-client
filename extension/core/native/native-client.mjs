@@ -308,4 +308,21 @@ function writeFile({dir, name, data}) {
   return request({op: 'write', dir: String(dir || ''), name: String(name || ''), data: toBase64(bytes)});
 }
 
-export {detectNativeClient, writeFile};
+// Batch form of writeFile: many {dir, name, data} entries, one IPC round
+// trip. Entries report independently — resolve is [{ok:true, path} | {ok:
+// false, error}]. The msg.ok reply gate is bypassed here because the batch
+// itself succeeds even when single entries fail; read results out of
+// msg.results.
+function writeFiles(files) {
+  const list = Array.isArray(files) ? files : [];
+  if (!list.length) {
+    return Promise.resolve({results: []});
+  }
+  return request({op: 'write-batch', files: list.map(f => ({
+    dir: String(f?.dir || ''),
+    name: String(f?.name || ''),
+    data: toBase64(f?.data instanceof Uint8Array ? f.data : new Uint8Array(f?.data ?? []))
+  }))}, 5 * REQUEST_TIMEOUT);
+}
+
+export {detectNativeClient, writeFile, writeFiles};

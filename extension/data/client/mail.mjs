@@ -268,7 +268,10 @@ function wrap(accountId, api) {
       return retried(api => api.clearCache(), true);
     },
     readFile(uid) {
-      return retried(api => api.readFile(uid), false);
+      // a body that cannot be read (malformed message) is not fixable by a
+      // reconnect — only retry on connection-shaped errors so the fail is
+      // fast and isolated to this one email
+      return retried(api => api.readFile(uid), true);
     },
     setFlags(uids, addFlags, removeFlags) {
       return retried(api => api.setFlags(uids, addFlags, removeFlags), true);

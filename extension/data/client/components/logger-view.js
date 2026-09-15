@@ -25,7 +25,7 @@ class LoggerView extends HTMLElement {
           background: var(--pane-bg, #ffffff);
           border: 1px solid var(--line, #d9dce1);
           border-radius: var(--radius, 10px);
-          padding: calc(6px * var(--font-scale, 1)) calc(10px * var(--font-scale, 1));
+          padding: calc(8px * var(--font-scale, 1)) calc(12px * var(--font-scale, 1));
           color: var(--fg, #1b1d21);
           font: calc(12px * var(--font-scale, 1))/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
         }
@@ -71,6 +71,7 @@ class LoggerView extends HTMLElement {
           display: flex;
           flex-direction: column;
           gap: calc(2px * var(--font-scale, 1));
+          padding: calc(4px * var(--font-scale, 1));
         }
         .line {
           display: flex;
@@ -102,19 +103,6 @@ class LoggerView extends HTMLElement {
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
-        }
-        .bar {
-          flex: none;
-          width: calc(60px * var(--font-scale, 1));
-          height: 4px;
-          border-radius: 2px;
-          background: color-mix(in srgb, var(--dim, #8a8f98) 30%, transparent);
-          overflow: hidden;
-        }
-        .bar > i {
-          display: block;
-          height: 100%;
-          background: var(--accent, AccentColor);
         }
         .job-btn {
           flex: none;
@@ -187,18 +175,11 @@ class LoggerView extends HTMLElement {
   }
 
   #apply() {
-    // While a foreground operation is queued/running the status line shows
-    // that activity (with its live label); when idle it falls back to the
-    // last persistent status.
-    const active = (this.#entries || []).filter(e =>
-      !e.quiet && (e.state === 'queued' || e.state === 'running'));
+    // The status line shows only the persistent status text; running jobs
+    // render as their own single row below (no mirrored duplicate line).
     let text = '';
     let tone = 'info';
-    if (active.length) {
-      text = active[active.length - 1].label || '';
-      tone = 'busy';
-    }
-    else if (this.#status) {
+    if (this.#status) {
       text = this.#status.text || '';
       tone = this.#status.tone || 'info';
     }
@@ -216,11 +197,6 @@ class LoggerView extends HTMLElement {
     spin.className = 'spin';
     const label = document.createElement('span');
     label.className = 'label';
-    const bar = document.createElement('span');
-    bar.className = 'bar';
-    bar.hidden = true;
-    const barFill = document.createElement('i');
-    bar.append(barFill);
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'job-btn';
@@ -234,15 +210,13 @@ class LoggerView extends HTMLElement {
         composed: true
       }));
     });
-    row.append(spin, label, bar, btn);
+    row.append(spin, label, btn);
     return row;
   }
 
   #sync(row, entry) {
     const spin = row.querySelector('.spin');
     const label = row.querySelector('.label');
-    const bar = row.querySelector('.bar');
-    const fill = bar.querySelector('i');
     const btn = row.querySelector('.job-btn');
     const failed = entry.state === 'failed';
     const done = entry.state === 'done';
@@ -254,14 +228,6 @@ class LoggerView extends HTMLElement {
       : done
         ? (entry.doneLabel || entry.label || '')
         : (entry.label || '');
-    const p = entry.progress;
-    if (p && p.total > 0) {
-      bar.hidden = false;
-      fill.style.width = Math.min(100, Math.round((p.done / p.total) * 100)) + '%';
-    }
-    else {
-      bar.hidden = true;
-    }
     btn.hidden = !(entry.cancelable || failed);
     btn.disabled = false;
     btn.title = failed ? 'Dismiss' : 'Cancel';

@@ -4,8 +4,9 @@ import * as logger from './logger.mjs';
 // Per-account action queue. Every server-side operation (moves, flag
 // changes, save-to-disk overrides, folder create/delete) is enqueued here by
 // the modules that own the UI, so the queue is the single gateway to IMAP.
-// Jobs run sequentially per account (the wasm client serializes commands
-// anyway); different accounts run in parallel.
+// Jobs run sequentially per account — except save-to-disk jobs, which run in
+// their own concurrent bank so a new archive never waits for an in-flight
+// one (the wasm client serializes IMAP commands anyway).
 //
 // A job is:
 //   {
@@ -24,7 +25,8 @@ import * as logger from './logger.mjs';
 // so action lines and worker lines (filters, badge sync) share one bar.
 
 let nextId = 1;
-const queues = new Map();   // accountId -> {running: Job|null, pending: Job[]}
+const queues = new Map();   // accountId -> {running: Job|null, saves: Set<Job>, pending: Job[]}
+const SAVE_SLOTS = 3;       // concurrent save jobs per account
 const jobSubs = new Set();  // lifecycle listeners: fn(phase, job)
 
 // Job lifecycle events: 'start' (enqueued), 'done', 'fail' (after rollback),
@@ -66,7 +68,7 @@ function notifyBadge() {
 
 function hasPending() {
   for (const [, q] of queues) {
-    if (q.running || q.pending.length) {
+    if (q.running || q.pending.length || q.saves.size) {
       return true;
     }
   }
@@ -113,7 +115,7 @@ function enqueue({
   });
   let q = queues.get(accountId);
   if (!q) {
-    q = {running: null, pending: []};
+    q = {running: null, saves: new Set(), pending: []};
     queues.set(accountId, q);
   }
   q.pending.push(job);
@@ -122,16 +124,12 @@ function enqueue({
   return id;
 }
 
-async function process(accountId) {
-  const q = queues.get(accountId);
-  if (!q || q.running) {
-    return;
-  }
-  const job = q.pending.shift();
-  if (!job) {
-    return;
-  }
-  q.running = job;
+// Saves run in their own concurrent bank (SAVE_SLOTS at once) so a new
+// archive starts immediately while earlier ones are still copying to disk —
+// IMAP safety comes from the wasm client's FIFO and uidBusy() filters uid
+// clashes. Every other kind stays serialized and only starts when both
+// lanes are idle, so counter predictions never interleave.
+async function runJob(accountId, job, finish) {
   job.state = 'running';
   // Only multi-stage save jobs can be interrupted mid-flight; a queued job is
   // always cancelable, a running atomic batch call is not.
@@ -179,8 +177,42 @@ async function process(accountId) {
     }
   }
   finally {
-    q.running = null;
-    process(accountId);
+    finish();
+  }
+}
+
+function process(accountId) {
+  const q = queues.get(accountId);
+  if (!q) {
+    return;
+  }
+  // start save jobs until the save bank is full
+  while (q.saves.size < SAVE_SLOTS) {
+    const idx = q.pending.findIndex(j => j.kind === 'save');
+    if (idx === -1) {
+      break;
+    }
+    const [job] = q.pending.splice(idx, 1);
+    job.state = 'running';
+    q.saves.add(job);
+    runJob(accountId, job, () => {
+      q.saves.delete(job);
+      process(accountId);
+    });
+  }
+  // one serialized slot for every non-save kind: it only starts when both
+  // lanes are idle so its counter prediction never interleaves with a save
+  if (!q.running && !q.saves.size) {
+    const idx = q.pending.findIndex(j => j.kind !== 'save');
+    if (idx !== -1) {
+      const [job] = q.pending.splice(idx, 1);
+      job.state = 'running';
+      q.running = job;
+      runJob(accountId, job, () => {
+        q.running = null;
+        process(accountId);
+      });
+    }
   }
 }
 
@@ -199,18 +231,22 @@ function cancel(id) {
       logger.remove(id);
       return true;
     }
-    if (q.running && q.running.id === id) {
-      if (!q.running.cancelable) {
+    // a cancelled save job shares its lane; its cancelable flag says whether
+    // it may be interrupted mid-flight (cancellation is cooperative: the
+    // loop inside run() notices state 'cancelled' and stops)
+    const flying = q.running?.id === id ? q.running : [...q.saves].find(j => j.id === id);
+    if (flying) {
+      if (!flying.cancelable) {
         return false;
       }
-      q.running.state = 'cancelled';
-      if (q.running.rollback) {
+      flying.state = 'cancelled';
+      if (flying.rollback) {
         try {
-          q.running.rollback();
+          flying.rollback();
         }
         catch {}
       }
-      fire('cancel', q.running);
+      fire('cancel', flying);
       logger.remove(id);
       return true;
     }
@@ -229,7 +265,7 @@ function accountPendingJobs(accountId) {
   if (!q) {
     return [];
   }
-  return [...(q.running ? [q.running] : []), ...q.pending];
+  return [...(q.running ? [q.running] : []), ...q.saves, ...q.pending];
 }
 
 // True when the uid is already claimed by a job that relocates or deletes
@@ -243,7 +279,7 @@ function uidBusy(accountId, uid) {
     return false;
   }
   const hit = j => MOVING_KINDS.has(j.kind) && j.uids && j.uids.includes(Number(uid));
-  return (q.running && hit(q.running)) || q.pending.some(hit);
+  return (q.running && hit(q.running)) || [...q.saves].some(hit) || q.pending.some(hit);
 }
 
 // Progress/label updates from inside a running job's own steps (the

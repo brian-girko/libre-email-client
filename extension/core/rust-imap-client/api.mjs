@@ -748,9 +748,20 @@ export async function createMailApi(cfg) {
             const t0 = Date.now();
             try {
                 // persistent tier: key includes uidnext, so any new mail bumps
-                // the key and misses automatically. refresh bypasses this
-                // lookup to refetch the folder; the result re-populates it.
-                const cacheKey = [selected, String(Number(status?.uidnext) || 0), String(Number(status?.uidvalidity) || 0)];
+                // the key and misses automatically. exists and unseen fence
+                // cross-session races too: a move/expunge changes exists and
+                // a \Seen flag change changes unseen without touching
+                // uidnext, so a warm put from another session (e.g. the
+                // worker's badge pass) can never serve pre-change mail to
+                // this one. refresh bypasses this lookup to refetch the
+                // folder; the result re-populates it.
+                const cacheKey = [
+                    selected,
+                    String(Number(status?.uidvalidity) || 0),
+                    String(Number(status?.uidnext) || 0),
+                    String(Number(status?.exists) || 0),
+                    String(Number(status?.unseen) || 0),
+                ];
                 const hit = refresh ? null : await cache.get('threads', cacheKey);
                 if (hit) {
                     try {
