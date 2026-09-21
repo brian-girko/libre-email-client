@@ -2,96 +2,34 @@
 // directory via the File System Access API and stores the directory handle in
 // IndexedDB (db 'data-picker', store 'handles', key 'root') so other parts of
 // the extension can pick it up later. Handles survive browser restarts; a
-// stale permission is restored with one user-gesture re-grant. When the
-// stored handle still has permission, this page offers the choice between the
-// sync client interface (data/sync/client/index.html) and the mail client
-// (data/client/index.html).
+// stale permission is restored with one user-gesture re-grant.
+//
+// The page only matters in the 'external' storage mode; with the default
+// 'browser storage' root (OPFS, data/sync/root-handle.mjs) there is nothing
+// to grant — it says so and offers the way back to the options. When the
+// stored external handle still has permission, this page offers the choice
+// between the sync client interface (data/sync/client/index.html) and the
+// mail client (data/client/index.html).
 
 'use strict';
 
-const DB_NAME = 'data-picker';
-const STORE = 'handles';
-const KEY = 'root';
-const NAME_KEY = KEY + ':name';
-const HANDLE_KEY = KEY;
+import {
+  MODE_EXTERNAL,
+  getStorageMode,
+  ownedRootHandle,
+  persistRootHandle,
+  clearRootHandle,
+  verifyRoot
+} from '../sync/root-handle.mjs';
 
 const pickBtn = document.getElementById('pick');
 const grantBtn = document.getElementById('grant');
 const forgetBtn = document.getElementById('forget');
 const openSyncBtn = document.getElementById('open-sync');
 const openClientBtn = document.getElementById('open-client');
+const openOptionsBtn = document.getElementById('open-options');
 const statusEl = document.getElementById('status');
 const dirEl = document.getElementById('dir');
-
-function openDb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(STORE)) {
-        req.result.createObjectStore(STORE);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function request(req) {
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function eventDone(tx) {
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
-  });
-}
-
-async function persist(handle, name) {
-  const conn = await openDb();
-  try {
-    const tx = conn.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
-    store.put(handle, HANDLE_KEY);
-    store.put(name, NAME_KEY);
-    await eventDone(tx);
-  }
-  finally {
-    conn.close();
-  }
-}
-
-async function owns() {
-  const conn = await openDb();
-  try {
-    const tx = conn.transaction(STORE, 'readonly');
-    const store = tx.objectStore(STORE);
-    const handle = await request(store.get(HANDLE_KEY));
-    const name = await request(store.get(NAME_KEY));
-    return {handle, name};
-  }
-  finally {
-    conn.close();
-  }
-}
-
-async function clearHandle() {
-  const conn = await openDb();
-  try {
-    const tx = conn.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
-    store.delete(HANDLE_KEY);
-    store.delete(NAME_KEY);
-    await eventDone(tx);
-  }
-  finally {
-    conn.close();
-  }
-}
 
 const e2msg = e => e?.message || String(e);
 
@@ -105,44 +43,73 @@ function setDir(name) {
   dirEl.hidden = !name;
 }
 
-function forget() {
+async function forget() {
   pickBtn.hidden = false;
   grantBtn.hidden = true;
   forgetBtn.hidden = true;
   openSyncBtn.hidden = true;
   openClientBtn.hidden = true;
+  openOptionsBtn.hidden = true;
   setDir('');
-  setStatus('No directory access granted yet.');
+  await renderStatus();
 }
 
-// Proves the stored handle is still usable: write a probe file. Covers both
-// a dropped permission and a moved/renamed directory (queryPermission can
-// claim 'granted' while real writes would fail). The probe file stays in
-// place and is simply overwritten on each boot — dot-names are ignored by
-// the maildir walkers and the sync engine, so nothing sees it.
-async function verify(handle) {
-  const file = await handle.getFileHandle('.picker-probe', {create: true});
-  const writable = await file.createWritable();
-  await writable.close();
+// OPFS mode needs no handle at all: point the visitor back to the options.
+async function opfsMode() {
+  pickBtn.hidden = true;
+  grantBtn.hidden = true;
+  forgetBtn.hidden = true;
+  openSyncBtn.hidden = true;
+  openClientBtn.hidden = true;
+  openOptionsBtn.hidden = false;
+  setDir('');
+  setStatus('Mail is stored in browser storage (the default) — no directory access is needed. To use a custom directory instead, change it in the options.', true);
 }
 
+// Boot text for the external mode without touching the handle: grants, lapses
+// and availability are rendered without the write probe (the probe runs right
+// before the handle is handed off; a destination page never re-probes).
+async function renderStatus() {
+  const {handle, name} = await ownedRootHandle();
+  if (!handle || !(handle instanceof FileSystemDirectoryHandle)) {
+    return 'No directory access granted yet.';
+  }
+  const state = await handle.queryPermission({mode: 'readwrite'});
+  if (state === 'granted') {
+    return 'Access confirmed for ' + (name || 'the directory') + '.';
+  }
+  return state === 'prompt'
+    ? 'Access needs to be re-granted for ' + name + '.'
+    : 'Permission denied for ' + (name || 'the directory') + '.';
+}
+
+// Provisional text for the brief boot window; boot() overwrites it with the
+// verified verdict below.
 async function boot() {
+  const status = await renderStatus();
+  setStatus(status, /\bconfirmed\b/.test(status));
+  setDir((await ownedRootHandle()).name || '');
+
   try {
-    const {handle, name} = await owns();
+    if ((await getStorageMode()) !== MODE_EXTERNAL) {
+      return await opfsMode();
+    }
+    const {handle, name} = await ownedRootHandle();
     if (!handle || !(handle instanceof FileSystemDirectoryHandle)) {
-      forget();
-      return;
+      return await forget();
     }
     setDir(name);
     forgetBtn.hidden = false;
+    openOptionsBtn.hidden = false;
     try {
-      await verify(handle);
+      await verifyRoot(handle);
       // access is confirmed: let the user pick the destination page
       pickBtn.hidden = true;
       grantBtn.hidden = true;
       forgetBtn.hidden = false;
       openSyncBtn.hidden = false;
       openClientBtn.hidden = false;
+      openOptionsBtn.hidden = false;
       setStatus('Access confirmed for ' + (name || 'the directory') + '.', true);
       return;
     }
@@ -151,13 +118,12 @@ async function boot() {
       forgetBtn.hidden = false;
       const state = await handle.queryPermission({mode: 'readwrite'});
       if (state === 'granted') {
-        await persist(handle, name);
+        await persistRootHandle(handle, name);
         return boot();
       }
       grantBtn.hidden = state !== 'prompt';
       if (grantBtn.hidden) {
-        forget();
-        return;
+        return await forget();
       }
       setStatus('Access needs to be re-granted for ' + name + '.', false);
     }
@@ -170,7 +136,7 @@ async function boot() {
 pickBtn.addEventListener('click', async () => {
   try {
     const handle = await window.showDirectoryPicker({mode: 'readwrite'});
-    await persist(handle, handle.name);
+    await persistRootHandle(handle, handle.name);
     return boot();
   }
   catch (e) {
@@ -183,9 +149,9 @@ pickBtn.addEventListener('click', async () => {
 
 grantBtn.addEventListener('click', async () => {
   try {
-    const {handle, name} = await owns();
+    const {handle, name} = await ownedRootHandle();
     if (!handle) {
-      return forget();
+      return await forget();
     }
     const result = await handle.requestPermission({mode: 'readwrite'});
     if (result === 'granted') {
@@ -199,13 +165,19 @@ grantBtn.addEventListener('click', async () => {
 });
 
 forgetBtn.addEventListener('click', () => {
-  clearHandle().then(forget, forget);
+  clearRootHandle().then(forget, forget);
 });
 
-const handOff = page => {
-  location.replace(chrome.runtime.getURL(page));
-};
-openSyncBtn.addEventListener('click', () => handOff('data/sync/client/index.html'));
-openClientBtn.addEventListener('click', () => handOff('data/client/index.html'));
+openSyncBtn.addEventListener('click', () => {
+  location.replace(chrome.runtime.getURL('data/sync/client/index.html'));
+});
+
+openClientBtn.addEventListener('click', () => {
+  location.replace(chrome.runtime.getURL('data/client/index.html'));
+});
+
+openOptionsBtn.addEventListener('click', () => {
+  location.replace(chrome.runtime.getURL('data/options/index.html#global'));
+});
 
 boot();

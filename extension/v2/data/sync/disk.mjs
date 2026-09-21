@@ -1,76 +1,25 @@
-// data/sync/index.js — sync page gate. The service worker cannot check
-// FileSystem handle permissions, so this page is the real checkpoint (shared
-// by the data/client gate): it loads the stored handle and confirms the
-// readwrite permission is still in place, bouncing back to the picker when
-// the handle is gone or the permission was revoked. Actual read/write proof
-// is the picker's probe (data/picker), which runs right before a handle is
-// handed off — a destination page never re-probes.
+// data/sync/disk.mjs — the storage-root gate. The service worker cannot
+// resolve the root handle, so this module is the real checkpoint (shared by
+// the data/client gate): it decides between the extension's own browser
+// storage ('opfs', the default — always granted, no permission flow) and the
+// user-chosen external directory ('external' — the persisted IndexedDB
+// handle), confirming the access is still in place and bouncing back to the
+// picker when the external handle is gone or its permission was revoked.
+// Actual read/write proof is the probe (data/sync/root-handle.mjs), which
+// runs right before a handle is handed off — a page never trusts a bare
+// queryPermission.
 
 'use strict';
 
-const DB_NAME = 'data-picker';
-const STORE = 'handles';
-const HANDLE_KEY = 'root';
-const NAME_KEY = HANDLE_KEY + ':name';
+import {
+  MODE_EXTERNAL,
+  getStorageMode,
+  opfsRoot,
+  ownedRootHandle,
+  clearRootHandle,
+  verifyRoot
+} from './root-handle.mjs';
 
-function openDb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(STORE)) {
-        req.result.createObjectStore(STORE);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function request(req) {
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function eventDone(tx) {
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
-  });
-}
-
-async function owns() {
-  const conn = await openDb();
-  try {
-    const tx = conn.transaction(STORE, 'readonly');
-    const store = tx.objectStore(STORE);
-    const handle = await request(store.get(HANDLE_KEY));
-    const name = await request(store.get(NAME_KEY));
-    return {handle, name};
-  }
-  finally {
-    conn.close();
-  }
-}
-
-async function clearHandle() {
-  const conn = await openDb();
-  try {
-    const tx = conn.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
-    store.delete(HANDLE_KEY);
-    store.delete(NAME_KEY);
-    await eventDone(tx);
-  }
-  finally {
-    conn.close();
-  }
-}
-
-// Cheap permission re-check (no writes, no probe): the picker owns the
-// real read/write verification that precedes every hand-off.
 function backToPicker() {
   location.replace(chrome.runtime.getURL('data/picker/index.html'));
 }
@@ -78,11 +27,17 @@ function backToPicker() {
 // Offscreen-safe variant of boot(): same checks, no navigation (an
 // offscreen document cannot redirect anywhere useful) — the caller gets a
 // verdict instead and the client surfaces a link to the picker. The raw
-// queryPermission value ('granted'|'prompt'|'denied') rides along so the
-// calling side can tell a real lapse from a context-quirk verdict.
+// permission value ('granted'|'prompt'|'denied', or the trivial 'granted'
+// verdict in opfs mode) rides along so the calling side can tell a real
+// lapse from a context-quirk verdict.
 export async function bootSilent() {
   try {
-    const {handle, name} = await owns();
+    if ((await getStorageMode()) !== MODE_EXTERNAL) {
+      const handle = await opfsRoot();
+      console.log('[sync] opfs root resolved (browser storage)');
+      return {ok: true, raw: 'granted', reason: null, name: '(browser storage)', handle};
+    }
+    const {handle, name} = await ownedRootHandle();
     if (!handle || !(handle instanceof FileSystemDirectoryHandle)) {
       console.log('[sync] access check: no stored handle');
       return {ok: false, raw: null, reason: 'no-handle', name};
@@ -105,9 +60,14 @@ export async function bootSilent() {
 
 export async function boot() {
   try {
-    const {handle, name} = await owns();
+    if ((await getStorageMode()) !== MODE_EXTERNAL) {
+      const handle = await opfsRoot();
+      await verifyRoot(handle);
+      return handle;
+    }
+    const {handle, name} = await ownedRootHandle();
     if (!handle || !(handle instanceof FileSystemDirectoryHandle)) {
-      await clearHandle();
+      await clearRootHandle();
       return backToPicker();
     }
     if ((await handle.queryPermission({mode: 'readwrite'})) !== 'granted') {
@@ -122,4 +82,3 @@ export async function boot() {
     return backToPicker();
   }
 }
-

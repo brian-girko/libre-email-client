@@ -9,6 +9,13 @@ import {
 } from '/tools/crypto.mjs';
 import {reencryptStoredPasswords} from '/tools/passwords.mjs';
 import {detectNativeClient} from '/core/native/native-client.mjs';
+import {
+  MODE_EXTERNAL,
+  getStorageMode,
+  ownedRootHandle,
+  persistRootHandle,
+  clearRootHandle
+} from '/data/sync/root-handle.mjs';
 import '/data/components/prompt-view.js';
 import './components/text-viewer.js';
 import {initTheme} from '/data/client/theme.mjs';

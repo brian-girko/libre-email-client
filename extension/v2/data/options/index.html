@@ -22,6 +22,24 @@
     <div id="panel-global" role="tabpanel" aria-labelledby="tab-global">
     <section id="global">
       <fieldset>
+        <legend>Storage root</legend>
+        <label class="check">
+          <input type="radio" name="storage-mode" id="f-storage-opfs" value="opfs" checked>
+          Browser storage (default)
+        </label>
+        <label class="check">
+          <input type="radio" name="storage-mode" id="f-storage-external" value="external">
+          Custom directory
+        </label>
+        <p class="hint" id="storage-status"></p>
+        <div class="row">
+          <button type="button" id="pick-storage" disabled>Choose directory&hellip;</button>
+          <button type="button" id="grant-storage" hidden>Re-grant access</button>
+          <button type="button" id="forget-storage" hidden>Forget directory</button>
+        </div>
+        <p class="hint">Browser storage keeps the synced mail inside the extension's own private storage — it needs no directory picker and no permission, but it lives in the browser profile (remove the profile or the extension and the mail is gone). A custom directory keeps the Maildir tree in a folder of your choice instead; the directory handle is remembered across browser restarts, but a lapsed permission has to be re-granted.</p>
+      </fieldset>
+      <fieldset>
         <legend>WS/TCP bridge</legend>
         <label class="check">
           <input type="radio" name="ws-mode" id="f-ws-native" value="native" checked>
