@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Directory Access :: Libre Email Client</title>
+  <link rel="stylesheet" href="index.css">
+</head>
+<body>
+  <main>
+    <h1>Directory Access</h1>
+    <p id="status"></p>
+    <p id="dir" hidden></p>
+    <section>
+      <button id="pick" type="button">Choose a directory&hellip;</button>
+      <button id="grant" type="button" hidden>Re-grant access</button>
+      <button id="open-sync" type="button" hidden>Open Sync</button>
+      <button id="open-client" type="button" hidden>Open Mail</button>
+      <button id="forget" type="button" hidden>Forget</button>
+    </section>
+    <p class="note">The handle is stored in IndexedDB and reused on the next
+      visits. It keeps read/write access to the chosen directory only.</p>
+  </main>
+  <script src="index.js"></script>
+</body>
+</html>

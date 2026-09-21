@@ -1,0 +1,366 @@
+:root {
+  color-scheme: light dark;
+
+  --bg: light-dark(#f5f5f7, #1c1c1e);
+  --bg-light: light-dark(rgba(128, 128, 128, 0.1), rgba(128, 128, 128, 0.2));
+  --card: light-dark(#fff, #2c2c2e);
+  --border: light-dark(#d9d9de, #48484a);
+  --text: light-dark(#1d1d1f, #f2f2f7);
+  --muted: light-dark(#6e6e73, #98989d);
+  --accent: light-dark(#0a84ff, #0a84ff);
+  --ok: light-dark(#1a7f37, #30d158);
+  --danger: light-dark(#d70015, #ff453a);
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* when a reader-view theme is active (body[data-theme] in ../client/theme.css)
+   the options palette follows it; the light-dark() values are the fallbacks
+   for the unthemed state */
+body {
+  --text: var(--fg, light-dark(#1d1d1f, #f2f2f7));
+  --muted: var(--dim, light-dark(#6e6e73, #98989d));
+  --card: var(--pane-bg, light-dark(#fff, #2c2c2e));
+  --border: var(--line, light-dark(#d9d9de, #48484a));
+  --bg-light: color-mix(in srgb, var(--dim, #808080) 15%, transparent);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+main {
+  max-width: 860px;
+  margin: 32px auto;
+  padding: 0 16px;
+  display: grid;
+  grid-template-columns: 170px minmax(0, 1fr);
+  column-gap: 16px;
+}
+
+h1 {
+  font-size: 20px;
+  margin: 0 0 20px;
+  text-align: center;
+  grid-column: 1 / -1;
+}
+
+#tabs {
+  position: sticky;
+  top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#tabs button {
+  text-align: left;
+  color: var(--muted);
+}
+
+#tabs button[aria-selected="true"] {
+  color: var(--text);
+  font-weight: 600;
+  border-color: var(--accent);
+  background: var(--bg-light);
+}
+
+#tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 0 0 10px;
+}
+
+section {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+select {
+  margin-bottom: 12px;
+  background: var(--card);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+fieldset {
+  /* legacy fieldsets default to min-inline-size: min-content, which lets
+     wide descendants (text-viewer) stretch them past the section */
+  min-inline-size: 0;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  margin: 0 0 14px;
+  padding: 0 0 14px;
+}
+
+legend {
+  color: var(--muted);
+  background-color: var(--bg-light);
+  font-weight: 600;
+  width: 100%;
+  padding: 5px;
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+label {
+  display: block;
+  margin-bottom: 10px;
+  color: var(--muted);
+}
+
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: var(--text);
+}
+
+input[type="text"],
+input[type="number"],
+input[type="password"],
+select,
+textarea {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font: inherit;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.45;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+button {
+  font: inherit;
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  cursor: pointer;
+}
+
+button[type="submit"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button:hover:not(:disabled) {
+  filter: brightness(0.95);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+#badge-status {
+  white-space: pre-line;
+}
+
+#saved,
+#global-saved,
+#master-saved,
+#actions-saved,
+#filter-saved {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+#saved.error,
+#global-saved.error,
+#master-saved.error,
+#actions-saved.error,
+#filter-saved.error {
+  color: var(--danger);
+}
+
+#native-status.error,
+#filters-native-status.error {
+  color: var(--danger);
+}
+
+/* filter list rows */
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+}
+
+.filter-row input[type="checkbox"] {
+  margin: 0;
+}
+
+.filter-row .summary {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  max-height: 5lh;
+  overflow: hidden;
+}
+
+.filter-row .summary .name {
+  font-weight: 600;
+}
+
+.filter-row .summary .desc {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.filter-row button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.filter-row button.move {
+  padding: 4px 7px;
+}
+
+.filter-row .disabled {
+  opacity: 0.55;
+}
+
+/* text-viewer (filter query box) inherits its shadow styles from these
+   variables, following the prompt-view mapping below */
+text-viewer {
+  --fg: var(--text);
+  --pane-bg: var(--card);
+  --line: var(--border);
+  --dim: var(--muted);
+}
+
+/* inline mentions of the query syntax inside hint texts */
+.hint code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  background: var(--bg-light);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+/* prompt-view inherits its shadow styles from these variables; map them onto
+   the options theme so the dialog follows light/dark like on the client page */
+prompt-view {
+  --fg: var(--text);
+  --pane-bg: var(--card);
+  --line: var(--border);
+  --bg: var(--card);
+  --dim: var(--muted);
+}
+
+/* export/import choice dialog (plain DOM, styled with the page theme) */
+#choice-dialog {
+  width: min(90vw, 420px);
+  padding: 18px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+  margin: auto;
+}
+
+#choice-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+#choice-dialog form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+}
+
+#choice-dialog .message {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+#choice-dialog .row {
+  justify-content: flex-end;
+}
+
+@media (max-width: 640px) {
+  main {
+    max-width: 100%;
+    width: 100%;
+    margin: 0;
+    padding: 12px 0;
+    display: block;
+  }
+
+  #tabs {
+    position: static;
+    flex-direction: row;
+    margin-bottom: 16px;
+  }
+
+  #tabs button {
+    flex: 1;
+    text-align: center;
+  }
+
+  section {
+    width: 100%;
+    border: none;
+    border-radius: 0;
+    margin-bottom: 16px;
+  }
+
+  input[type="text"],
+  input[type="number"],
+  input[type="password"],
+  select,
+  textarea,
+  text-viewer {
+    font-size: 16px;
+  }
+}

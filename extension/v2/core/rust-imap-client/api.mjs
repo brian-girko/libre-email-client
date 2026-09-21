@@ -24,7 +24,7 @@
 //   const res = await api.idle({ timeoutMs: 20000 });
 //   await api.close();
 
-import { initSync, MailClient, TransportRx } from '../pkg/mail_core.js';
+import { initSync, MailClient, TransportRx } from './mail_core.mjs';
 
 let wasmReady = false;
 

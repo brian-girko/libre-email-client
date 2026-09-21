@@ -24,7 +24,7 @@
 //   const res = await api.idle({ timeoutMs: 20000 });
 //   await api.close();
 
-import { initSync, MailClient, TransportRx } from '../pkg/mail_core.js';
+import { initSync, MailClient, TransportRx } from './mail_core.mjs';
 
 let wasmReady = false;
 
@@ -109,22 +109,33 @@ function imapDate(d) {
 /**
  * Build an IMAP SEARCH criteria string from user input.
  * Plain text becomes `TEXT "…"` (server-side full-text). Prefixes map to
- * their IMAP keys: from: to: subject: body: since: before:. Multiple terms
- * are ANDed (IMAP default). Returns "" for empty input.
+ * their IMAP keys: from: to: subject: body: since: before:. `is:` maps to
+ * flag keys: is:unseen is:seen is:flagged is:answered is:deleted →
+ * UNSEEN SEEN FLAGGED ANSWERED DELETED. Any key accepts an optional `not:`
+ * prefix for negation (e.g. `not:is:deleted` → `NOT DELETED`; `not:` on
+ * since/before dates is ignored). Multiple terms are ANDed (IMAP default).
+ * Returns "" for empty input.
  * @param {string} query
  * @returns {string}
  */
 export function buildCriteria(query) {
     const raw = String(query ?? '').trim();
     if (!raw) return '';
+    const FLAGS = {
+        unseen: 'UNSEEN',
+        seen: 'SEEN',
+        flagged: 'FLAGGED',
+        answered: 'ANSWERED',
+        deleted: 'DELETED',
+    };
     const parts = [];
     for (const token of raw.split(/\s+/)) {
-        const m = token.match(/^(from|to|subject|body|text|since|before):(.*)$/i);
+        const m = token.match(/^(not:)?(from|to|subject|body|text|since|before|is):(.*)$/i);
         if (!m) {
             parts.push(`TEXT ${imapQuote(token)}`);
             continue;
         }
-        const [, key, rest] = m;
+        const [, neg, key, rest] = m;
         if (/^(since|before)$/i.test(key)) {
             const d = imapDate(rest);
             if (d) {
@@ -132,14 +143,22 @@ export function buildCriteria(query) {
             }
             continue;
         }
+        if (/^is$/i.test(key)) {
+            const flag = FLAGS[rest.toLowerCase()];
+            if (flag) {
+                parts.push(`${neg ? 'NOT ' : ''}${flag}`);
+            }
+            continue;
+        }
         if (rest) {
-            parts.push(`${key.toUpperCase()} ${imapQuote(rest)}`);
+            parts.push(`${neg ? 'NOT ' : ''}${key.toUpperCase()} ${imapQuote(rest)}`);
         }
     }
     return parts.join(' ');
 }
 
-function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) return input;
+export function decodeMimeWords(input) {
+    if (!input || input.indexOf('=?') === -1) return input;
     // whitespace between adjacent encoded words is not part of the text
     const joined = input.replace(/(\?=)[ \t\r\n]+(=\?)/g, '$1$2');
     return joined.replace(/=\?([^?\s]+)\?([BbQq])\?([^?\s]*)\?=/g, (token, charset, enc, data) => {
@@ -150,6 +169,30 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
             return token; // unknown charset or malformed: leave untouched
         }
     });
+}
+
+/**
+ * Normalize a raw wasm thread row into the documented ThreadSummary shape
+ * (numbers as numbers, flags as strings, RFC 2047 encoded words decoded).
+ * Shared by listThreads() and search() so both return the same shape.
+ */
+function mapThread(t) {
+    return {
+        uids: (Array.isArray(t.uids) ? t.uids : []).map(Number),
+        count: Number(t.count) || 0,
+        unread: Number(t.unread) || 0,
+        flagged: !!t.flagged,
+        subject: decodeMimeWords(t.subject ?? null),
+        from: decodeMimeWords(t.from ?? null),
+        date: t.date ?? null,
+        messages: (Array.isArray(t.messages) ? t.messages : []).map((m) => ({
+            uid: Number(m.uid),
+            flags: Array.isArray(m.flags) ? m.flags.map(String) : [],
+            subject: decodeMimeWords(m.subject ?? null),
+            from: decodeMimeWords(m.from ?? null),
+            date: m.date ?? null,
+        })),
+    };
 }
 
 /**
@@ -172,6 +215,8 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
  * @property {Uint8Array} [wasmBytes] compiled mail_core_bg.wasm bytes.
  * @property {string} [wasmUrl] URL to fetch mail_core_bg.wasm from (browser).
  * @property {typeof WebSocket} [WebSocketImpl] WebSocket constructor override.
+ * @property {string} [accountId] stable account id; scopes engine-side
+ *   bookkeeping. Defaults to "user@host" when omitted.
  */
 
 /**
@@ -187,6 +232,13 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
  * @property {number} uidvalidity
  * @property {number} uidnext next UID the server will assign
  * @property {number|null} unseen
+ */
+
+/**
+ * @typedef {Object} DirCount unread/total for one folder.
+ * @property {string} name full mailbox name
+ * @property {number} unread messages without \Seen
+ * @property {number} total messages in the folder
  */
 
 /**
@@ -238,18 +290,22 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
 /**
  * @typedef {Object} MailApi
  * @property {() => Promise<void>} connect
- * @property {() => Promise<Folder[]>} listDirs
+ * @property {() => Promise<Folder[]>} listDirs list of mailboxes (LIST).
  * @property {(name: string) => Promise<MailboxStatus>} openDir selects the dir
  *   for subsequent listFiles/listThreads/readFile/idle.
+ * @property {(onProgress?: (c: DirCount) => void) => Promise<DirCount[]>} listDirCounts
+ *   per-folder unread/total, one server-side SEARCH per selectable mailbox;
+ *   onProgress fires as each folder resolves (see DirCount).
  * @property {(name: string) => Promise<void>} createDir CREATE a new mailbox
  *   (hierarchy parents are created as needed; INBOX/existing names rejected).
  * @property {(name: string) => Promise<void>} deleteDir DELETE a mailbox;
  *   closes it when it was the open dir.
  * @property {(opts?: ListOpts) => Promise<MessageSummary[]>} listFiles one
  *   request per page; results sorted newest (highest UID) first.
- * @property {() => Promise<ThreadSummary[]>} listThreads group the whole
+ * @property {(opts?: {refresh?: boolean}) => Promise<ThreadSummary[]>} listThreads group the whole
  *   selected dir into conversations (JWZ threading inside the wasm core,
- *   newest thread first).
+ *   newest thread first). Fresh from the server every call; listThreads' me
+ *   mirror layer (engine) decides what to store locally.
  * @property {(uid: number) => Promise<Uint8Array>} readFile one FETCH per call,
  *   raw RFC822 bytes of a single message.
  * @property {(uids: number[], addFlags: string[], removeFlags: string[]) => Promise<void>} setFlags
@@ -261,11 +317,6 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
  *   "\\Deleted" on the selected dir, then UID EXPUNGE when the core build
  *   exports expunge_messages; without that export the flag stays set and the
  *   server purges the messages on its next expunge.
- * @property {(mailbox: string|null, opts: {content: Uint8Array|ArrayBuffer|Blob|number[], flags?: string[], internaldate?: string|null}) => Promise<boolean>} appendMail
- *   APPEND a raw RFC822 message to `mailbox` (falls back to the open dir);
- *   `flags` are the initial IMAP flags (e.g. ["\\Seen"]), `internaldate` an
- *   optional RFC 3501 date-time string. Bumps local exists/uidnext so the
- *   next listFiles sees the new message.
  * @property {(opts?: {timeoutMs?: number}) => Promise<IdleResult>} idle wait for
  *   server updates on the selected dir; falls back to NOOP polling when the
  *   server has no IDLE support.
@@ -292,6 +343,12 @@ export async function createMailApi(cfg) {
     let client = null;
     let selected = null;
     let status = null;
+    // Set by socket close/error. Results that resolve afterwards are
+    // untrustworthy: once the transport is gone the wasm core can settle
+    // pending commands with garbage (e.g. an empty mailbox list) instead of
+    // an error, so reads re-check liveness and surface a real connection
+    // error for the reconnect wrapper to act on.
+    let transportDown = false;
 
     const log = (msg) => {
         if (!cfg.debug) return;
@@ -331,10 +388,17 @@ export async function createMailApi(cfg) {
     // cross-feed each other's responses. Run every client call through this
     // FIFO chain; concurrent callers just queue up.
     let tail = Promise.resolve();
-    const clientCall = (name, ...args) => {
+    const clientCall = (name, args = [], {postCheck = true} = {}) => {
         const run = tail.then(() => {
             if (!client) throw new Error('not connected; call connect() first');
+            if (transportDown) throw new Error('io: transport closed');
             return client[name](...args).catch(rethrow);
+        }).then((value) => {
+            // Mutations opt out (postCheck: false) so an already-applied
+            // command is never re-run because the socket died right after
+            // its response.
+            if (postCheck && transportDown) throw new Error('io: transport closed');
+            return value;
         });
         tail = run.then(() => {}, () => {});
         return run;
@@ -422,8 +486,14 @@ export async function createMailApi(cfg) {
             }
             rx.push_bytes(toU8(ev.data));
         });
-        sock.addEventListener('close', () => rx.transport_closed());
-        sock.addEventListener('error', (e) => rx.transport_error(String(e?.message || e)));
+        sock.addEventListener('close', () => {
+            transportDown = true;
+            rx.transport_closed();
+        });
+        sock.addEventListener('error', (e) => {
+            transportDown = true;
+            rx.transport_error(String(e?.message || e));
+        });
         for (const chunk of pre) rx.push_bytes(chunk);
     }
 
@@ -455,6 +525,17 @@ export async function createMailApi(cfg) {
                     delimiter: m.delimiter ?? null,
                     attrs: Array.isArray(m.attrs) ? m.attrs.map(String) : [],
                 }));
+                if (!out.length) {
+                    // IMAP guarantees INBOX for every authenticated session,
+                    // so an empty LIST means the server closed the session in
+                    // a way JS cannot observe (e.g. a TLS close_notify the
+                    // wasm core absorbed after the DELETE of the open
+                    // mailbox). Surface it as a connection error so the
+                    // engine's session wrapper rebuilds and retries on a
+                    // fresh session instead of passing on a bogus empty list.
+                    log('listDirs(): empty mailbox list — treating the session as closed');
+                    throw new Error('io: empty mailbox list (session closed by the server?)');
+                }
                 log(`listDirs() -> ${out.length} dirs (${Date.now() - t0}ms)`);
                 return out;
             } catch (e) {
@@ -467,7 +548,7 @@ export async function createMailApi(cfg) {
             assertConnected();
             const t0 = Date.now();
             try {
-                const s = await clientCall('select', name);
+                const s = await clientCall('select', [name]);
                 selected = name;
                 status = s;
                 const out = {
@@ -484,6 +565,70 @@ export async function createMailApi(cfg) {
             }
         },
 
+        /**
+         * Unread/total per folder, without disturbing the selected mailbox.
+         * The wasm core has no STATUS (build artifacts only), so this runs
+         * the same per-folder SEARCH as allFolders search(): one match-all
+         * search_threads() mailbox, threads carry unread/count sums. Folders
+         * are walked sequentially (wasm FIFO); failures skip a folder's
+         * counts but do not stop the sweep. onProgress, when given, fires
+         * as each folder resolves so callers can update incrementally.
+         * @param {(c: DirCount) => void} [onProgress]
+         * @returns {Promise<DirCount[]>}
+         */
+        async listDirCounts(onProgress) {
+            assertConnected();
+            if (typeof client.search_threads !== 'function') {
+                throw new Error('listDirCounts: mail core build does not support search; rebuild rust-client with search_threads export');
+            }
+            const folders = (await this.listDirs()).filter((f) =>
+                !f.attrs.some((a) => /\\noselect|\\nonexistent/i.test(String(a)))
+            );
+            const t0 = Date.now();
+            const criteria = buildCriteria('since:1970-01-01') || 'SINCE 1-Jan-1970';
+            const out = [];
+            for (const folder of folders) {
+                let unread = 0;
+                let total = 0;
+                try {
+                    const rows = await clientCall('search_threads', [folder.name, criteria]);
+                    for (const t of rows) {
+                        unread += Number(t.unread) || 0;
+                        total += Number(t.count) || 0;
+                    }
+                }
+                catch (e) {
+                    log(`listDirCounts(${JSON.stringify(folder.name)}) FAILED: ${e.message}`);
+                    continue;
+                }
+                const entry = {name: folder.name, unread, total};
+                out.push(entry);
+                if (typeof onProgress === 'function') {
+                    try {
+                        onProgress(entry);
+                    }
+                    catch {
+                        /* caller-provided callback must not break the sweep */
+                    }
+                }
+            }
+            log(`listDirCounts() -> ${out.length}/${folders.length} dirs (${Date.now() - t0}ms)`);
+            // A per-folder search may have left a different mailbox selected
+            // on the server than the facade's `selected` state claims.
+            // Re-assert the open dir so listFiles/listThreads keep fetching
+            // the folder the caller opened. Best-effort: without a selected
+            // dir there is nothing to restore.
+            if (selected) {
+                try {
+                    await this.openDir(selected);
+                }
+                catch (e) {
+                    log(`listDirCounts(): restore openDir(${JSON.stringify(selected)}) FAILED: ${e.message}`);
+                }
+            }
+            return out;
+        },
+
         async createDir(name) {
             assertConnected();
             if (typeof name !== 'string' || !name.trim()) throw new Error('createDir: folder name required');
@@ -492,7 +637,7 @@ export async function createMailApi(cfg) {
             }
             const t0 = Date.now();
             try {
-                await clientCall('create_mailbox', name);
+                await clientCall('create_mailbox', [name], {postCheck: false});
                 log(`createDir(${JSON.stringify(name)}) (${Date.now() - t0}ms)`);
             } catch (e) {
                 log(`createDir(${JSON.stringify(name)}) FAILED after ${Date.now() - t0}ms: ${e.message}`);
@@ -508,7 +653,7 @@ export async function createMailApi(cfg) {
             }
             const t0 = Date.now();
             try {
-                await clientCall('delete_mailbox', name);
+                await clientCall('delete_mailbox', [name], {postCheck: false});
                 if (selected === name) {
                     selected = null;
                     status = null;
@@ -536,7 +681,7 @@ export async function createMailApi(cfg) {
             }
             const t0 = Date.now();
             try {
-                const rows = await clientCall('fetch_summaries', set);
+                const rows = await clientCall('fetch_summaries', [set]);
                 const out = rows
                     .map((m) => ({
                         uid: Number(m.uid),
@@ -555,7 +700,7 @@ export async function createMailApi(cfg) {
             }
         },
 
-        async listThreads() {
+        async listThreads(opts) {
             assertConnected();
             if (!selected) throw new Error('openDir() first');
             if (typeof client.fetch_threads !== 'function') {
@@ -563,23 +708,8 @@ export async function createMailApi(cfg) {
             }
             const t0 = Date.now();
             try {
-                const rows = await clientCall('fetch_threads', selected);
-                const out = rows.map((t) => ({
-                    uids: (Array.isArray(t.uids) ? t.uids : []).map(Number),
-                    count: Number(t.count) || 0,
-                    unread: Number(t.unread) || 0,
-                    flagged: !!t.flagged,
-                    subject: decodeMimeWords(t.subject ?? null),
-                    from: decodeMimeWords(t.from ?? null),
-                    date: t.date ?? null,
-                    messages: (Array.isArray(t.messages) ? t.messages : []).map((m) => ({
-                        uid: Number(m.uid),
-                        flags: Array.isArray(m.flags) ? m.flags.map(String) : [],
-                        subject: decodeMimeWords(m.subject ?? null),
-                        from: decodeMimeWords(m.from ?? null),
-                        date: m.date ?? null,
-                    })),
-                }));
+                const rows = await clientCall('fetch_threads', [selected]);
+                const out = rows.map(mapThread);
                 log(`listThreads() -> ${out.length} threads (${Date.now() - t0}ms)`);
                 return out;
             } catch (e) {
@@ -602,8 +732,8 @@ export async function createMailApi(cfg) {
                 if (!allFolders) {
                     const target = dir || selected;
                     if (!target) throw new Error('search: no dir given and none open');
-                    const rows = await clientCall('search_threads', target, criteria);
-                    const out = rows.map((t) => ({...t, dir: target}));
+                    const rows = await clientCall('search_threads', [target, criteria]);
+                    const out = rows.map((t) => ({...mapThread(t), dir: target}));
                     log(`search(${JSON.stringify(criteria)} in ${JSON.stringify(target)}) -> ${out.length} threads (${Date.now() - t0}ms)`);
                     return out;
                 }
@@ -614,9 +744,9 @@ export async function createMailApi(cfg) {
                 );
                 const merged = [];
                 for (const folder of folders) {
-                    const rows = await clientCall('search_threads', folder.name, criteria);
+                    const rows = await clientCall('search_threads', [folder.name, criteria]);
                     for (const t of rows) {
-                        merged.push({...t, dir: folder.name});
+                        merged.push({...mapThread(t), dir: folder.name});
                     }
                 }
                 merged.sort((a, b) => Number(b.date ? +new Date(b.date) : 0) - Number(a.date ? +new Date(a.date) : 0));
@@ -634,7 +764,7 @@ export async function createMailApi(cfg) {
             const t0 = Date.now();
             const uidNum = Number(uid);
             try {
-                const raw = await clientCall('fetch_message', uidNum);
+                const raw = await clientCall('fetch_message', [uidNum]);
                 const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
                 log(`readFile(${uid}) -> ${bytes.length} bytes (${Date.now() - t0}ms)`);
                 return bytes;
@@ -656,7 +786,7 @@ export async function createMailApi(cfg) {
             }
             const t0 = Date.now();
             try {
-                await clientCall('store_flags', set, add, remove);
+                await clientCall('store_flags', [set, add, remove], {postCheck: false});
                 log(`setFlags(${set.length} uids +[${add}] -[${remove}]) (${Date.now() - t0}ms)`);
             } catch (e) {
                 log(`setFlags(${set.length} uids +[${add}] -[${remove}]) FAILED after ${Date.now() - t0}ms: ${e.message}`);
@@ -675,7 +805,7 @@ export async function createMailApi(cfg) {
             }
             const t0 = Date.now();
             try {
-                await clientCall('move_messages', set, mailbox);
+                await clientCall('move_messages', [set, mailbox], {postCheck: false});
                 log(`moveTo(${set.length} uids -> ${JSON.stringify(mailbox)}) (${Date.now() - t0}ms)`);
             } catch (e) {
                 log(`moveTo(${set.length} uids -> ${JSON.stringify(mailbox)}) FAILED after ${Date.now() - t0}ms: ${e.message}`);
@@ -693,12 +823,12 @@ export async function createMailApi(cfg) {
             }
             const t0 = Date.now();
             try {
-                await clientCall('store_flags', set, ['\\Deleted'], []);
+                await clientCall('store_flags', [set, ['\\Deleted'], []], {postCheck: false});
                 // True "delete now" needs the optional expunge_messages export
                 // (UID EXPUNGE, RFC 4315); cores without it keep the flag and
                 // let the server purge on its next expunge.
                 if (typeof client.expunge_messages === 'function') {
-                    await clientCall('expunge_messages', set);
+                    await clientCall('expunge_messages', [set], {postCheck: false});
                 }
                 else {
                     log(`deleteMessages(${set.length} uids): \\Deleted set; no expunge_messages export in this core build`);
@@ -710,42 +840,13 @@ export async function createMailApi(cfg) {
             }
         },
 
-        async appendMail(mailbox, { content, flags = [], internaldate = null } = {}) {
-            assertConnected();
-            const dir = typeof mailbox === 'string' && mailbox.trim() ? mailbox : selected;
-            if (!dir) throw new Error('appendMail: folder name required (or openDir() first)');
-            if (typeof client.upload_mail !== 'function') {
-                throw new Error('appendMail: mail core build does not support APPEND; rebuild rust-client with upload_mail export');
-            }
-            let body = content instanceof Uint8Array ? content
-                : content instanceof ArrayBuffer ? new Uint8Array(content)
-                : content instanceof Blob ? new Uint8Array(await content.arrayBuffer())
-                : Array.isArray(content) ? new Uint8Array(content)
-                : null;
-            if (!body || !body.length) throw new Error('appendMail: message content required');
-            const flagList = (Array.isArray(flags) ? flags : [flags]).map(String).filter(Boolean);
-            const date = typeof internaldate === 'string' && internaldate.trim() ? internaldate.trim() : null;
-            const t0 = Date.now();
-            try {
-                await clientCall('upload_mail', dir, body, flagList, date);
-                if (dir === selected && status) {
-                    status = { ...status, exists: Number(status.exists) + 1, uidnext: Number(status.uidnext) + 1 };
-                }
-                log(`appendMail(${JSON.stringify(dir)} ${body.length} bytes flags [${flagList}]) (${Date.now() - t0}ms)`);
-                return true;
-            } catch (e) {
-                log(`appendMail(${JSON.stringify(dir)}) FAILED after ${Date.now() - t0}ms: ${e.message}`);
-                throw e;
-            }
-        },
-
         async idle(opts) {
             assertConnected();
             if (!selected) throw new Error('openDir() first');
             const timeoutMs = Math.max(1000, opts?.timeoutMs ?? 20000);
             const t0 = Date.now();
             try {
-                const res = await clientCall('idle_once', selected, timeoutMs);
+                const res = await clientCall('idle_once', [selected, timeoutMs]);
                 const out = res?.raw != null ? { type: res.type, raw: res.raw } : { type: res.type };
                 log(`idle({timeoutMs:${timeoutMs}}) -> ${out.type} (${Date.now() - t0}ms)`);
                 return out;
@@ -758,7 +859,7 @@ export async function createMailApi(cfg) {
         async close() {
             log('close: logging out');
             try {
-                if (client) await clientCall('logout');
+                if (client) await clientCall('logout', [], {postCheck: false});
             } catch {
                 /* server may have already closed */
             }

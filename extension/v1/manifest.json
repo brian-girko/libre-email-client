@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "version": "0.1.0",
+  "name": "Libre Email Client",
+  "description": "A powerful in-browser IMAP email client",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "unlimitedStorage",
+    "contextMenus",
+    "alarms",
+    "idle"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
+  "icons": {
+    "16": "/data/icons/blue/16.png",
+    "32": "/data/icons/blue/32.png",
+    "48": "/data/icons/blue/48.png",
+    "64": "/data/icons/blue/64.png",
+    "128": "/data/icons/blue/128.png",
+    "256": "/data/icons/blue/256.png",
+    "512": "/data/icons/blue/512.png"
+  },
+  "offline_enabled": true,
+  "action": {
+    "default_title": "Libre Email Client"
+  },
+  "options_ui": {
+    "page": "data/options/index.html",
+    "open_in_tab": true
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self';"
+  },
+  "background": {
+    "service_worker": "worker.mjs",
+    "type": "module"
+  }
+}

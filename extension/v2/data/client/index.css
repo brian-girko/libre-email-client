@@ -1,0 +1,334 @@
+:root {
+  color-scheme: light dark;
+  --radius: 10px;
+  --bg: light-dark(#f5f6f8, #15171a);
+  --fg: light-dark(#1b1d21, #e6e8eb);
+  --dim: light-dark(#6f747d, #8b9098);
+  --line: light-dark(#d9dce1, #2a2e33);
+  --pane-bg: light-dark(#ffffff, #1c1f24);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+  background: var(--bg);
+  color: var(--fg);
+  font: calc(14px * var(--font-scale, 1))/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+}
+
+#app {
+  flex: 1;
+  display: grid;
+  min-height: 0;
+  min-width: 0;
+  gap: 8px;
+  padding: 8px;
+  grid-template-areas: "dirs" "mails";
+  grid-template-columns: 1fr;
+  grid-template-rows: auto minmax(340px, 1fr);
+  overflow-y: auto;
+}
+
+.pane {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  text-align: center;
+  background: var(--pane-bg);
+  border: 1px solid var(--line);
+  color: var(--dim);
+  font-size: calc(14px * var(--font-scale, 1));
+  letter-spacing: 0.02em;
+  user-select: none;
+  border-radius: var(--radius, 10px);
+}
+
+#dirs {
+  grid-area: dirs;
+}
+
+@media (max-width: 699.98px) {
+  #dirs {
+    max-height: 40vh;
+  }
+}
+
+#mails {
+  grid-area: mails;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+#mails-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 0 6px;
+}
+
+#mail-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 32px;
+  font: inherit;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--fg);
+  background: var(--pane-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  padding: 4px 10px;
+}
+
+#mail-search::placeholder {
+  color: var(--dim);
+}
+
+#mail-search:focus {
+  outline: none;
+  border-color: var(--dim);
+}
+
+#search-clear {
+  flex: none;
+  min-height: 32px;
+  min-width: 32px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--dim);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  cursor: pointer;
+}
+
+#search-clear:hover {
+  color: var(--fg);
+  border-color: var(--dim);
+}
+
+#account-select {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 240px;
+  min-height: 32px;
+  font: inherit;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--fg);
+  background: var(--pane-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  padding: 4px 8px;
+}
+
+#mails-split {
+  flex: 1;
+  display: grid;
+  min-height: 0;
+  min-width: 0;
+  gap: 8px;
+  grid-template-areas: "emails" "preview";
+  grid-template-columns: 1fr;
+  grid-template-rows: minmax(160px, 1fr) minmax(160px, 1fr);
+}
+
+#sync-open {
+  flex: none;
+  min-height: 32px;
+  font: inherit;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--fg);
+  background: var(--pane-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+#sync-open:hover {
+  border-color: var(--dim);
+}
+
+#logger {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+#footer {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+#footer #logger {
+  margin-top: 0;
+}
+
+#emails {
+  grid-area: emails;
+}
+
+#preview {
+  grid-area: preview;
+}
+
+#preview:empty {
+  display: none;
+}
+
+#splitter:has(+ #preview:empty) {
+  display: none;
+}
+
+#mails-split:has(#preview:empty) {
+  grid-template-areas: "emails";
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+
+#splitter {
+  grid-area: splitter;
+  display: none;
+}
+
+#splitter::after {
+  content: "";
+  position: absolute;
+  border-radius: 2px;
+  background: var(--line);
+  transition: background 0.15s;
+}
+
+#splitter:hover::after,
+#splitter.dragging::after {
+  background: var(--dim);
+}
+
+#layout-toggle {
+  flex: none;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 4px 14px;
+  font: inherit;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--fg);
+  background: var(--pane-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  cursor: pointer;
+}
+
+#mails-bar:has(~ #mails-split #preview:empty) #layout-toggle {
+  display: none;
+}
+
+#layout-toggle:hover {
+  border-color: var(--dim);
+}
+
+@media (min-width: 700px) {
+  #app {
+    grid-template-areas: "dirs mails";
+    grid-template-columns: 220px 1fr;
+    grid-template-rows: 1fr;
+    overflow: visible;
+  }
+
+  #layout-toggle {
+    display: inline-flex;
+  }
+
+  #mails-split {
+    gap: 0;
+  }
+
+  #splitter {
+    display: block;
+    position: relative;
+    touch-action: none;
+  }
+
+  body[data-preview-layout="horizontal"] #mails-split {
+    grid-template-areas: "emails splitter preview";
+    grid-template-columns: var(--emails-width, minmax(0, 1fr)) auto minmax(0, 1fr);
+    grid-template-rows: 1fr;
+  }
+
+  body[data-preview-layout="horizontal"] #mails-split:has(#preview:empty) {
+    grid-template-areas: "emails";
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+  }
+
+  body[data-preview-layout="horizontal"] #splitter {
+    width: 10px;
+    margin: 0 2px;
+    cursor: col-resize;
+  }
+
+  body[data-preview-layout="horizontal"] #splitter::after {
+    top: 0;
+    bottom: 0;
+    left: 4px;
+    width: 2px;
+  }
+
+  body[data-preview-layout="vertical"] #mails-split {
+    grid-template-areas: "emails" "splitter" "preview";
+    grid-template-columns: 1fr;
+    grid-template-rows: var(--emails-height, minmax(0, 1fr)) auto minmax(0, 1fr);
+  }
+
+  body[data-preview-layout="vertical"] #mails-split:has(#preview:empty) {
+    grid-template-areas: "emails";
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+  }
+
+  body[data-preview-layout="vertical"] #splitter {
+    height: 10px;
+    margin: 2px 0;
+    cursor: row-resize;
+  }
+
+  body[data-preview-layout="vertical"] #splitter::after {
+    left: 0;
+    right: 0;
+    top: 4px;
+    height: 2px;
+  }
+}
+
+@media (min-width: 1100px) {
+  #app {
+    grid-template-columns: 260px 1fr;
+  }
+}

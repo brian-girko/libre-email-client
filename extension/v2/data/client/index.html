@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Libre Email Client</title>
+  <link id="favicon" rel="icon" type="image/png" href="/data/icons/gray/32.png">
+  <link rel="stylesheet" href="./index.css">
+  <link rel="stylesheet" href="./theme.css">
+</head>
+<body data-preview-layout="horizontal">
+  <div id="app">
+    <directory-view id="dirs" title="Folders — Alt+1 focus · ↑/↓ select · →/← expand/collapse · Enter open"></directory-view>
+    <main id="mails">
+      <div id="mails-bar">
+        <input id="mail-search" type="text" role="searchbox"
+               placeholder="Search mail…  from: to: subject: since: …"
+               aria-label="Search mail (server-side)" spellcheck="false" autocomplete="off">
+        <button id="search-clear" type="button" hidden title="Clear search"
+                aria-label="Clear search">✕</button>
+        <select id="account-select" aria-label="Account"></select>
+        <button id="layout-toggle" type="button"></button>
+      </div>
+      <div id="mails-split">
+        <list-view id="emails" title="Message list — Alt+2 focus · ↑/↓ move · Space check · Enter/double-click preview · Ctrl+A select all"></list-view>
+        <div id="splitter" role="separator"></div>
+        <emails-view id="preview" title="Open emails — Alt+3 focus · ↑/↓ switch emails"></emails-view>
+      </div>
+      <div id="footer">
+        <button id="sync-open" type="button" accesskey="y"
+                title="Open the sync client (Y)" aria-label="Open the sync client (Y)"><u>S</u>ync…</button>
+        <logger-view id="logger" title="Activity"></logger-view>
+      </div>
+    </main>
+  </div>
+  <prompt-view id="prompt" hidden></prompt-view>
+  <script type="module" src="./index.mjs"></script>
+</body>
+</html>

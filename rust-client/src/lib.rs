@@ -479,6 +479,50 @@ impl MailClient {
         Ok(())
     }
 
+    /// APPEND a raw RFC822 message to `mailbox` (RFC 3501 §6.3.11).
+    ///
+    /// `content` is the full message (headers + body, CRLF line endings).
+    /// `flags` is a list of IMAP flags to set initially (e.g. `["\\Seen"]`);
+    /// pass an empty list for none. `internaldate` is an optional RFC 3501
+    /// `date-time` string like `"16-Sep-2026 10:39:00 +0000"`. Targets a
+    /// mailbox without disturbing the currently selected one — APPEND is the
+    /// canonical way the facade uploads new `.eml` files.
+    pub async fn upload_mail(
+        &mut self,
+        mailbox: &str,
+        content: Vec<u8>,
+        flags: Vec<String>,
+        internaldate: Option<String>,
+    ) -> Result<(), JsValue> {
+        if content.is_empty() {
+            return Err(JsValue::from_str("upload_mail: empty message content"));
+        }
+        if mailbox.is_empty() {
+            return Err(JsValue::from_str("upload_mail: mailbox name required"));
+        }
+        let flags_str = if flags.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "({})",
+                flags
+                    .iter()
+                    .map(|f| flag_token(f))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ))
+        };
+        let s = self.session_mut()?;
+        s.append(
+            mailbox,
+            flags_str.as_deref(),
+            internaldate.as_deref(),
+            content.as_slice(),
+        )
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Enter IDLE on `mailbox` and wait up to `timeout_ms` for server updates.
     ///
     /// RFC 2177: the `IDLE` command is only used when the server advertises the

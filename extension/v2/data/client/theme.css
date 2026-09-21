@@ -1,0 +1,62 @@
+/* Reader-view color themes (https://github.com/rNeomy/reader-view).
+   Each theme only defines its foreground/background pair like the original;
+   every other color is derived from those two with color-mix(). A page picks
+   its theme by setting body[data-theme="<id>"] (see theme.mjs). */
+
+body[data-theme] {
+  --dim: color-mix(in srgb, var(--fg) 76%, var(--bg));
+  --line: color-mix(in srgb, var(--fg) 18%, var(--bg));
+  --pane-bg: color-mix(in srgb, var(--bg) 85%, light-dark(#fff, #000));
+}
+
+/* ---- light themes ---- */
+
+body[data-theme="light"] {
+  color-scheme: light;
+  --fg: #222;
+  --bg: whitesmoke;
+}
+
+body[data-theme="sepia"] {
+  color-scheme: light;
+  --fg: #5b4636;
+  --bg: color-mix(in srgb, #f4ecd8 60%, #fff);
+}
+
+body[data-theme="solarized-light"] {
+  color-scheme: light;
+  --fg: #586e75;
+  --bg: color-mix(in srgb, #fdf6e3 60%, #fff);
+}
+
+body[data-theme="nord-light"] {
+  color-scheme: light;
+  --fg: #2e3440;
+  --bg: color-mix(in srgb, #e5e9f0 60%, #fff);
+}
+
+/* ---- dark themes ---- */
+
+body[data-theme="dark"] {
+  color-scheme: dark;
+  --fg: #eee;
+  --bg: #333;
+}
+
+body[data-theme="groove-dark"] {
+  color-scheme: dark;
+  --fg: #cec4ac;
+  --bg: #282828;
+}
+
+body[data-theme="solarized-dark"] {
+  color-scheme: dark;
+  --fg: #839496;
+  --bg: #002b36;
+}
+
+body[data-theme="nord-dark"] {
+  color-scheme: dark;
+  --fg: #e5e9f0;
+  --bg: #2e3440;
+}
