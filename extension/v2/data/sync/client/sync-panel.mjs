@@ -816,6 +816,16 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
         `${totals.candidates} candidate(s), ${totals.matched} matched` +
         (totals.kept ? ` (${totals.kept} kept in place)` : '') +
         (dry ? '' : `, ${totals.moved} moved`) + ` (${secs}s)`, 'system');
+      // the renames were page-local file operations no other page can
+      // see: every open mail client gets the heads-up to refresh its
+      // tree and reconcile its open folder
+      if (!dry && totals.moved > 0) {
+        chrome.runtime.sendMessage({
+          type: 'sync-refresh',
+          accountId: picked.id,
+          slug: picked.slug
+        }).catch(() => {});
+      }
       syncView.setStatus(null);
     }
     catch (e) {

@@ -3,15 +3,17 @@ import '../components/combo-view.js';
 import './components/logger-view.js';
 import {initTheme} from './theme.mjs';
 import {initFontScale} from './font-scale.mjs';
-import {init as initDirs, load as loadDirs} from './dirs.mjs';
-import {init as initList, load as loadList, runSearch, clearSearch, isSearching} from './list.mjs';
+import {init as initDirs, load as loadDirs, refresh as refreshDirs} from './dirs.mjs';
+import {init as initList, load as loadList, runSearch, clearSearch, isSearching,
+  syncCurrent} from './list.mjs';
 import {init as initPreview} from './preview.mjs';
 import {init as initAccounts} from './accounts.mjs';
 import {init as initResize} from './resize.mjs';
 import {init as initShortcuts} from './shortcuts.mjs';
 import {initFilters} from './filters.mjs';
 import {init as initSyncEvents} from './sync-events.mjs';
-import {subscribe as subscribeLog} from './logger.mjs';
+import {subscribe as subscribeLog, setStatus as setLogStatus} from './logger.mjs';
+import {init as initSyncRun, requestSync} from './sync-run.mjs';
 import {cancel as cancelJob, dismiss as dismissJob} from './jobs.mjs';
 import * as counters from './counters.mjs';
 
@@ -58,17 +60,49 @@ initFilters();
 initSyncEvents();
 applyPopupSize();
 
-// ---- sync: button → sync tab -----------------------------------------------
+// ---- sync: button → background run / sync tab -------------------------------
 //
 // The client is a local Maildir viewer only — it carries no sync interface.
-// The simple button next to the logger opens the sync client
-// (data/sync/client/index.html) on a new tab; all the panel wiring lives
-// there (data/sync/client/).
+// A plain click on the button next to the logger submits a background sync
+// for the selected account (sync-run.mjs — one pinned logger line, no
+// interface); Shift+Click still opens the sync client
+// (data/sync/client/index.html) on a new tab. The selected-account mirror
+// lives further down; the synced callback only reads it from callbacks,
+// long after this module finished evaluating.
 
 const syncOpen = document.getElementById('sync-open');
 
-syncOpen.addEventListener('click', () => {
-  window.open(chrome.runtime.getURL('/data/sync/client/index.html'), '_blank');
+initSyncRun({
+  prompt: document.getElementById('prompt'),
+  synced: slug => {
+    if (slug === selectedAccount) {
+      // a clean run of the open account: reconcile the open folder in
+      // place (list.mjs' sync — no reload; counters drive the tree
+      // badges, title and favicon from there)
+      syncCurrent();
+    }
+  }
+});
+
+syncOpen.addEventListener('click', e => {
+  if (e.shiftKey) {
+    chrome.tabs.create({url: chrome.runtime.getURL('/data/sync/client/index.html')});
+    return;
+  }
+  const id = currentAccountId();
+  if (id) {
+    requestSync(id);
+  }
+  else {
+    setLogStatus('no account selected', {tone: 'warn', time: Date.now()});
+  }
+});
+
+// ---- explorer: button → /data/explorer/index.html ----------------------------
+
+const explorerOpen = document.getElementById('explorer-open');
+explorerOpen.addEventListener('click', () => {
+  chrome.tabs.create({url: chrome.runtime.getURL('/data/explorer/index.html')});
 });
 
 // server-side search: Enter runs it, Esc clears; the ✕ button mirrors Esc.
@@ -129,6 +163,20 @@ function currentAccountId() {
 function currentDirName() {
   return selectedDir;
 }
+
+// sync and filter runs write into the account dir from other pages (the
+// offscreen engine — background syncs and their post-sync INBOX filter
+// pass — and the sync interface's filter row): their 'sync-refresh'
+// broadcast asks every open client instance to update. This one refreshes
+// the selected account's folder tree and reconciles its open folder in
+// place — no reload, search-safe (list.mjs' sync no-ops during search).
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg?.type !== 'sync-refresh' || msg.slug !== selectedAccount) {
+    return;
+  }
+  refreshDirs();
+  syncCurrent();
+});
 
 // document.title: "<dir> [<n> unread] :: <extension name>". Unread comes
 // from the counter store's mirror-confirmed base, re-rendered on every

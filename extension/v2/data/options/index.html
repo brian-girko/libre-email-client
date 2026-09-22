@@ -38,6 +38,11 @@
           <button type="button" id="forget-storage" hidden>Forget directory</button>
         </div>
         <p class="hint">Browser storage keeps the synced mail inside the extension's own private storage — it needs no directory picker and no permission, but it lives in the browser profile (remove the profile or the extension and the mail is gone). A custom directory keeps the Maildir tree in a folder of your choice instead; the directory handle is remembered across browser restarts, but a lapsed permission has to be re-granted.</p>
+        <label class="check">
+          <input type="checkbox" id="f-picker-auto-open" checked>
+          Automatically open the mail client after directory access
+        </label>
+        <p class="hint">When on, the directory-access picker hands off to the mail client as soon as permission is confirmed. Turn it off to stay on the picker and choose the interface yourself (mail, sync, explorer or options).</p>
       </fieldset>
       <fieldset>
         <legend>WS/TCP bridge</legend>

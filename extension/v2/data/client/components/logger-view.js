@@ -63,6 +63,9 @@ class LoggerView extends HTMLElement {
           gap: calc(2px * var(--font-scale, 1));
           padding: 0 0 calc(4px * var(--font-scale, 1));
         }
+        .job-list:empty {
+          display: none;
+        }
         .line {
           display: flex;
           align-items: center;

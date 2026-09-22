@@ -211,7 +211,7 @@ function init(element) {
   el.addEventListener('open-sync', () => {
     // the sync client is what builds and refreshes the folder tree; the
     // mail client stays open so this offer does not cost the current spot
-    window.open(chrome.runtime.getURL(SYNC_URL), '_blank');
+    chrome.tabs.create({url: chrome.runtime.getURL(SYNC_URL)});
   });
   el.addEventListener('create-dir', e => {
     createDir(e);
@@ -219,26 +219,37 @@ function init(element) {
   el.addEventListener('delete-dir', e => {
     deleteDir(e);
   });
-  // Local mutations (folder create/delete moves the tree) refresh the tree
-  // in place: re-read the folder list + counts from the handle.
-  mirrorChanged.subscribe(async evt => {
-    if (evt?.accountId !== accountId || !el?.isConnected) {
+  mirrorChanged.subscribe(evt => {
+    if (evt?.accountId !== accountId) {
       return;
     }
-    try {
-      const api = await getMailApi(accountId);
-      const dirs = await api.listDirs();
-      counters.prune(accountId, dirs.map(d => d?.name).filter(Boolean));
-      if (!el?.isConnected) {
-        return;
-      }
-      el.dirs = dirs;
-      countDirs(api, accountId, loadToken);
-    }
-    catch {
-      /* transient read failure: the next event retries */
-    }
+    refreshTree();
   });
+}
+
+// In-place tree refresh: re-read the folder list + counts from the
+// handle. Local mutations report through mirrorChanged; sync and
+// filter runs write into the account dir from OTHER pages (the engine
+// document, the sync interface) — index.mjs routes their
+// 'sync-refresh' broadcasts here. No reload: the tree and the counter
+// sweep update in place.
+async function refreshTree() {
+  if (!accountId || !el?.isConnected) {
+    return;
+  }
+  try {
+    const api = await getMailApi(accountId);
+    const dirs = await api.listDirs();
+    counters.prune(accountId, dirs.map(d => d?.name).filter(Boolean));
+    if (!el?.isConnected) {
+      return;
+    }
+    el.dirs = dirs;
+    countDirs(api, accountId, loadToken);
+  }
+  catch {
+    /* transient read failure: the next event retries */
+  }
 }
 
 // "+ New" on the folder pane: ask for a name, create under the selected
@@ -369,4 +380,4 @@ async function deleteDir(e) {
   });
 }
 
-export {init, load, currentDirs};
+export {init, load, currentDirs, refreshTree as refresh};

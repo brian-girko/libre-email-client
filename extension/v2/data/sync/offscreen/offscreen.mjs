@@ -3,12 +3,17 @@
 // the whole interface is chrome.runtime messages.
 //
 //   sync-job       {kind:'sync'|'dry'|'sync-dir'|'dry-dir'|'discard'|
-//                   'sync-dirs', account, dir?, dirs?} → {ok, queued} —
+//                   'sync-dirs', account, dir?, dirs?, filters?} →
+//                   {ok, queued} —
 //                   the job ENQUEUES and runs after the previous one;
 //                   never a 'busy' rejection. 'sync-dirs' runs one scoped
 //                   sync per dir in its dirs array (one session, per-dir
 //                   failures logged and skipped; lastSyncAt stamps only
-//                   when every dir finished clean)
+//                   when every dir finished clean). A full 'sync' job may
+//                   carry the options-page filter list: after it lands,
+//                   the NEW INBOX messages are filtered on the spot
+//                   (runPostSyncFilters) — interface jobs never carry
+//                   filters, their behavior is unchanged
 //   sync-stop                       → the kill path: drops the queued jobs,
 //                   says goodbye to the sync-views (a final log broadcast
 //                   they all receive) and lets the worker close this document
@@ -34,6 +39,10 @@
 // Lifecycle: this document only exists while jobs are going. The worker
 // creates it for the first 'sync-job' it forwards; when the job list runs
 // empty this document asks the worker (sync-close) to close it again.
+//
+// Every settled non-dry job ends with a 'sync-refresh' broadcast
+// {accountId, slug}: the writes happened here, so the open mail clients
+// refresh their folder tree and open folder on receipt.
 
 'use strict';
 
@@ -41,6 +50,7 @@ import {createClient} from './client.mjs';
 import {bootSilent} from '../disk.mjs';
 import {MaildirStore} from '../maildir.mjs';
 import {createSync} from './sync.mjs';
+import {runAllFilters} from '../filters/run.mjs';
 
 // Everything that needs restricted chrome.* APIs lives elsewhere:
 //   - account configs arrive IN the job (the client page resolves them;
@@ -334,7 +344,10 @@ function updateBusy() {
 function enqueueJob(msg) {
   queue.push({
     rid: msg.rid, kind: msg.kind, account: msg.account,
-    dir: msg.dir, dirs: Array.isArray(msg.dirs) ? msg.dirs.slice() : null
+    dir: msg.dir, dirs: Array.isArray(msg.dirs) ? msg.dirs.slice() : null,
+    // the mail client's syncs carry the stored filter list for the
+    // post-sync pass over the NEW INBOX messages (runPostSyncFilters)
+    filters: Array.isArray(msg.filters) ? msg.filters.slice() : null
   });
   engineLog('queue',
     `${describeJob(msg)} requested — ` +
@@ -414,6 +427,63 @@ function reportDelimiter(account, summary) {
       accountId: account.id,
       delimiter
     });
+  }
+}
+
+/**
+ * The mail client's background syncs carry the options-page filter list
+ * in the job (the offscreen has no chrome.storage): once the run landed,
+ * the NEW INBOX messages — exactly this run's pulls, "new" regardless of
+ * read state, never the unread heuristic — are filtered right here on
+ * the store the run just wrote. First match wins per message in the
+ * filters' stored order ('of Filter N' numbering); every match is
+ * renamed into its destination Maildir (keepFmd5), the next sync pushes
+ * the server move. Interface-submitted jobs carry no filters: the sync
+ * interface keeps its own behavior — its filter row stays fully manual.
+ * A pass failure logs a warn and never fails the sync itself.
+ */
+async function runPostSyncFilters(job, plan, store, account) {
+  const stored = Array.isArray(job.filters) ? job.filters : [];
+  const filters = stored.filter(f => f && f.enabled !== false &&
+    typeof f.query === 'string' && f.folder);
+  if (job.kind !== 'sync' || !filters.length) {
+    return;
+  }
+  const newUids = (plan?.ops ?? [])
+    .filter(op => op?.kind === 'pull' && op.folder === 'INBOX' &&
+      Number.isFinite(Number(op.uid)))
+    .map(op => Number(op.uid));
+  if (!newUids.length) {
+    engineLog('filter', '(no new INBOX messages — filter pass skipped)', 'hint');
+    return;
+  }
+  const note = (content, cls = '') => engineLog('filter', content, cls);
+  const t0 = Date.now();
+  engineLog('filter',
+    `— filters · ${account.name || account.id} · INBOX — ` +
+    `${newUids.length} new message(s)`, 'system');
+  try {
+    const res = await runAllFilters(store, {
+      dir: 'INBOX',
+      filters,
+      accountId: account.id,
+      onlyUids: new Set(newUids),
+      dry: false,
+      filterNoOf: f => {
+        const i = stored.findIndex(g => g && g.id === f.id);
+        return i >= 0 ? i + 1 : null;
+      },
+      log: note
+    });
+    const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    engineLog('filter',
+      `filter pass finished: ${res.candidates} candidate(s), ` +
+      `${res.matched} matched` +
+      (res.kept ? ` (${res.kept} kept in place)` : '') +
+      `, ${res.moved} moved (${secs}s)`, 'system');
+  }
+  catch (e) {
+    engineLog('warn', 'filter pass FAILED: ' + (e?.stack || e), 'warn');
   }
 }
 
@@ -558,13 +628,21 @@ async function withSession(job) {
           engineLog('summary', '(nothing to do)');
         }
       }
-      else if (summary.finishedAt && !summary.failed) {
-        broadcast({
-          type: 'sync-synced',
-          accountId: account.id,
-          finishedAt: summary.finishedAt
-        });
-        engineLog('sync', 'lastSyncAt handed to the service worker');
+      else {
+        if (summary.finishedAt && !summary.failed) {
+          // the summary carries the snapshot's ISO lastSyncAt; broadcast
+          // epoch ms like the sync-dirs path does, so the worker's
+          // sync.lastSyncAt.<id> stamp has one format everywhere
+          broadcast({
+            type: 'sync-synced',
+            accountId: account.id,
+            finishedAt: Date.parse(summary.finishedAt) || Date.now()
+          });
+          engineLog('sync', 'lastSyncAt handed to the service worker');
+        }
+        // the mail client's syncs carry the filter list: the new INBOX
+        // messages are filtered right here, before the job settles
+        await runPostSyncFilters(job, plan, store, account);
       }
     }
     return {started: true};
@@ -608,6 +686,16 @@ async function scheduleDrain() {
       await withSession(job);
       queue.shift();
       emitJobs();
+      // the run (and its filter pass) wrote into the account dir from
+      // this invisible document — every open mail client needs the
+      // heads-up to refresh its tree and reconcile its open folder
+      if (!job.kind.startsWith('dry')) {
+        broadcast({
+          type: 'sync-refresh',
+          accountId: job.account?.id ?? null,
+          slug: job.account?.slug ?? null
+        });
+      }
     }
   }
   catch (e) {
@@ -635,6 +723,14 @@ function handleInit() {
       ({seq, ts, type, content, cls, gen: BOOT_GEN})),
     running: !!(draining || queue.length),
     label: activeLabel,
+    // the pending queue, rid included: pages that track a submitted run
+    // (e.g. the mail client's background sync, whose state survives its
+    // own reloads in chrome.storage.session) ask whether THEIR rid is
+    // still queued — same shape as the sync-jobs broadcast
+    items: queue.map(job => ({
+      rid: job.rid, kind: job.kind, dir: job.dir, dirs: job.dirs,
+      label: describeJob(job)
+    })),
     granted: access.granted,
     reason: access.reason,
     raw: access.raw,

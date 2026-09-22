@@ -249,6 +249,9 @@ export async function runFilter(store, {
  *   log line or move
  * @param {string|null} [opts.accountId] the mail's own account id
  * @param {string} [opts.scope] 'unread' | '10m' | '30m' | '1h' | '5h'
+ * @param {Set<number>} [opts.onlyUids] explicit candidate set — replaces
+ *   the unread/recency gates entirely (the engine's post-sync pass names
+ *   exactly the messages the run pulled: "new", regardless of read state)
  * @param {boolean} [opts.dry] report matches, rename nothing
  * @param {Function} [opts.filterNoOf] filterNoOf(filter) → 1-based
  *   position in the stored list (shown as 'of Filter N'); null/absent
@@ -260,7 +263,7 @@ export async function runFilter(store, {
  */
 export async function runAllFilters(store, {
   dir, filters, accountId = null, scope = 'unread', dry = false,
-  filterNoOf = null, log = () => {}
+  onlyUids = null, filterNoOf = null, log = () => {}
 } = {}) {
   const res = {candidates: 0, matched: 0, moved: 0, kept: 0};
   const list = Array.isArray(filters) ? filters : [];
@@ -277,12 +280,20 @@ export async function runAllFilters(store, {
 
   // candidates: engine-tracked files of THIS dir that are unread (the S
   // letter is absent); recency scopes cut further by the message's own
-  // Date header (the file's landing time stands in when missing)
-  const key = scopeKey(scope);
-  const cutoff = SCOPES[key] == null ? null : Date.now() - SCOPES[key] * 1000;
+  // Date header (the file's landing time stands in when missing).
+  // onlyUids replaces all of that with an explicit set — the post-sync
+  // pass targets exactly the run's pulls, read or unread.
+  const only = onlyUids instanceof Set ? onlyUids : null;
+  const cutoff = only ? null : (() => {
+    const key = scopeKey(scope);
+    return SCOPES[key] == null ? null : Date.now() - SCOPES[key] * 1000;
+  })();
   const candidates = [];
   for (const [uid, entry] of listing.entries) {
-    if (!Number.isFinite(uid) || (entry.flags ?? []).includes('\\Seen')) {
+    if (!Number.isFinite(uid)) {
+      continue;
+    }
+    if (only ? !only.has(uid) : (entry.flags ?? []).includes('\\Seen')) {
       continue;
     }
     candidates.push({uid, entry});
@@ -290,7 +301,7 @@ export async function runAllFilters(store, {
   candidates.sort((a, b) => a.uid - b.uid);
   res.candidates = candidates.length;
   if (!candidates.length) {
-    log(`filter ${dir}: 0 unread candidate(s) — nothing to do`, 'hint');
+    log(`filter ${dir}: 0 ${only ? 'new' : 'unread'} candidate(s) — nothing to do`, 'hint');
     return res;
   }
 

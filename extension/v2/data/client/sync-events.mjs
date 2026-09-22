@@ -12,6 +12,7 @@
 import * as logger from './logger.mjs';
 import {listAccounts} from './accounts.mjs';
 import {getMailApi} from './mail.mjs';
+import {findRegistryAccount} from './sync-run.mjs';
 
 const accounts = new Map();   // accountId -> label
 const lastSynced = new Map(); // accountId -> timestamp
@@ -24,6 +25,23 @@ function stamp(ts) {
   return d.toDateString() === new Date().toDateString()
     ? d.toLocaleTimeString()
     : d.toLocaleString();
+}
+
+// Sync stamps arrive in more than one shape — ms numbers (the engine's
+// sync-dirs path), numeric strings, and ISO strings (the engine's plain
+// sync summary carries the snapshot's ISO lastSyncAt). Number(ISO) is
+// NaN, and a NaN in the clock map renders as "never synced" — every
+// stamp is normalized to epoch ms before it enters the map.
+function toMs(ts) {
+  if (typeof ts === 'number') {
+    return Number.isFinite(ts) ? ts : 0;
+  }
+  const n = Number(ts);
+  if (Number.isFinite(n) && n > 0) {
+    return n;
+  }
+  const p = Date.parse(ts);
+  return Number.isFinite(p) ? p : 0;
 }
 
 // The persistent status: one segment per known account, each with its own
@@ -45,13 +63,14 @@ function refreshStatus(accountId = null) {
 }
 
 function noteSynced(accountId, syncedAt, {silent = false} = {}) {
-  if (!accountId || !syncedAt) {
+  const at = toMs(syncedAt);
+  if (!accountId || !at) {
     return;
   }
-  if ((lastSynced.get(accountId) || 0) >= Number(syncedAt)) {
+  if ((lastSynced.get(accountId) || 0) >= at) {
     return; // monotonic: a folder-only touch never rewinds the clock
   }
-  lastSynced.set(accountId, Number(syncedAt));
+  lastSynced.set(accountId, at);
   if (!silent) {
     refreshStatus(accountId);
   }
@@ -97,9 +116,9 @@ async function loadPersistence() {
     const ids = [...accounts.keys()];
     for (const id of ids) {
       try {
-        const t = await (await getMailApi(id)).lastSynced();
-        if (Number(t)) {
-          noteSynced(id, Number(t), {silent: true});
+        const t = toMs(await (await getMailApi(id)).lastSynced());
+        if (t) {
+          noteSynced(id, t, {silent: true});
         }
       }
       catch {
@@ -114,6 +133,23 @@ async function loadPersistence() {
 }
 
 // ---- wiring -----------------------------------------------------------------
+
+// Live clocks: every sync run (a background one submitted here, or one
+// from the sync interface) ends with the engine's 'sync-synced'
+// broadcast. It carries the registry id; the clocks here key by the
+// granted-directory slug — resolve it through the sync registry. The
+// null-finishedAt discard path resets the stamp on the server side only:
+// the local copy is gone, nothing to show a clock for.
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg?.type !== 'sync-synced' || msg.finishedAt == null) {
+    return;
+  }
+  findRegistryAccount(msg.accountId).then(acc => {
+    if (acc?.slug) {
+      noteSynced(acc.slug, msg.finishedAt);
+    }
+  }).catch(() => {});
+});
 
 function init() {
   loadAccounts().then(loadPersistence);

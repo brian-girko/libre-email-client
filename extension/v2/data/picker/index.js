@@ -7,9 +7,10 @@
 // The page only matters in the 'external' storage mode; with the default
 // 'browser storage' root (OPFS, data/sync/root-handle.mjs) there is nothing
 // to grant — it says so and offers the way back to the options. When the
-// stored external handle still has permission, this page offers the choice
-// between the sync client interface (data/sync/client/index.html) and the
-// mail client (data/client/index.html).
+// stored external handle still has permission (or in OPFS mode, straight
+// away), this page hands off to the mail client (data/client/index.html) by
+// default; the 'picker.autoOpen' preference (options page, default on) keeps
+// the destination buttons around for a manual choice instead.
 
 'use strict';
 
@@ -34,6 +35,17 @@ const dirEl = document.getElementById('dir');
 
 const e2msg = e => e?.message || String(e);
 
+// options preference: hand off to the mail client as soon as access is
+// confirmed (default on; off keeps the manual destination choice)
+async function autoOpen() {
+  const {'picker.autoOpen': value} = await chrome.storage.local.get({'picker.autoOpen': true});
+  return value !== false;
+}
+
+function openClient() {
+  location.replace(chrome.runtime.getURL('data/client/index.html'));
+}
+
 function setStatus(text, ok) {
   statusEl.textContent = text;
   statusEl.className = ok ? 'ok' : 'bad';
@@ -56,8 +68,12 @@ async function forget() {
   await renderStatus();
 }
 
-// OPFS mode needs no handle at all: point the visitor back to the options.
+// OPFS mode needs no handle at all: hand off to the mail client (or point
+// the visitor back to the options for a manual choice).
 async function opfsMode() {
+  if (await autoOpen()) {
+    return openClient();
+  }
   pickBtn.hidden = true;
   grantBtn.hidden = true;
   forgetBtn.hidden = true;
@@ -108,7 +124,12 @@ async function boot() {
     openOptionsBtn.hidden = false;
     try {
       await verifyRoot(handle);
-      // access is confirmed: let the user pick the destination page
+      // access is confirmed: hand off to the mail client by default, let the
+      // user pick the destination page when the preference says so
+      if (await autoOpen()) {
+        setStatus('Access confirmed for ' + (name || 'the directory') + '.', true);
+        return openClient();
+      }
       pickBtn.hidden = true;
       grantBtn.hidden = true;
       forgetBtn.hidden = false;

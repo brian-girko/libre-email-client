@@ -45,6 +45,7 @@ const badgeEnabledEl = document.getElementById('f-badge-enabled');
 const badgeIntervalEl = document.getElementById('f-badge-interval');
 const badgeMaxAgeEl = document.getElementById('f-badge-max-age');
 const badgeIdleEl = document.getElementById('f-badge-idle');
+const pickerAutoOpenEl = document.getElementById('f-picker-auto-open');
 const checkBadgeBtn = document.getElementById('check-badge');
 const badgeStatusEl = document.getElementById('badge-status');
 const saveGlobalBtn = document.getElementById('save-global');
@@ -518,7 +519,8 @@ async function loadGlobalPrefs() {
     'badge.enabled': true,
     'badge.idleCheck': true,
     'badge.interval': 5,
-    'badge.maxAge': 0
+    'badge.maxAge': 0,
+    'picker.autoOpen': true
   });
   storageOpfsEl.checked = res['storage.mode'] !== MODE_EXTERNAL;
   storageExternalEl.checked = res['storage.mode'] === MODE_EXTERNAL;
@@ -542,6 +544,7 @@ async function loadGlobalPrefs() {
   badgeMaxAgeEl.value = BADGE_MAX_AGES.includes(Number(res['badge.maxAge']))
     ? String(Number(res['badge.maxAge']))
     : '0';
+  pickerAutoOpenEl.checked = res['picker.autoOpen'] !== false;
   updateWsUrlState();
   updateStorageUi(); // async status line: no await, it lands when the query returns
 }
@@ -600,7 +603,8 @@ saveGlobalBtn.addEventListener('click', async () => {
     'badge.interval': badgeInterval,
     'badge.maxAge': BADGE_MAX_AGES.includes(Number(badgeMaxAgeEl.value))
       ? Number(badgeMaxAgeEl.value)
-      : 0
+      : 0,
+    'picker.autoOpen': pickerAutoOpenEl.checked
   });
   // Clients gate the root through data/sync/disk.mjs on every call, but the
   // pages themselves hold stale state under a mode whose gate now answers
