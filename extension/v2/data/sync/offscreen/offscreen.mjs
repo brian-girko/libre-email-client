@@ -2,9 +2,13 @@
 // (data/sync/offscreen/offscreen.html). No UI:
 // the whole interface is chrome.runtime messages.
 //
-//   sync-job       {kind:'sync'|'dry'|'sync-dir'|'dry-dir'|'discard',
-//                   account, dir} → {ok, queued} — the job ENQUEUES and
-//                   runs after the previous one; never a 'busy' rejection
+//   sync-job       {kind:'sync'|'dry'|'sync-dir'|'dry-dir'|'discard'|
+//                   'sync-dirs', account, dir?, dirs?} → {ok, queued} —
+//                   the job ENQUEUES and runs after the previous one;
+//                   never a 'busy' rejection. 'sync-dirs' runs one scoped
+//                   sync per dir in its dirs array (one session, per-dir
+//                   failures logged and skipped; lastSyncAt stamps only
+//                   when every dir finished clean)
 //   sync-stop                       → the kill path: drops the queued jobs,
 //                   says goodbye to the sync-views (a final log broadcast
 //                   they all receive) and lets the worker close this document
@@ -283,9 +287,27 @@ let draining = false;         // one session at a time (serial queue; no job
                               // kind is parallel yet)
 let activeLabel = null;
 
+const DIRS_LABEL_MAX = 3;         // names shown before "+N more"
+
+/** human list of a sync-dirs job's targets (truncated) */
+function describeDirs(dirs) {
+  const names = (Array.isArray(dirs) ? dirs : []).map(String);
+  if (!names.length) {
+    return '';
+  }
+  const head = names.slice(0, DIRS_LABEL_MAX).join(', ');
+  return names.length > DIRS_LABEL_MAX
+    ? head + ` (+${names.length - DIRS_LABEL_MAX} more)`
+    : head;
+}
+
 const describeJob = job => {
   const a = job.account || {};
   const name = a.name || a.id || 'account';
+  if (job.kind === 'sync-dirs') {
+    return `${job.kind} · ${name}` +
+      (describeDirs(job.dirs) ? ' · ' + describeDirs(job.dirs) : '');
+  }
   return `${job.kind} · ${name}` +
     (job.kind.endsWith('-dir') && job.dir ? ' · ' + job.dir : '');
 };
@@ -296,7 +318,8 @@ function emitJobs() {
     type: 'sync-jobs',
     busy: draining || queue.length > 0,
     items: queue.map(job => ({
-      rid: job.rid, kind: job.kind, dir: job.dir, label: describeJob(job)
+      rid: job.rid, kind: job.kind, dir: job.dir, dirs: job.dirs,
+      label: describeJob(job)
     }))
   });
 }
@@ -309,7 +332,10 @@ function updateBusy() {
 }
 
 function enqueueJob(msg) {
-  queue.push({rid: msg.rid, kind: msg.kind, account: msg.account, dir: msg.dir});
+  queue.push({
+    rid: msg.rid, kind: msg.kind, account: msg.account,
+    dir: msg.dir, dirs: Array.isArray(msg.dirs) ? msg.dirs.slice() : null
+  });
   engineLog('queue',
     `${describeJob(msg)} requested — ` +
     queue.map(describeJob).join(', ')
@@ -373,6 +399,24 @@ function letBridgeSleep() {
   }
 }
 
+/**
+ * Fire-and-forget delimiter report: the engine's survey learned the
+ * account's hierarchy delimiter; the service worker persists it
+ * (sync.delimiter.<id>) so the options page can normalize '/'-typed
+ * filter paths onto the server's spelling and the sync panel can seed
+ * its stores — the offscreen document has no chrome.storage itself.
+ */
+function reportDelimiter(account, summary) {
+  const delimiter = summary?.delimiter;
+  if (account?.id && typeof delimiter === 'string' && delimiter) {
+    broadcast({
+      type: 'sync-delimiter',
+      accountId: account.id,
+      delimiter
+    });
+  }
+}
+
 /** every job boots its own client + engine and tears them down after */
 async function withSession(job) {
   let mail = null;
@@ -390,7 +434,9 @@ async function withSession(job) {
       engineLog('warn',
         gate.reason === 'need-regrant'
           ? 'directory access needs a re-grant — open the sync panel for the link'
-          : 'no granted directory (run the picker)',
+          : gate.reason === 'gate-failure'
+            ? `storage gate failed: ${gate.error || 'unknown error'}`
+            : 'no granted directory (run the picker)',
         'warn'
       );
       return {started: false, reason: gate.reason};
@@ -398,7 +444,10 @@ async function withSession(job) {
     const rootHandle = gate.handle;
     const account = job.account;
     const only = job.kind.endsWith('-dir') ? job.dir : undefined;
-    const label = `${account.name || account.id}${only ? ' · ' + only : ''}`;
+    const dirsNote = job.kind === 'sync-dirs'
+      ? ` · ${describeDirs(job.dirs)}`
+      : '';
+    const label = `${account.name || account.id}${only ? ' · ' + only : ''}${dirsNote}`;
     activeLabel = label;
     updateBusy();
     keepBridgeAlive();
@@ -438,6 +487,57 @@ async function withSession(job) {
       broadcast({type: 'sync-synced', accountId: account.id, finishedAt: null});
       engineLog('discard', 'lastSyncAt handed to the service worker — press Sync for the full re-pull');
     }
+    else if (job.kind === 'sync-dirs') {
+      // one session, one scoped sync per suggested dir: each run reuses
+      // the single-dir scoping (only: dir) and its own snapshot read —
+      // a per-dir failure logs and moves on, the rest still sync
+      const dirs = (job.dirs || []).filter(d =>
+        typeof d === 'string' && d);
+      if (!dirs.length) {
+        engineLog('sync', '(no dirs listed — nothing to sync)');
+        return {started: true};
+      }
+      let failed = 0;
+      for (const dir of dirs) {
+        engineLog('system', `— ${label} · ${dir} —`, 'system');
+        try {
+          const engine = createSync(mail, store, {
+            account: `${account.user}@${account.host}`,
+            log: engineLog,
+            confirmPurge,
+            confirmDropDirectory,
+            pullBatch,
+            pullQuantum,
+            miningBatch,
+            only: dir
+          });
+          const {summary} = await engine.run({dry: false});
+          reportDelimiter(account, summary);
+          engineLog('summary', summary);
+          if (!summary.finishedAt || summary.failed) {
+            failed++;
+          }
+        }
+        catch (e) {
+          failed++;
+          engineLog('warn', `FAILED ${dir}: ` + (e?.stack || e), 'warn');
+        }
+      }
+      // lastSyncAt is account-level: stamp it only when EVERY dir ran clean,
+      // so a partial pass never looks like a completed account sync
+      if (failed) {
+        engineLog('sync',
+          `${failed} of ${dirs.length} dir(s) failed — lastSyncAt left untouched`);
+      }
+      else {
+        broadcast({
+          type: 'sync-synced',
+          accountId: account.id,
+          finishedAt: Date.now()
+        });
+        engineLog('sync', 'lastSyncAt handed to the service worker');
+      }
+    }
     else {
       const engine = createSync(mail, store, {
         account: `${account.user}@${account.host}`,
@@ -451,6 +551,7 @@ async function withSession(job) {
       });
       const dry = job.kind.startsWith('dry');
       const {plan, summary} = await engine.run({dry});
+      reportDelimiter(account, summary);   // dry runs survey too — always fresh
       engineLog('summary', summary);
       if (dry) {
         if (!plan.ops.length && !plan.conflicts.length) {
@@ -542,9 +643,12 @@ function handleInit() {
 }
 
 const acceptsJob = msg =>
-  ['sync', 'dry', 'sync-dir', 'dry-dir', 'discard'].includes(msg.kind) &&
+  ['sync', 'dry', 'sync-dir', 'dry-dir', 'sync-dirs', 'discard'].includes(msg.kind) &&
   !!(msg.account && typeof msg.account === 'object' &&
-     msg.account.host && msg.account.port && msg.account.user);
+     msg.account.host && msg.account.port && msg.account.user) &&
+  (msg.kind !== 'sync-dirs' || (
+    Array.isArray(msg.dirs) && msg.dirs.length &&
+    msg.dirs.every(d => typeof d === 'string' && d)));
 
 chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   switch (msg?.type) {

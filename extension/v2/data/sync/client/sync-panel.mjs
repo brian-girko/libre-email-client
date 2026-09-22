@@ -29,15 +29,22 @@
 // offscreen: they execute right here — the page owns the granted handle,
 // a MaildirStore and chrome.storage (the options-page filter list) — and
 // narrate through the same log pane.
+//
+// The suggested-dirs row reads the worker's dirty report (dirty.mjs,
+// sync-dirty-query): every dir a client edit marked as needing a server
+// resync. Its Sync suggested dirs button submits ONE 'sync-dirs' job —
+// the engine runs one scoped sync per listed dir in a single session;
+// the report self-clears the picked dirs at enqueue, and the button
+// stays disabled whenever the report is empty.
 
 import '../../components/prompt-view.js';
 import './components/sync-view.js';
 import {loadAccounts, decryptPassword} from './accounts.mjs';
-import {MaildirStore} from '../maildir.mjs';
+import {MaildirStore, sameFolder} from '../maildir.mjs';
 import {bootSilent} from '../disk.mjs';
 import {getRootHandle} from '../../client/local-api.mjs';
 import {loadFilters} from '../filters/route.mjs';
-import {runFilter} from '../filters/run.mjs';
+import {runAllFilters, runFilter} from '../filters/run.mjs';
 
 /**
  * Wires one <sync-view> element to the offscreen sync engine.
@@ -62,6 +69,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     ['dry', 'dry'],
     ['sync-dir', 'syncdir'],
     ['dry-dir', 'drydir'],
+    ['sync-dirs', 'syncdirs'],
     ['discard', 'discard'],
     ['filter-dir', 'filterrun'],
     ['dry-filter-dir', 'filterdry']
@@ -196,6 +204,9 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       }
       if (dirty) {
         applyPending();
+        // one of our jobs settled: the dirty report may have changed (the
+        // store self-clears at enqueue — the suggested line re-reads it)
+        refreshDirty().catch(() => {});
       }
       return;
     }
@@ -204,6 +215,9 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
         syncView.setBusy(!!msg.busy, msg.busy ? labelOf(msg) : null);
         if (!msg.busy) {
           syncView.setStatus('run finished');
+          // a run (here or from another view) settled: the store may have
+          // self-cleared at its enqueue — re-read the suggested line
+          refreshDirty().catch(() => {});
         }
       }
       return;
@@ -324,7 +338,28 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       }
     }
     await refreshDirs();
-    return refreshFilters();
+    return Promise.all([refreshFilters(), refreshDirty()]);
+  }
+
+  /**
+   * Opens the account's MaildirStore with the engine-discovered hierarchy
+   * delimiter stamped in (sync.delimiter.<id>, persisted by the service
+   * worker after every engine survey). Folder names must be spelled exactly
+   * like the engine does: listFolders() maps local Maildir names back to
+   * server names and filter-run moves must land in engine-compatible
+   * Maildirs — the constructor's '/' default is only right for
+   * '/'-delimiter servers.
+   */
+  async function openStore(root, slug, accountId) {
+    const store = new MaildirStore(root, slug);
+    await store.open();
+    const res = await chrome.storage.local.get('sync.delimiter.' + accountId)
+      .catch(() => ({}));
+    const delimiter = res['sync.delimiter.' + accountId];
+    if (typeof delimiter === 'string' && delimiter) {
+      store.delimiter = delimiter;
+    }
+    return store;
   }
 
   async function refreshDirs() {
@@ -333,8 +368,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     let names = [];
     if (acc && root) {
       try {
-        const store = new MaildirStore(root, acc.slug);
-        await store.open();
+        const store = await openStore(root, acc.slug, acc.id);
         names = (await store.listFolders()).sort((a, b) => a.localeCompare(b));
       }
       catch (e) {
@@ -378,6 +412,30 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     const preferred = acc ? await getLastPref('lastFilter.' + acc.id) : '';
     syncView.setFilters(list, preferred || null);
     syncView.setScope(await getLastPref('lastFilterScope'));
+  }
+
+  /**
+   * The dirty report (dirty.mjs) for the picked account, rendered as the
+   * suggested-dirs line: every dir a client edit marked as needing a
+   * server resync. The store keys accounts by the client's slug; the
+   * locked mode may dictate the options-page id — both spell the same
+   * account (findAccount resolves either), so the whole report is read
+   * and matched on both. Re-queried on open, on account changes, and
+   * whenever our submitted jobs settle: the store self-clears at enqueue,
+   * so the suggested list empties the moment a sync picks its dirs up.
+   */
+  async function refreshDirty() {
+    const acc = findAccount(syncView.pickedAccount());
+    let dirs = [];
+    if (acc) {
+      const res = await chrome.runtime.sendMessage({type: 'sync-dirty-query'})
+        .catch(() => null);
+      if (res?.ok) {
+        const marks = res.dirs?.[acc.slug] ?? res.dirs?.[acc.id] ?? {};
+        dirs = Object.keys(marks).filter(d => typeof d === 'string' && d);
+      }
+    }
+    syncView.setSuggested(dirs);
   }
 
   async function open() {
@@ -506,6 +564,13 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       syncView.setStatus('access: no stored handle — run the picker');
       return;
     }
+    if (gate.reason === 'gate-failure') {
+      // the root decision itself failed (mode read / opfs branch) — not a
+      // lapsed external grant, so the picker is not the answer
+      syncView.setGranted(false);
+      syncView.setStatus('access: gate failed (' + (gate.error || 'unknown') + ')');
+      return;
+    }
     if (gate.raw === 'denied') {
       // the query says revoked, but page-context checks misread live grants:
       // a successful write proves the access, so the row stays down
@@ -555,7 +620,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     if (!forcedAccount && id) {
       setLastPref('lastAccount', id);
     }
-    return Promise.all([refreshDirs(), refreshFilters()]);
+    return Promise.all([refreshDirs(), refreshFilters(), refreshDirty()]);
   });
   syncView.addEventListener('sync-dir-changed', e => {
     const acc = findAccount(syncView.pickedAccount());
@@ -595,6 +660,9 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
         applyPending();
         syncView.setBusy(false, null);
         syncView.setStatus('sync stopped');
+        // the killed run's dirs left the store at enqueue already: the
+        // suggested line re-reads what actually remains
+        refreshDirty().catch(() => {});
       })
       .catch(e => syncView.setStatus('stop failed: ' + (e?.message || String(e))));
   });
@@ -632,12 +700,15 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
    * and the Maildir store live here too. The filter object is re-read
    * from storage (never a stale copy), candidates come from the local
    * mirror and every output line lands in the log pane. The '__all__'
-   * pick resolves to every runnable filter of the picked account, run
-   * one after another (stop on the first failure — the individual runs
-   * are atomic renames, so the settled part is safe). A run in flight
-   * pins both filter buttons (applyPending) until it settles; closing
-   * the panel mid-run lets it finish — every moveMessage is an
-   * independent atomic rename, so partial runs are always safe.
+   * pick resolves to every runnable filter of the picked account and
+   * runs FIRST MATCH WINS per message (the options page's rule): the
+   * stored order is the precedence, and a match whose destination IS
+   * the source dir anchors the message in place — later filters never
+   * move it elsewhere. One failing candidate or move never stops the
+   * rest. A run in flight pins both filter buttons (applyPending) until
+   * it settles; closing the panel mid-run lets it finish — every
+   * moveMessage is an independent atomic rename, so partial runs are
+   * always safe.
    */
   async function runFilterJob(kind, accountId, dir, detail) {
     const picked = findAccount(accountId);
@@ -654,6 +725,10 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       (!f.accountId || f.accountId === picked.id);
     let chosen;
     if (detail?.filterId === '__all__') {
+      // every runnable filter joins the walk — including ones whose
+      // destination IS the source dir: first match wins per message and
+      // a self-targeted winner anchors its messages in place instead of
+      // letting later filters move them elsewhere (runAllFilters)
       chosen = filters.filter(runnable);
       if (!chosen.length) {
         syncView.setStatus('no runnable filters — re-check the options page');
@@ -675,11 +750,19 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     }
     let store = null;
     try {
-      store = new MaildirStore(root, picked.slug);
-      await store.open();
+      store = await openStore(root, picked.slug, picked.id);
     }
     catch (e) {
       syncView.setStatus('cannot open the local mirror: ' + (e?.message || e));
+      return;
+    }
+    // a single pick whose destination IS the source dir never starts:
+    // compared through the account's delimiter spelling ('/'-typed
+    // filter paths vs the canonical listFolders names); the run.mjs
+    // guard repeats the check as the last line of defence
+    if (detail?.filterId !== '__all__' &&
+        sameFolder(chosen[0].folder, dir, store.delimiter)) {
+      syncView.setStatus(`source and destination are both "${dir}" — filter not run`);
       return;
     }
     const dry = kind === 'dry-filter-dir';
@@ -693,24 +776,45 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     try {
       syncView.setStatus((dry ? 'dry-running' : 'running') + ' filter' +
         (chosen.length > 1 ? 's' : '') + ' on ' + dir + '…');
-      const totals = {candidates: 0, matched: 0, moved: 0};
-      for (const filter of chosen) {
-        const res = await runFilter(store, {
+      const totals = {candidates: 0, matched: 0, moved: 0, kept: 0};
+      if (detail?.filterId === '__all__') {
+        // first match wins across the stored order: one walk decides
+        // every message's destination (a self-targeted winner anchors
+        // its messages in place); match lines name the filter's 1-based
+        // position in the STORED list (stable options-page order)
+        const res = await runAllFilters(store, {
           dir,
-          filter,
+          filters: chosen,
           accountId: picked.id,
           scope,
           dry,
+          filterNoOf: f => {
+            const i = filters.findIndex(g => g && g.id === f.id);
+            return i >= 0 ? i + 1 : null;
+          },
           log: note
         });
-        totals.candidates += res.candidates;
-        totals.matched += res.matched;
-        totals.moved += res.moved;
+        Object.assign(totals, res);
+      }
+      else {
+        const res = await runFilter(store, {
+          dir,
+          filter: chosen[0],
+          accountId: picked.id,
+          scope,
+          dry,
+          filterNo: null,
+          log: note
+        });
+        totals.candidates = res.candidates;
+        totals.matched = res.matched;
+        totals.moved = res.moved;
       }
       const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
       note(`filter ${dry ? 'dry run' : 'run'} finished` +
         (chosen.length > 1 ? ` (${chosen.length} filter(s))` : '') + ': ' +
         `${totals.candidates} candidate(s), ${totals.matched} matched` +
+        (totals.kept ? ` (${totals.kept} kept in place)` : '') +
         (dry ? '' : `, ${totals.moved} moved`) + ` (${secs}s)`, 'system');
       syncView.setStatus(null);
     }
@@ -725,7 +829,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
   }
 
   syncView.addEventListener('sync-request', async e => {
-    const {kind, account: accountId, dir} = e.detail;
+    const {kind, account: accountId, dir, dirs} = e.detail;
     if (FILTER_KINDS.has(kind)) {
       await runFilterJob(kind, accountId, dir, e.detail);
       return;
@@ -733,6 +837,14 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     const picked = findAccount(accountId);
     if (!picked) {
       syncView.setStatus('account "' + accountId + '" is not configured (options page)');
+      return;
+    }
+    // the suggested-dirs job carries the view's dirty-report list — never
+    // submit an empty one (the view keeps the button disabled anyway)
+    const dirtyDirs = kind === 'sync-dirs'
+      ? (Array.isArray(dirs) ? dirs : []).filter(d => typeof d === 'string' && d)
+      : null;
+    if (kind === 'sync-dirs' && !dirtyDirs.length) {
       return;
     }
     const account = await resolveSyncAccount(picked);
@@ -746,9 +858,12 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     if (kind !== 'discard' || await confirmDiscard(account)) {
       pendingRids.set(rid, btnOf);
       applyPending();
-      const res = await chrome.runtime.sendMessage({
-        type: 'sync-request', rid, kind, account, dir
-      }).catch(err => ({ok: false, error: err?.message || String(err)}));
+      const payload = {type: 'sync-request', rid, kind, account, dir};
+      if (kind === 'sync-dirs') {
+        payload.dirs = dirtyDirs;
+      }
+      const res = await chrome.runtime.sendMessage(payload)
+        .catch(err => ({ok: false, error: err?.message || String(err)}));
       if (!res?.ok || res?.started === false) {
         // never enqueued: unpin and explain
         pendingRids.delete(rid);
@@ -759,6 +874,11 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       }
       else {
         syncView.setStatus(null);
+        if (kind === 'sync-dirs') {
+          // the store self-clears the picked dirs at enqueue: re-read now
+          // so the suggested line empties (and the button disables) at once
+          refreshDirty().catch(() => {});
+        }
       }
     }
   });

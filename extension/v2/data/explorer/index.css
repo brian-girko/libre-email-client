@@ -1,0 +1,276 @@
+/* the same base vars the sync client's shell defines — theme.css
+   (body[data-theme]) derives --dim/--line/--pane-bg from --fg/--bg and
+   overrides everything here once initTheme() has run */
+:root {
+  --radius: 10px;
+  --bg: light-dark(#f5f6f8, #15171a);
+  --fg: light-dark(#1b1d21, #e6e8eb);
+  --dim: #6f747d;
+  --line: #d9dce1;
+  --pane-bg: light-dark(#fff, #22252a);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg, #f5f6f8);
+  color: var(--fg, #1b1d21);
+  font: calc(13px * var(--font-scale, 1))/1.5 system-ui, -apple-system,
+        "Segoe UI", Roboto, sans-serif;
+}
+
+#shell {
+  max-width: 46rem;
+  margin: 1.5rem auto;
+  padding: 1rem;
+  box-sizing: border-box;
+  background: var(--pane-bg, #fff);
+  border: 1px solid var(--line, #d9dce1);
+  border-radius: var(--radius, 10px);
+  box-shadow: 0 1px 3px light-dark(rgba(0, 0, 0, .08), rgba(0, 0, 0, .4));
+}
+
+#breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .1rem;
+  font-weight: 600;
+  word-break: break-all;
+  min-height: 1.75rem;
+  margin-bottom: .75rem;
+}
+
+#breadcrumb button {
+  font: inherit;
+  font-weight: 600;
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  padding: .15rem .3rem;
+  border-radius: 4px;
+}
+
+#breadcrumb button:hover {
+  background: color-mix(in srgb, var(--fg, #1b1d21) 8%, transparent);
+}
+
+#breadcrumb .here {
+  padding: .15rem .3rem;
+  color: var(--dim, #6f747d);
+}
+
+#breadcrumb .sep {
+  color: var(--dim, #6f747d);
+}
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-bottom: .75rem;
+}
+
+#toolbar .spacer {
+  flex: 1;
+}
+
+/* the shared button recipe of the sync/client interfaces */
+#toolbar button,
+#gate button {
+  font: inherit;
+  min-height: 28px;
+  padding: 2px 12px;
+  border: 1px solid var(--line, #d9dce1);
+  border-radius: var(--radius, 10px);
+  background: var(--bg, #f5f6f8);
+  color: var(--fg, #1b1d21);
+  cursor: pointer;
+}
+
+#toolbar button:hover:not(:disabled),
+#gate button:hover:not(:disabled) {
+  border-color: var(--dim, #6f747d);
+}
+
+#toolbar button:disabled,
+#gate button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+#toolbar form {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+
+#toolbar input[type="text"] {
+  font: inherit;
+  color: var(--fg, #1b1d21);
+  background: var(--pane-bg, #fff);
+  padding: .3rem .5rem;
+  border: 1px solid var(--line, #d9dce1);
+  border-radius: calc(var(--radius, 10px) / 2);
+  min-width: 12rem;
+}
+
+#toolbar input[type="text"]:focus {
+  outline: 2px solid light-dark(#0969da, #539bf5);
+  outline-offset: -1px;
+}
+
+#listing {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line, #d9dce1);
+  border-radius: calc(var(--radius, 10px) / 2);
+  min-height: 12rem;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+#listing li {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .35rem .6rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--fg, #1b1d21) 8%, transparent);
+  cursor: pointer;
+  user-select: none;
+}
+
+#listing li:last-child {
+  border-bottom: none;
+}
+
+#listing li:hover {
+  background: color-mix(in srgb, var(--fg, #1b1d21) 6%, transparent);
+}
+
+#listing li.selected {
+  background: color-mix(in srgb, var(--fg, #1b1d21) 14%, transparent);
+}
+
+#listing .icon {
+  flex: none;
+  width: 1.15rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#listing .icon svg {
+  width: 1.15rem;
+  height: 1.15rem;
+  display: block;
+}
+
+#listing .name {
+  flex: 1;
+  word-break: break-all;
+}
+
+#listing .rename-input {
+  flex: 1;
+  font: inherit;
+  color: var(--fg, #1b1d21);
+  background: var(--pane-bg, #fff);
+  padding: .1rem .35rem;
+  border: 1px solid var(--line, #d9dce1);
+  border-radius: 4px;
+  min-width: 0;
+}
+
+#listing .rename-input:focus {
+  outline: 2px solid light-dark(#0969da, #539bf5);
+  outline-offset: -1px;
+}
+
+#listing .size {
+  flex: none;
+  color: var(--dim, #6f747d);
+  font-variant-numeric: tabular-nums;
+}
+
+#listing .up {
+  color: var(--dim, #6f747d);
+}
+
+#status {
+  color: var(--dim, #6f747d);
+}
+
+#status.ok,
+#gate-status.ok {
+  color: light-dark(#1a7f37, #3fb950);
+}
+
+#status.bad,
+#gate-status.bad {
+  color: light-dark(#cf222e, #f85149);
+}
+
+#gate {
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+}
+
+#gate[hidden] {
+  display: none;
+}
+
+main[hidden],
+section[hidden] {
+  display: none;
+}
+
+#gate > div {
+  margin-top: 15vh;
+  width: 100%;
+  max-width: 26rem;
+  box-sizing: border-box;
+  padding: 2rem;
+  background: var(--pane-bg, #fff);
+  border: 1px solid var(--line, #d9dce1);
+  border-radius: var(--radius, 10px);
+  box-shadow: 0 1px 3px light-dark(rgba(0, 0, 0, .08), rgba(0, 0, 0, .4));
+}
+
+#gate h1 {
+  margin: 0 0 1rem;
+  font-size: 1.15rem;
+}
+
+#gate-status {
+  margin: 0 0 .75rem;
+}
+
+#gate-root {
+  font-weight: 600;
+  word-break: break-all;
+  background: color-mix(in srgb, var(--fg, #1b1d21) 8%, var(--bg, #f5f6f8));
+  padding: .4rem .6rem;
+  border-radius: 4px;
+}
+
+#gate section {
+  display: flex;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+#gate button {
+  padding: .4rem .8rem;
+}
+
+.note {
+  margin: 0;
+  color: var(--dim, #6f747d);
+  font-size: .85rem;
+}

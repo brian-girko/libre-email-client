@@ -26,6 +26,12 @@ const MASTER_PASS = 'master.pass';
 initTheme();
 
 const selectEl = document.getElementById('account-select');
+const storageOpfsEl = document.getElementById('f-storage-opfs');
+const storageExternalEl = document.getElementById('f-storage-external');
+const storageStatusEl = document.getElementById('storage-status');
+const pickStorageBtn = document.getElementById('pick-storage');
+const grantStorageBtn = document.getElementById('grant-storage');
+const forgetStorageBtn = document.getElementById('forget-storage');
 const wsNativeEl = document.getElementById('f-ws-native');
 const wsExternalEl = document.getElementById('f-ws-external');
 const wsUrlEl = document.getElementById('f-ws-url');
@@ -44,6 +50,9 @@ const badgeStatusEl = document.getElementById('badge-status');
 const saveGlobalBtn = document.getElementById('save-global');
 const globalSavedEl = document.getElementById('global-saved');
 let globalFlashTimer = null;
+let initialStorageMode = 'opfs';
+
+// ---- Storage root: browser storage (default) or a user-chosen directory ----
 
 // minutes; 0 disables the age limit (badge counts all unread mail)
 const BADGE_MAX_AGES = [0, 15, 30, 60, 120, 360, 720];
@@ -455,6 +464,8 @@ deleteBtn.addEventListener('click', async () => {
   }
   else {
     await chrome.storage.local.remove([...Object.keys(FIELDS), 'email.showRemoteContent'].map(name => key(name, selectedId)));
+    // engine-discovered state the worker stamps outside the FIELDS set
+    await chrome.storage.local.remove('sync.delimiter.' + selectedId);
     await chrome.storage.session.remove(key('user.pass', selectedId));
     accounts = accounts.filter(a => a.id !== selectedId);
   }
@@ -495,6 +506,7 @@ function flashGlobal(message = 'Saved', error = false) {
 
 async function loadGlobalPrefs() {
   const res = await chrome.storage.local.get({
+    'storage.mode': 'opfs',
     'ws.mode': 'native',
     'ws.url': '',
     'ws.debug': false,
@@ -508,7 +520,11 @@ async function loadGlobalPrefs() {
     'badge.interval': 5,
     'badge.maxAge': 0
   });
+  storageOpfsEl.checked = res['storage.mode'] !== MODE_EXTERNAL;
+  storageExternalEl.checked = res['storage.mode'] === MODE_EXTERNAL;
+  initialStorageMode = storageOpfsEl.checked ? 'opfs' : MODE_EXTERNAL;
   wsExternalEl.checked = res['ws.mode'] === 'external';
+  wsNativeEl.checked = !wsExternalEl.checked;
   wsNativeEl.checked = !wsExternalEl.checked;
   wsUrlEl.value = res['ws.url'] || '';
   wsDebugEl.checked = !!res['ws.debug'];
@@ -527,6 +543,7 @@ async function loadGlobalPrefs() {
     ? String(Number(res['badge.maxAge']))
     : '0';
   updateWsUrlState();
+  updateStorageUi(); // async status line: no await, it lands when the query returns
 }
 
 for (const el of [wsNativeEl, wsExternalEl]) {
@@ -536,6 +553,11 @@ for (const el of [wsNativeEl, wsExternalEl]) {
 saveGlobalBtn.addEventListener('click', async () => {
   const url = wsUrlEl.value.trim();
   const mode = wsMode();
+  const nextStorageMode = storageMode();
+  if (nextStorageMode === MODE_EXTERNAL && !(await externalStorageReady())) {
+    flashGlobal('Pick a usable directory or switch back to browser storage', true);
+    return;
+  }
   if (mode === 'external' && !/^wss?:\/\//.test(url)) {
     flashGlobal('Enter a valid ws:// or wss:// URL', true);
     return;
@@ -562,6 +584,7 @@ saveGlobalBtn.addEventListener('click', async () => {
     return;
   }
   await chrome.storage.local.set({
+    'storage.mode': nextStorageMode,
     'ws.mode': mode,
     'ws.url': url,
     'ws.debug': wsDebugEl.checked,
@@ -579,8 +602,109 @@ saveGlobalBtn.addEventListener('click', async () => {
       ? Number(badgeMaxAgeEl.value)
       : 0
   });
+  // Clients gate the root through data/sync/disk.mjs on every call, but the
+  // pages themselves hold stale state under a mode whose gate now answers
+  // differently: a reload makes the change effective everywhere at once.
+  if (nextStorageMode !== initialStorageMode) {
+    flashGlobal('Saved — reloading…');
+    setTimeout(() => location.reload(), 600);
+    return;
+  }
   flashGlobal();
 });
+
+// ---- Storage root ------------------------------------------------------------
+
+function storageMode() {
+  return storageExternalEl.checked ? MODE_EXTERNAL : 'opfs';
+}
+
+// Light check of the external handle for the status line: a permission query
+// and the stored name only — no write probe (the gate re-probes at boot).
+// OPFS mode needs nothing: the handle is always there and always writable.
+async function updateStorageUi() {
+  const external = storageMode() === MODE_EXTERNAL;
+  pickStorageBtn.disabled = !external;
+  grantStorageBtn.hidden = true;
+  forgetStorageBtn.hidden = true;
+  if (!external) {
+    storageStatusEl.textContent = 'Mail will be stored in browser storage (the extension private storage) — nothing to pick or re-grant.';
+    return;
+  }
+  const {handle, name} = await ownedRootHandle();
+  if (!handle || !(handle instanceof FileSystemDirectoryHandle)) {
+    storageStatusEl.textContent = 'No directory picked yet.';
+    return;
+  }
+  const state = await handle.queryPermission({mode: 'readwrite'});
+  forgetStorageBtn.hidden = false;
+  if (state === 'prompt') {
+    grantStorageBtn.hidden = false;
+    storageStatusEl.textContent = 'Picked: ' + (name || 'the directory') + ' — access needs to be re-granted.';
+  }
+  else if (state === 'granted') {
+    storageStatusEl.textContent = 'Picked: ' + (name || 'the directory') + ' — access confirmed.';
+  }
+  else {
+    storageStatusEl.textContent = 'Picked: ' + (name || 'the directory') + ' — permission denied, pick the directory again.';
+  }
+}
+
+for (const el of [storageOpfsEl, storageExternalEl]) {
+  el.addEventListener('change', updateStorageUi);
+}
+
+pickStorageBtn.addEventListener('click', async () => {
+  try {
+    const handle = await window.showDirectoryPicker({mode: 'readwrite'});
+    await persistRootHandle(handle, handle.name);
+    await updateStorageUi();
+  }
+  catch (e) {
+    if (e?.name !== 'AbortError') {
+      storageStatusEl.textContent = 'Directory pick failed: ' + (e?.message || String(e));
+    }
+  }
+});
+
+grantStorageBtn.addEventListener('click', async () => {
+  try {
+    const {handle, name} = await ownedRootHandle();
+    if (!handle) {
+      return await updateStorageUi();
+    }
+    const result = await handle.requestPermission({mode: 'readwrite'});
+    storageStatusEl.textContent = result === 'granted'
+      ? 'Access granted for ' + (name || 'the directory') + '.'
+      : 'Permission denied for ' + (name || 'the directory') + '.';
+    await updateStorageUi();
+  }
+  catch (e) {
+    storageStatusEl.textContent = 'Permission request failed: ' + (e?.message || String(e));
+  }
+});
+
+forgetStorageBtn.addEventListener('click', async () => {
+  await clearRootHandle();
+  await updateStorageUi();
+});
+
+// A custom directory is the mode's only requirement: switching to it without
+// a picked directory (or with a lapsed permission) blocks the save, since the
+// handle can only be acquired through this page's or the picker's gesture.
+function externalStorageReady() {
+  if (storageMode() !== MODE_EXTERNAL) {
+    return true;
+  }
+  return (async () => {
+    const {handle} = await ownedRootHandle();
+    if (!handle || !(handle instanceof FileSystemDirectoryHandle)) {
+      storageStatusEl.textContent = 'Pick a custom directory first (or switch back to browser storage).';
+      return false;
+    }
+    return (await handle.queryPermission({mode: 'readwrite'})) === 'granted';
+  })();
+}
 
 // ---- Preferences backup: export / import chrome.storage.local ----
 
@@ -968,6 +1092,30 @@ function describeFilter(filter) {
   return {text, tip};
 }
 
+// The filter's folder is the raw SERVER folder name (matched against the
+// sync snapshot and moved by the engine as-is), but the editor hint has
+// users type '/'-separated paths. The engine reports each account's real
+// hierarchy delimiter after every survey ('sync.delimiter.<id>', stamped
+// by the service worker), so typed separators are mapped onto it here —
+// 'Work/Projects' lands as 'Work.Projects' on '.'-delimiter servers.
+// Without a known delimiter (all-accounts filters, never-synced accounts)
+// the input is stored exactly as typed.
+async function accountDelimiter(accountId) {
+  if (!accountId) {
+    return null;
+  }
+  const res = await chrome.storage.local.get('sync.delimiter.' + accountId)
+    .catch(() => ({}));
+  return res['sync.delimiter.' + accountId] || null;
+}
+
+function normalizeFolderPath(path, delimiter) {
+  if (!delimiter || delimiter === '/') {
+    return path;
+  }
+  return path.split('/').join(delimiter);
+}
+
 // Rows are reordered with the up/down buttons; the array order is the
 // evaluation order (first match wins), so every swap rewrites the 'filters'
 // array and persists it immediately. Out-of-range moves are a no-op.
@@ -1113,7 +1261,8 @@ filterFormEl.addEventListener('submit', async e => {
     return;
   }
   editingFilter.query = ffInputs.query.value;
-  editingFilter.folder = folder;
+  editingFilter.folder =
+    normalizeFolderPath(folder, await accountDelimiter(ffInputs.account.value));
   editingFilter.createFolder = ffInputs.createFolder.checked;
   editingFilter.description = ffInputs.description.value.trim();
   editingFilter.accountId = ffInputs.account.value;

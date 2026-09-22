@@ -278,6 +278,17 @@ function summarize(plan) {
   return summary;
 }
 
+/** The account's hierarchy delimiter as the survey saw it: INBOX's when
+ *  present, else the first surveyed folder's; null when none was seen.
+ *  Stamped onto the run summary so the caller can report it — the worker
+ *  persists it (sync.delimiter.<id>) and the options page maps '/'-typed
+ *  filter paths onto it for '.'-delimiter servers. */
+function delimiterOf(survey) {
+  const folders = [...(survey?.folders?.values() ?? [])];
+  const inbox = folders.find(F => F.name.toUpperCase() === 'INBOX' && F.delimiter);
+  return (inbox ?? folders.find(F => F.delimiter))?.delimiter ?? null;
+}
+
 // When `only` names one folder, the whole pipeline (survey, plan, apply,
 // snapshot) is scoped to that single dir: the rest of the account keeps its
 // snapshot untouched and only that dir's entry is rewritten.
@@ -1608,6 +1619,8 @@ async function rowsFor(name, uidnext) {
    */
   async function run({dry = false} = {}) {
     const {plan: planned, summary, survey} = await plan();
+    const delimiter = delimiterOf(survey);
+    summary.delimiter = delimiter;
     for (const entry of describePlan(planned)) {
       emitLog(entry.type, entry.content, entry.cls);
     }
@@ -1698,6 +1711,7 @@ async function rowsFor(name, uidnext) {
     planned.__survey = survey;
     planned.__summary = summary;
     const applied = await apply(planned);
+    applied.delimiter = delimiter;
     return {dry: false, plan: planned, summary: applied};
   }
 

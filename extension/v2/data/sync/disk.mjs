@@ -32,7 +32,8 @@ function backToPicker() {
 // lapse from a context-quirk verdict.
 export async function bootSilent() {
   try {
-    if ((await getStorageMode()) !== MODE_EXTERNAL) {
+    const mode = await getStorageMode();
+    if (mode !== MODE_EXTERNAL) {
       const handle = await opfsRoot();
       console.log('[sync] opfs root resolved (browser storage)');
       return {ok: true, raw: 'granted', reason: null, name: '(browser storage)', handle};
@@ -54,7 +55,10 @@ export async function bootSilent() {
   }
   catch (e) {
     console.log('[sync] access check failed:', e?.message || e);
-    return {ok: false, raw: null, reason: 'no-handle', error: e?.message || String(e)};
+    // not a missing external handle — the OPFS branch (or the mode read
+    // itself) failed, so "run the picker" would send the user down the
+    // wrong flow; the verdict carries the real error for the caller
+    return {ok: false, raw: null, reason: 'gate-failure', error: e?.message || String(e)};
   }
 }
 

@@ -27,6 +27,7 @@ const grantBtn = document.getElementById('grant');
 const forgetBtn = document.getElementById('forget');
 const openSyncBtn = document.getElementById('open-sync');
 const openClientBtn = document.getElementById('open-client');
+const openExplorerBtn = document.getElementById('open-explorer');
 const openOptionsBtn = document.getElementById('open-options');
 const statusEl = document.getElementById('status');
 const dirEl = document.getElementById('dir');
@@ -49,6 +50,7 @@ async function forget() {
   forgetBtn.hidden = true;
   openSyncBtn.hidden = true;
   openClientBtn.hidden = true;
+  openExplorerBtn.hidden = true;
   openOptionsBtn.hidden = true;
   setDir('');
   await renderStatus();
@@ -59,8 +61,11 @@ async function opfsMode() {
   pickBtn.hidden = true;
   grantBtn.hidden = true;
   forgetBtn.hidden = true;
-  openSyncBtn.hidden = true;
-  openClientBtn.hidden = true;
+  // the destinations are mode-independent: browser storage may be the root,
+  // but the sync and the mail client still open from here
+  openSyncBtn.hidden = false;
+  openClientBtn.hidden = false;
+  openExplorerBtn.hidden = false;
   openOptionsBtn.hidden = false;
   setDir('');
   setStatus('Mail is stored in browser storage (the default) — no directory access is needed. To use a custom directory instead, change it in the options.', true);
@@ -109,6 +114,7 @@ async function boot() {
       forgetBtn.hidden = false;
       openSyncBtn.hidden = false;
       openClientBtn.hidden = false;
+      openExplorerBtn.hidden = false;
       openOptionsBtn.hidden = false;
       setStatus('Access confirmed for ' + (name || 'the directory') + '.', true);
       return;
@@ -174,6 +180,10 @@ openSyncBtn.addEventListener('click', () => {
 
 openClientBtn.addEventListener('click', () => {
   location.replace(chrome.runtime.getURL('data/client/index.html'));
+});
+
+openExplorerBtn.addEventListener('click', () => {
+  location.replace(chrome.runtime.getURL('data/explorer/index.html'));
 });
 
 openOptionsBtn.addEventListener('click', () => {

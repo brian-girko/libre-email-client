@@ -13,6 +13,7 @@
     <section>
       <button id="pick" type="button">Choose a directory&hellip;</button>
       <button id="grant" type="button" hidden>Re-grant access</button>
+      <button id="open-explorer" type="button" hidden>Open Explorer</button>
       <button id="open-sync" type="button" hidden>Open Sync</button>
       <button id="open-client" type="button" hidden>Open Mail</button>
       <button id="forget" type="button" hidden>Forget</button>
@@ -21,6 +22,6 @@
     <p class="note">The handle is stored in IndexedDB and reused on the next
       visits. It keeps read/write access to the chosen directory only.</p>
   </main>
-  <script src="index.js"></script>
+  <script type="module" src="index.js"></script>
 </body>
 </html>

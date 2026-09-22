@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/svg" href="images/favicon.svg">
+  <title>File Explorer :: Libre Email Client</title>
+  <link rel="stylesheet" href="/data/client/theme.css">
+  <link rel="stylesheet" href="index.css">
+</head>
+<body>
+  <main id="shell" hidden>
+    <header>
+      <nav id="breadcrumb" aria-label="Path"></nav>
+      <div id="toolbar">
+        <button id="download-btn" type="button" disabled>Download</button>
+        <button id="rename-btn" type="button" disabled>Rename</button>
+        <button id="delete-btn" type="button" disabled>Delete</button>
+        <span class="spacer"></span>
+        <button id="new-folder-btn" type="button">New folder</button>
+        <form id="new-folder-form" hidden>
+          <input id="new-folder-name" type="text" placeholder="Folder name"
+            autocomplete="off" spellcheck="false">
+          <button id="new-folder-create" type="submit">Create</button>
+          <button id="new-folder-cancel" type="button">Cancel</button>
+        </form>
+        <button id="import-btn" type="button">Import files</button>
+        <input id="import-input" type="file" multiple hidden>
+      </div>
+    </header>
+    <ul id="listing"></ul>
+    <footer>
+      <span id="status"></span>
+    </footer>
+  </main>
+  <section id="gate" hidden>
+    <div>
+      <h1>File Explorer</h1>
+      <p id="gate-status"></p>
+      <p id="gate-root" hidden></p>
+      <section>
+        <button id="grant" type="button" hidden>Re-grant access</button>
+      </section>
+      <p class="note">The explorer browses the storage root of this extension
+        (internal storage or the directory granted in the picker interface).
+        Browsing is read-only; write actions (delete, rename, new folder,
+        import) ask for write permission on first use.</p>
+    </div>
+  </section>
+  <script type="module" src="index.js"></script>
+</body>
+</html>

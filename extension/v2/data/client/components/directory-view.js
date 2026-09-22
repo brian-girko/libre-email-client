@@ -414,7 +414,12 @@ class DirectoryView extends HTMLElement {
       this.dispatchEvent(new CustomEvent('open-setup', {bubbles: true, composed: true}));
     });
     this.#optionsButton.addEventListener('click', () => {
-      this.dispatchEvent(new CustomEvent('open-options', {bubbles: true, composed: true}));
+      // 'sync' mode borrows the options button slot: the offer is "run a
+      // sync", not "go configure the account"
+      this.dispatchEvent(new CustomEvent(
+        this.#mode === 'sync' ? 'open-sync' : 'open-options',
+        {bubbles: true, composed: true}
+      ));
     });
     this.#addButton.addEventListener('click', () => {
       this.dispatchEvent(new CustomEvent('create-dir', {
@@ -555,6 +560,15 @@ class DirectoryView extends HTMLElement {
   optionsNeeded(message) {
     this.#mode = 'options';
     this.#message = String(message ?? 'This account is not configured');
+    this.#render();
+  }
+
+  // Error screen with a "Run Sync" offer: shown when the account is fine but
+  // empty because nothing was switched against the server yet. The sync
+  // client builds the {tmp,new,cur} tree; retrying the folder read cannot.
+  syncNeeded(message) {
+    this.#mode = 'sync';
+    this.#message = String(message ?? 'No folders yet');
     this.#render();
   }
 
@@ -767,10 +781,11 @@ class DirectoryView extends HTMLElement {
       this.#syncSelect();
     }
     if (!ready) {
-      this.#status.classList.toggle('error', this.#mode === 'error' || this.#mode === 'options');
+      this.#status.classList.toggle('error', this.#mode === 'error' || this.#mode === 'options' || this.#mode === 'sync');
       this.#retryButton.hidden = this.#mode !== 'error';
       this.#setupButton.hidden = this.#mode !== 'setup';
-      this.#optionsButton.hidden = this.#mode !== 'options';
+      this.#optionsButton.hidden = this.#mode !== 'options' && this.#mode !== 'sync';
+      this.#optionsButton.textContent = this.#mode === 'sync' ? 'Run Sync' : 'Open Options';
       this.#statusText.textContent = this.#message;
       this.#tree.replaceChildren();
       return;

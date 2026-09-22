@@ -26,6 +26,10 @@
 
 import {acquire, release} from '/core/bridge.mjs';
 import {markSynced, clearSynced} from '/data/sync/client/accounts.mjs';
+// side-effect import: /dirty.mjs registers its own runtime listener — the
+// resync bookkeeping (dirs that need a server sync) lives there, not in
+// the switch below
+import '/dirty.mjs';
 import '/context.mjs';
 
 const OFFSCREEN_URL = 'data/sync/offscreen/offscreen.html';
@@ -195,6 +199,20 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
           console.log('[sync] lastSync stamp failed: ' + (e?.message || e));
         }
       })();
+      return false;
+    }
+    // the engine's survey learned the account's hierarchy delimiter:
+    // persist it so the options page stores filter folder paths in the
+    // server's own spelling and the panel seeds its stores with the same
+    // value. Fire-and-forget, like the broadcast that carried it here.
+    case 'sync-delimiter': {
+      const id = msg.accountId;
+      const d = msg.delimiter;
+      if (typeof id === 'string' && id &&
+          typeof d === 'string' && d.length === 1 && d !== '%') {
+        chrome.storage.local.set({['sync.delimiter.' + id]: d})
+          .catch(e => console.log('[sync] delimiter stamp failed: ' + (e?.message || e)));
+      }
       return false;
     }
     default:

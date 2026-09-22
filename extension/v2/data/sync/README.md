@@ -12,8 +12,10 @@ data/sync/
                    button of the client footer, the account registry
                    (accounts.mjs) and the initSyncPanel(...) wiring
                    (components/)
-  disk.mjs       ← granted-handle gate, shared by both sides (bootSilent
-                   for the offscreen, boot() stays the visible-page gate)
+  disk.mjs       ← storage-root gate, shared by both sides (bootSilent for
+                   the offscreen, boot() stays the visible-page gate); root
+                   handle plumbing lives in root-handle.mjs (opfs default or
+                   the picker-persisted external directory)
   maildir.mjs    ← Maildir store on the granted root handle (shared layer)
   snapshot.mjs   ← .sync-state.json (uid → msgid/flags last-good view)
   offscreen/     ← hidden host document (offscreen.html) running the engine

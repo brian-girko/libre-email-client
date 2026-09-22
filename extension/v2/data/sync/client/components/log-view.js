@@ -236,11 +236,12 @@ class LogView extends HTMLElement {
     const distanceFromBottom = this.#out.scrollHeight -
       this.#out.scrollTop - this.#out.clientHeight;
     const following = distanceFromBottom <= 2;
-    // the freshly added tail: `added` entries went in, `removed` fell off
-    // the front — `added - removed` of them are still visible
-    const newCount = added - removed;
+    // the freshly added tail: the last `added` entries are new rows —
+    // also (and especially) at the line cap, where `removed` rows fell
+    // off the FRONT while every appended entry still needs its row
+    const from = Math.max(0, this.#entries.length - added);
     const frag = document.createDocumentFragment();
-    for (let i = this.#entries.length - newCount; i < this.#entries.length; i++) {
+    for (let i = from; i < this.#entries.length; i++) {
       frag.appendChild(this.#row(this.#entries[i]));
     }
     this.#out.appendChild(frag);

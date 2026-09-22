@@ -57,6 +57,25 @@ const mirrorChanged = {
   },
 };
 
+// ---- resync reports (worker bookkeeping) -------------------------------------
+//
+// Every local edit reports itself to the worker's dirty.mjs module — one
+// fire-and-forget message per operation, carrying the operation's email
+// ids, source dir, move destination and flag changes. The module marks the
+// touched dirs as needing a server resync in chrome.storage.session (and
+// clears them again when a sync actually runs). Nothing here depends on an
+// answer: a worker that is not up must never break an edit.
+
+function reportEdit(payload) {
+  try {
+    chrome.runtime.sendMessage({type: 'sync-dirty-report', ...payload})
+      .catch(() => {});
+  }
+  catch {
+    /* extension context gone (reload/close) — the edit itself still ran */
+  }
+}
+
 // ---- per-message metadata (re-parsed on demand; no cache files) ---------------
 
 // subject/from/date/threads re-parse per folder read (cheap header slices,
@@ -123,6 +142,41 @@ async function withMeta(rows) {
     }
   }));
   return rows;
+}
+
+// Raw RFC822 of one message, resilient to the maildir flag-rename races:
+// a \Seen (or any flag) change renames the file (new/ <-> cur/, plus the
+// info letters), and a listing taken just before the rename holds file
+// handles whose paths no longer exist — getFile() then fails with the FS
+// Access API's NotFoundError ("a requested file or directory could not be
+// found"). Each attempt re-lists the folder so the entry reflects the
+// current path; retries only the transient not-found cases and rethrows
+// anything else untouched.
+const READ_RETRIES = 3;
+const READ_RETRY_DELAY = 25;
+
+function isNotFound(e) {
+  return e?.name === 'NotFoundError' || /could not be found/i.test(String(e?.message ?? e));
+}
+
+async function readMessage(store, accountId, folder, uid) {
+  const wanted = Number(uid);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const {rows} = await folderRows(store, accountId, folder);
+      const row = rows.find(r => r.uid === wanted);
+      if (!row) {
+        throw new Error('body not available locally: uid ' + uid);
+      }
+      return await store.readFile(row.entry);
+    }
+    catch (e) {
+      if (attempt >= READ_RETRIES - 1 || !isNotFound(e)) {
+        throw e;
+      }
+      await new Promise(resolve => setTimeout(resolve, READ_RETRY_DELAY));
+    }
+  }
 }
 
 // ---- the API facade ------------------------------------------------------------
@@ -225,12 +279,7 @@ async function buildApi(accountId) {
 
     async readFile(uid) {
       if (!selected) throw new Error('openDir() first');
-      const {rows} = await folderRows(store, accountId, selected);
-      const row = rows.find(r => r.uid === Number(uid));
-      if (!row) {
-        throw new Error('body not available locally: uid ' + uid);
-      }
-      return await store.readFile(row.entry);
+      return await readMessage(store, accountId, selected, uid);
     },
 
     async search(options) {
@@ -276,6 +325,7 @@ async function buildApi(accountId) {
       const remove = (removeFlags ?? []).map(String);
       const {rows} = await folderRows(store, accountId, selected);
       let touched = false;
+      const touchedUids = [];
       for (const row of rows) {
         if (!wanted.has(row.uid)) {
           continue;
@@ -289,9 +339,17 @@ async function buildApi(accountId) {
         }
         await store.renameMessage(selected, row.entry, {flags: next});
         touched = true;
+        touchedUids.push(row.uid);
       }
       if (touched) {
         notifyLocalChange(accountId, [selected]);
+        reportEdit({
+          accountId,
+          uids: touchedUids,
+          srcDir: selected,
+          addFlags: add,
+          removeFlags: remove
+        });
       }
       return 0;
     },
@@ -314,6 +372,12 @@ async function buildApi(accountId) {
         await store.moveMessage(selected, row.entry, mailbox, row.uid, {keepFmd5: true});
       }
       notifyLocalChange(accountId, [selected, mailbox]);
+      reportEdit({
+        accountId,
+        uids: candidates.map(r => r.uid),
+        srcDir: selected,
+        destDir: mailbox
+      });
       return candidates.length;
     },
 
@@ -330,6 +394,12 @@ async function buildApi(accountId) {
         await store.renameMessage(selected, row.entry, {flags});
       }
       notifyLocalChange(accountId, [selected]);
+      reportEdit({
+        accountId,
+        uids: candidates.map(r => r.uid),
+        srcDir: selected,
+        addFlags: ['\\Deleted']
+      });
       return candidates.length;
     },
 
@@ -349,6 +419,11 @@ async function buildApi(accountId) {
         }
       }
       notifyLocalChange(accountId, [selected]);
+      reportEdit({
+        accountId,
+        uids: candidates.map(r => r.uid),
+        srcDir: selected
+      });
       return purged;
     },
 
@@ -358,6 +433,7 @@ async function buildApi(accountId) {
       }
       await store.folder(name.trim(), {create: true});
       notifyLocalChange(accountId, [name.trim()]);
+      reportEdit({accountId, srcDir: name.trim()});
     },
 
     async deleteDir(name) {
@@ -366,6 +442,7 @@ async function buildApi(accountId) {
       }
       await removeFolderDir(store, name);
       notifyLocalChange(accountId, [name]);
+      reportEdit({accountId, srcDir: name});
     },
 
     async idle() {
@@ -622,7 +699,7 @@ async function bodyFields(store, accountId, row) {
   }
   const fields = {bodyText: '', to: ''};
   try {
-    const raw = await store.readFile(row.entry);
+    const raw = await readMessage(store, accountId, row.folder, row.uid);
     const email = await postalMime().parse(raw);
     const parts = [];
     if (email.text) {

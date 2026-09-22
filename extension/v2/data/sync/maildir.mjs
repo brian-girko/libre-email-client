@@ -186,6 +186,39 @@ export function folderFor(dirName, delimiter = '/') {
     .join(delimiter);
 }
 
+/**
+ * Maps a user-typed folder name onto the account's canonical spelling:
+ * '/'-typed paths are translated onto the hierarchy delimiter (the
+ * convention the options page normalizes on save — this is the run-time
+ * defence for already-stored filters). The inverse is never applied: on
+ * a '/'-delimiter server '.' is a legal character INSIDE folder names
+ * ("Notes 1.2" must not become "Notes 1/2"). Whitespace around the whole
+ * name is trimmed.
+ * @param {string} folder server folder name, any '/'-typed spelling
+ * @param {string} delimiter server hierarchy delimiter
+ * @returns {string} the folder spelled in the account delimiter
+ */
+export function normalizeFolderPath(folder, delimiter = '/') {
+  const name = String(folder ?? '').trim();
+  return delimiter !== '/' ? name.replaceAll('/', delimiter) : name;
+}
+
+/**
+ * Folder-name equality in the account's spelling: exact, or equal after
+ * both sides went through normalizeFolderPath — "Root/Sub" and
+ * "Root.Sub" are the same folder on a '.'-delimiter account.
+ * @param {string} a first folder name
+ * @param {string} b second folder name
+ * @param {string} delimiter server hierarchy delimiter
+ * @returns {boolean}
+ */
+export function sameFolder(a, b, delimiter = '/') {
+  if (a === b) {
+    return true;
+  }
+  return normalizeFolderPath(a, delimiter) === normalizeFolderPath(b, delimiter);
+}
+
 let seq = 0;
 
 /** "<ts>.M<msec>P<pid>Q<seq>.<host>" — the unique part of a maildir name */

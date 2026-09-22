@@ -5,6 +5,7 @@ import {getPref, setPref} from './prefs.mjs';
 import {enqueue, accountPendingJobs} from './jobs.mjs';
 import * as counters from './counters.mjs';
 import {listAccounts} from './accounts.mjs';
+import {MODE_EXTERNAL, getStorageMode} from '../sync/root-handle.mjs';
 
 let el = null;
 let accountId = null;
@@ -18,6 +19,7 @@ const dirKey = id => 'dir.' + id;
 // when the picker opens avoids leaving two windows.
 const PICKER_URL = '../picker/index.html';
 const OPTIONS_URL = '../options/index.html';
+const SYNC_URL = '../sync/client/index.html';
 
 function openPage(url) {
   location.replace(chrome.runtime.getURL(url));
@@ -103,8 +105,13 @@ async function load(id) {
     if (await hasAccounts()) {
       el.optionsNeeded('Select an account to list its folders.');
     }
-    else {
+    else if ((await getStorageMode()) === MODE_EXTERNAL) {
       el.setupNeeded('No account directories on the granted directory yet — run a sync first.');
+    }
+    else {
+      // browser storage root: nothing to grant, the accounts missing are a
+      // configuration matter, not a setup one
+      el.optionsNeeded('No account directories yet — configure accounts and run a sync.');
     }
     return;
   }
@@ -147,7 +154,7 @@ async function load(id) {
       notify(initial.name);
     }
     else {
-      el.optionsNeeded('This account has no folders yet — run a sync.');
+      el.syncNeeded('This account has no folders yet — run a sync.');
     }
   }
   catch (e) {
@@ -187,14 +194,24 @@ function init(element) {
     }
     dropMailApi(accountId).finally(() => load(accountId));
   });
-  el.addEventListener('open-setup', () => {
-    // the picker page grants / re-grants the directory handle: the client
-    // page comes back on its own once access is confirmed
-    location.replace(chrome.runtime.getURL(PICKER_URL));
+  el.addEventListener('open-setup', async () => {
+    // the picker page grants / re-grants the external directory handle and
+    // the client page comes back on its own once access is confirmed — in
+    // browser-storage mode there is nothing to grant at all, so the offer
+    // lands on the options page (accounts are managed and created there)
+    if ((await getStorageMode()) === MODE_EXTERNAL) {
+      return openPage(PICKER_URL);
+    }
+    openPage(OPTIONS_URL);
   });
   el.addEventListener('open-options', () => {
     // the options page is where accounts are managed and created
     location.replace(chrome.runtime.getURL(OPTIONS_URL));
+  });
+  el.addEventListener('open-sync', () => {
+    // the sync client is what builds and refreshes the folder tree; the
+    // mail client stays open so this offer does not cost the current spot
+    window.open(chrome.runtime.getURL(SYNC_URL), '_blank');
   });
   el.addEventListener('create-dir', e => {
     createDir(e);
