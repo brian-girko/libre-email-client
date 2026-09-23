@@ -311,8 +311,9 @@ async function buildApi(accountId) {
     },
 
     // ---- mutations: pure local file edits (maildir semantics) ----
-    // flags   → the maildir info letters rewrite themselves (S R F T D only;
-    //           unknown IMAP keywords cannot be filename-encoded and drop)
+    // flags   → the maildir info letters rewrite themselves (S R F T D plus
+    //           the a..e star-color keywords; unknown IMAP keywords cannot
+    //           be filename-encoded and drop)
     // delete  → the T (Deleted) letter; the sync engine replays the server
     //           purge from the filename truth on its own device
     // move    → the file renames into the target folder keeping its uid —
@@ -567,6 +568,7 @@ const FLAG_KEYWORDS = {
   unseen: 'UNSEEN',
   seen: 'SEEN',
   flagged: 'FLAGGED',
+  starred: 'FLAGGED',   // colored-star alias: any \Flagged message matches
   answered: 'ANSWERED',
   deleted: 'DELETED',
 };

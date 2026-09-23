@@ -6,12 +6,14 @@
  * per message, this module reads the first slice of the file (well beyond
  * the usual stack of Received/DKIM headers, capped like snapshot.mjs does)
  * and parses the RFC822 header block directly: unfolding, RFC 2047
- * encoded-word decoding, and the specific fields the UI and the local
- * threader need.
+ * encoded-word decoding (the shared decoder, core/mime.mjs), and the
+ * specific fields the UI and the local threader need.
  *
  * The header slice never parses bodies — that (full postal-mime) happens
  * lazily in preview.mjs and search.mjs only.
  */
+
+import {decodeMimeWords} from '../../core/mime.mjs';
 
 const HEADER_SCAN_BYTES = 65536; // header stacks can exceed 8KB on real mail
 const decoder = new TextDecoder('utf-8', {fatal: false});
@@ -58,47 +60,6 @@ export function parseHeaderBlock(bytes) {
     headers.set(name, line.slice(sep + 1).trim());
   }
   return headers;
-}
-
-// ---- RFC 2047 encoded-word decoding -----------------------------------------
-
-function qDecode(charset, data) {
-  const bytes = Uint8Array.from(data.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g,
-    (_, h) => String.fromCharCode(parseInt(h, 16))), c => c.charCodeAt(0));
-  return decodeCharset(charset, bytes);
-}
-
-function b64Decode(charset, data) {
-  const bin = atob(data);
-  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
-  return decodeCharset(charset, bytes);
-}
-
-function decodeCharset(charset, bytes) {
-  try {
-    return new TextDecoder(String(charset).toLowerCase()).decode(bytes).trim();
-  }
-  catch {
-    return new TextDecoder('utf-8', {fatal: false}).decode(bytes).trim();
-  }
-}
-
-/** RFC 2047 encoded words ("=?charset?B/Q?...?=") → readable text */
-export function decodeMimeWords(input) {
-  const str = String(input ?? '');
-  if (!str.includes('=?')) {
-    return str;
-  }
-  // whitespace between adjacent encoded words is not part of the text
-  const joined = str.replace(/(\?=)[ \t\r\n]+(=\?)/g, '$1$2');
-  return joined.replace(/=\?([^?\s]+)\?([BbQq])\?([^?\s]*)\?=/g, (token, charset, enc, data) => {
-    try {
-      return enc.toUpperCase() === 'B' ? b64Decode(charset, data) : qDecode(charset, data);
-    }
-    catch {
-      return token; // unknown charset or malformed: leave untouched
-    }
-  }).replace(/\s+/g, ' ').trim();
 }
 
 /**

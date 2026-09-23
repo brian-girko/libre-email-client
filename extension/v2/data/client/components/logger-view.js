@@ -92,11 +92,20 @@ class LoggerView extends HTMLElement {
           to { transform: rotate(360deg); }
         }
         .label {
-          flex: 1 1 auto;
+          flex: 0 1 auto;
           min-width: 0;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }
+        .detail {
+          flex: 0 1 auto;
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-style: italic;
+          opacity: 0.75;
         }
         .job-btn {
           flex: none;
@@ -190,6 +199,8 @@ class LoggerView extends HTMLElement {
     spin.className = 'spin';
     const label = document.createElement('span');
     label.className = 'label';
+    const detail = document.createElement('span');
+    detail.className = 'detail';
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'job-btn';
@@ -203,13 +214,14 @@ class LoggerView extends HTMLElement {
         composed: true
       }));
     });
-    row.append(spin, label, btn);
+    row.append(spin, label, detail, btn);
     return row;
   }
 
   #sync(row, entry) {
     const spin = row.querySelector('.spin');
     const label = row.querySelector('.label');
+    const detail = row.querySelector('.detail');
     const btn = row.querySelector('.job-btn');
     const failed = entry.state === 'failed';
     const done = entry.state === 'done';
@@ -221,6 +233,10 @@ class LoggerView extends HTMLElement {
       : done
         ? (entry.doneLabel || entry.label || '')
         : (entry.label || '');
+    // the newest engine log line rides along only while the run is live;
+    // settled entries never show stale mid-run text
+    detail.textContent = spin.hidden ? '' : (entry.detail ? '— ' + entry.detail : '');
+    detail.hidden = spin.hidden || !entry.detail;
     btn.hidden = !(entry.cancelable || failed);
     btn.disabled = false;
     btn.title = failed ? 'Dismiss' : 'Cancel';

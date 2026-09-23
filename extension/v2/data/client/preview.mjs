@@ -34,7 +34,7 @@ function add(accountId, uid) {
   }
   const card = document.createElement('email-view');
   card.uid = uid;
-  card.flagged = list.isFlagged(uid);
+  card.color = list.starColor(uid);
   el.append(card);
   (async () => {
     try {
@@ -109,7 +109,7 @@ function init(element, listView, dirsView) {
       return;
     }
     list.dispatchEvent(new CustomEvent('star', {
-      detail: {uid: detail.uid, flagged: !!detail.flagged},
+      detail: {uids: [detail.uid], color: detail.color},
       bubbles: true,
       composed: true
     }));
@@ -131,7 +131,7 @@ function init(element, listView, dirsView) {
     for (const uid of e.detail?.uids ?? []) {
       const card = cardFor(uid);
       if (card) {
-        card.flagged = list.isFlagged(uid);
+        card.color = list.starColor(uid);
       }
     }
   });

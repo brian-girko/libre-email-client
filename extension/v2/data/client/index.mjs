@@ -60,17 +60,19 @@ initFilters();
 initSyncEvents();
 applyPopupSize();
 
-// ---- sync: button → background run / sync tab -------------------------------
+// ---- sync: combo button → background run / sync tab --------------------------
 //
 // The client is a local Maildir viewer only — it carries no sync interface.
-// A plain click on the button next to the logger submits a background sync
-// for the selected account (sync-run.mjs — one pinned logger line, no
-// interface); Shift+Click still opens the sync client
-// (data/sync/client/index.html) on a new tab. The selected-account mirror
-// lives further down; the synced callback only reads it from callbacks,
-// long after this module finished evaluating.
+// A plain click on a combo segment submits a background sync (sync-run.mjs —
+// one pinned logger line, no interface): "Dir" scopes the run to the selected
+// folder of the selected account, "Account" syncs the whole account.
+// Shift+Click on either segment still opens the sync client
+// (data/sync/client/index.html) on a new tab without syncing. The
+// selected-account mirror lives further down; the synced callback only reads
+// it from callbacks, long after this module finished evaluating.
 
-const syncOpen = document.getElementById('sync-open');
+const syncDirBtn = document.getElementById('sync-dir');
+const syncAccountBtn = document.getElementById('sync-account');
 
 initSyncRun({
   prompt: document.getElementById('prompt'),
@@ -84,9 +86,32 @@ initSyncRun({
   }
 });
 
-syncOpen.addEventListener('click', e => {
+// shift+click on either segment: open the sync interface, sync nothing
+function syncTab(e) {
   if (e.shiftKey) {
     chrome.tabs.create({url: chrome.runtime.getURL('/data/sync/client/index.html')});
+    return true;
+  }
+  return false;
+}
+
+syncDirBtn.addEventListener('click', e => {
+  if (syncTab(e)) {
+    return;
+  }
+  const id = currentAccountId();
+  const dir = currentDirName();
+  if (id && dir) {
+    requestSync(id, {dir});
+  }
+  else {
+    setLogStatus(!id ? 'no account selected' : 'no folder selected',
+      {tone: 'warn', time: Date.now()});
+  }
+});
+
+syncAccountBtn.addEventListener('click', e => {
+  if (syncTab(e)) {
     return;
   }
   const id = currentAccountId();

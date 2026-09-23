@@ -4,6 +4,7 @@ import {getPref, setPref} from './prefs.mjs';
 import {enqueue, uidBusy} from './jobs.mjs';
 import {currentDirs} from './dirs.mjs';
 import {writeFiles} from '/core/native/native-client.mjs';
+import {STAR_COLORS, starFlagOps} from './star-colors.mjs';
 import * as counters from './counters.mjs';
 import * as logger from './logger.mjs';
 
@@ -541,17 +542,24 @@ async function runAction(action, uids) {
   }
 }
 
-function runFlag(uids, flagged) {
+// Star clicks cycle through the Gmail palette and back to none (the views
+// hand us the color; starFlagOps turns it into flag add/remove lists —
+// \Flagged always rides along, at most one $star-* keyword at a time).
+function runStar(uids, color) {
   const count = Array.isArray(uids) ? uids.length : 0;
-  if (!count) {
+  if (!count || !(Number.isInteger(color) && color >= 0 && color < STAR_COLORS.length)) {
     return;
   }
+  const {add, remove} = starFlagOps(color);
+  const name = STAR_COLORS[color].name;
   queueFlag(
-    accountId, uids,
-    flagged ? ['\\Flagged'] : [],
-    flagged ? [] : ['\\Flagged'],
-    (flagged ? 'Flagging ' : 'Unflagging ') + messageCountLabel(count),
-    (flagged ? 'Flagged ' : 'Unflagged ') + messageCountLabel(count),
+    accountId, uids, add, remove,
+    color
+      ? `Flagging ${messageCountLabel(count)} (${name})`
+      : `Unflagging ${messageCountLabel(count)}`,
+    color
+      ? `Flagged ${messageCountLabel(count)} (${name})`
+      : `Unflagged ${messageCountLabel(count)}`,
   );
 }
 
@@ -605,7 +613,8 @@ function init(element) {
     if (!detail) {
       return;
     }
-    runFlag(detail.uids, detail.flagged);
+    // view rows send {uids, color}; the preview card forwards {uid, color}
+    runStar(detail.uids ?? (detail.uid != null ? [detail.uid] : null), detail.color);
   });
   el.addEventListener('spam', e => runAction('spam', e.detail?.uids));
   el.addEventListener('move', e => runAction('move', e.detail?.uids));

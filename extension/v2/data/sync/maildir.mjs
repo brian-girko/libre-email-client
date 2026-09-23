@@ -26,7 +26,8 @@
 //          FMD5 until the sync engine replays them as one server MOVE;
 //          server-directed relocations are stamped with the destination's
 //   I=2,S  Maildir info (browser-safe spelling of the classic ":2,S");
-//          letters S=Seen R=Answered F=Flagged T=Deleted D=Draft; other IMAP
+//          letters S=Seen R=Answered F=Flagged T=Deleted D=Draft; lowercase
+//          a..e carry the colored-star IMAP keywords ($star-*); other IMAP
 //          keywords cannot be encoded and are ignored by the sync diffs
 //
 // Escaping per character: "%" maps to "%25" and a literal "." maps to
@@ -45,15 +46,36 @@ const FLAG_LETTERS = new Map([
   ['\\Draft', 'D']
 ]);
 const LETTER_FLAGS = new Map([...FLAG_LETTERS].map(([k, v]) => [v, k]));
+
+// ---- colored stars: Gmail-palette colors as IMAP keywords ------------------
+// The plain yellow star is \Flagged alone (what every IMAP client sees);
+// the other palette colors ride as server keywords, encoded in the filename
+// info part as the lowercase letters a..e (uppercase stays S R F T D).
+// A colored star always keeps \Flagged set; at most one color keyword lives
+// on a message — the client enforces that exclusivity, the sync engine just
+// diffs the keyword like any standard flag.
+const STAR_KEYWORDS = new Map([
+  ['$star-red', 'a'],
+  ['$star-orange', 'b'],
+  ['$star-green', 'c'],
+  ['$star-blue', 'd'],
+  ['$star-purple', 'e']
+]);
+const STAR_LETTERS = new Map([...STAR_KEYWORDS].map(([k, v]) => [v, k]));
+
+/** every flag that round-trips through a maildir filename (flags + stars) */
+const FLAG_TO_LETTER = new Map([...FLAG_LETTERS, ...STAR_KEYWORDS]);
+
 const LETTER_RE = /^[a-zA-Z]$/;
 const INFO_RE = /^(?<unique>[^,]+),U=(?<uid>\d+)(?:,FMD5=(?<fmd5>[0-9a-f]{32}))?(?:(?::|,I=)(?<info>2,(?<letters>[a-zA-Z]*)))?$/i;
 
-export const KNOWN_FLAG_NAMES = [...FLAG_LETTERS.keys()];
+export const KNOWN_FLAG_NAMES = [...FLAG_TO_LETTER.keys()];
+export const STAR_COLOR_KEYWORDS = [...STAR_KEYWORDS.keys()];
 
 export function flagsToLetters(flags = []) {
   const seen = new Set();
   for (const f of flags) {
-    const letter = FLAG_LETTERS.get(f);
+    const letter = FLAG_TO_LETTER.get(f);
     if (letter) {
       seen.add(letter);
     }
@@ -62,12 +84,12 @@ export function flagsToLetters(flags = []) {
 }
 
 export function knownFlags(flags = []) {
-  return (flags ?? []).filter(f => FLAG_LETTERS.has(f));
+  return (flags ?? []).filter(f => FLAG_TO_LETTER.has(f));
 }
 
-/** server keywords that cannot be encoded in a filename (logged, ignored) */
+/** server flags that cannot be encoded in a filename (logged, ignored) */
 export function unknownFlags(flags = []) {
-  return (flags ?? []).filter(f => !FLAG_LETTERS.has(f));
+  return (flags ?? []).filter(f => !FLAG_TO_LETTER.has(f));
 }
 
 /** order-independent flag equality over the representable subset */
@@ -263,6 +285,9 @@ export function parseFilename(name) {
     if (LETTER_FLAGS.has(ch)) {
       flags.push(LETTER_FLAGS.get(ch));
     }
+    else if (STAR_LETTERS.has(ch)) {
+      keywords.push(STAR_LETTERS.get(ch));
+    }
     else if (LETTER_RE.test(ch)) {
       keywords.push(ch);
     }
@@ -440,7 +465,13 @@ export async function listLocal(maildir, folder) {
         maildir,
         uid: parsed.uid,
         fmd5: parsed.fmd5,
-        flags: which === 'new' ? [] : parsed.flags,
+        // star-color keywords are filename-encodable (a..e) — they join the
+        // flags so every consumer (rows, threads, sync classifier) sees one
+        // coherent flag list; foreign single-letter keywords stay in
+        // `keywords` (snapshot-only, never diffed against files)
+        flags: which === 'new'
+          ? []
+          : [...parsed.flags, ...parsed.keywords.filter(k => STAR_KEYWORDS.has(k))],
         keywords: parsed.keywords,
         dir: which,
         unique: parsed.unique,

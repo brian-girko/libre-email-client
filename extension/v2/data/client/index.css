@@ -115,7 +115,6 @@ body {
 
 #search-clear,
 #explorer-open,
-#sync-open,
 #layout-toggle {
   flex: none;
   min-height: calc(26px * var(--font-scale, 1));
@@ -129,6 +128,13 @@ body {
   cursor: pointer;
 }
 
+/* combo segments share one bordered body; the border lives on the host */
+#sync-combo {
+  flex: none;
+  min-height: calc(26px * var(--font-scale, 1));
+  background: var(--pane-bg);
+}
+
 #search-clear {
   min-width: calc(26px * var(--font-scale, 1));
   padding: 0;
@@ -138,7 +144,6 @@ body {
 
 #search-clear:hover,
 #explorer-open:hover,
-#sync-open:hover,
 #layout-toggle:hover {
   border-color: var(--dim);
 }

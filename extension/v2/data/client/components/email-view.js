@@ -1,4 +1,5 @@
 import postalMime from '/core/parser/postal-mime.mjs';
+import './star-toggle.js';
 
 const dateTimeFormat = new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'});
 
@@ -73,7 +74,7 @@ class EmailView extends HTMLElement {
   #uid = null;
   #displayMode = 'block';
   #fontScale = 1;
-  #flagged = false;
+  #color = 0;
   #state = 'loading';
   #error = '';
   #urls = [];
@@ -143,8 +144,9 @@ class EmailView extends HTMLElement {
           font-size: calc(12px * var(--font-scale, 1));
         }
         .from {
-          flex: 1;
+          flex: none;
           min-width: 0;
+          max-width: min-content;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
@@ -181,36 +183,6 @@ class EmailView extends HTMLElement {
           display: flex;
           align-items: center;
           gap: calc(4px * var(--font-scale, 1));
-        }
-        .star {
-          flex: none;
-          width: calc(24px * var(--font-scale, 1));
-          height: calc(24px * var(--font-scale, 1));
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          border: 0;
-          padding: 0;
-          background: none;
-          cursor: pointer;
-          color: var(--line, #d9dce1);
-        }
-        .star:hover {
-          color: var(--dim, #8a8f98);
-        }
-        .star svg {
-          width: calc(16px * var(--font-scale, 1));
-          height: calc(16px * var(--font-scale, 1));
-          fill: none;
-          stroke: currentColor;
-          stroke-width: 1.5;
-          stroke-linejoin: round;
-        }
-        .star[aria-pressed="true"] {
-          color: light-dark(#e8a013, #f5b301);
-        }
-        .star[aria-pressed="true"] svg {
-          fill: currentColor;
         }
         .trash,
         .archive {
@@ -295,7 +267,7 @@ class EmailView extends HTMLElement {
           <span class="to"></span>
         </div>
         <div class="actions">
-          <button class="star" type="button" accesskey="f" title="Flag (F)" aria-pressed="false" aria-label="Flag message"></button>
+          <star-toggle class="star" accesskey="f" title="Flag (F)" aria-label="Flag message"></star-toggle>
           <button class="trash" type="button" accesskey="h" title="Trash (H)" aria-label="Trash"><svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M 160,256 H 96 C 78.326876,256 64.000014,241.67311 64.000014,224 64.000014,206.32689 78.326876,192 96,192 H 352 V 95.936 c 0,-17.673112 14.32689,-32 32,-32 h 256 c 17.67311,0 32,14.326888 32,32 V 192 h 256 c 17.67312,0 31.99999,14.32689 31.99999,32 0,17.67311 -14.32687,32 -31.99999,32 h -64 v 672 c 0,17.67311 -14.32689,32 -32,32 H 192 c -17.67311,0 -32,-14.32689 -32,-32 z M 608,192 V 128 H 416 v 64 z M 239.36,880.64 H 784.64 V 271.36 H 239.36 Z M 416,768 c -17.67311,0 -32,-14.32689 -32,-32 V 416 c 0,-17.67312 14.32689,-31.99999 32,-31.99999 17.67311,0 32,14.32687 32,31.99999 v 320 c 0,17.67311 -14.32689,32 -32,32 z m 192,0 c -17.67311,0 -32,-14.32689 -32,-32 V 416 c 0,-17.67312 14.32689,-31.99999 32,-31.99999 17.67311,0 32,14.32687 32,31.99999 v 320 c 0,17.67311 -14.32689,32 -32,32 z"/></svg></button>
           <button class="archive" type="button" accesskey="c" title="Archive (C)" aria-label="Archive"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 10C7.44772 10 7 10.4477 7 11C7 11.5523 7.44772 12 8 12H16C16.5523 12 17 11.5523 17 11C17 10.4477 16.5523 10 16 10H8Z"/><path fill-rule="evenodd" clip-rule="evenodd" d="M23 4C23 2.34315 21.6569 1 20 1H4C2.34315 1 1 2.34315 1 4V5C1 6.30622 1.83481 7.41746 3 7.82929V20C3 21.6569 4.34315 23 6 23H18C19.6569 23 21 21.6569 21 20V7.82929C22.1652 7.41746 23 6.30622 23 5V4ZM20 6H4C3.44772 6 3 5.55228 3 5V4C3 3.44772 3.44772 3 4 3H20C20.5523 3 21 3.44772 21 4V5C21 5.55228 20.5523 6 20 6ZM5 20V8H19V20C19 20.5523 18.5523 21 18 21H6C5.44772 21 5 20.5523 5 20Z"/></svg></button>
         </div>
@@ -311,10 +283,10 @@ class EmailView extends HTMLElement {
     this.#star = root.querySelector('.star');
     this.#trash = root.querySelector('.trash');
     this.#archive = root.querySelector('.archive');
-    this.#star.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.6l2.9 6 6.6.9-4.8 4.6 1.2 6.5-5.9-3.2-5.9 3.2 1.2-6.5-4.8-4.6 6.6-.9z"/></svg>';
-    this.#star.addEventListener('click', () => {
+    this.#star.addEventListener('star', e => {
+      e.stopPropagation();
       this.dispatchEvent(new CustomEvent('star', {
-        detail: {uid: this.#uid, flagged: !this.#flagged},
+        detail: {uid: this.#uid, color: e.detail.color},
         bubbles: true,
         composed: true
       }));
@@ -369,11 +341,12 @@ class EmailView extends HTMLElement {
     this.#fontScale = scale > 0 ? scale : 1;
   }
 
-  set flagged(value) {
-    this.#flagged = !!value;
-    this.#star.setAttribute('aria-pressed', String(this.#flagged));
-    this.#star.setAttribute('aria-label', this.#flagged ? 'Unflag message' : 'Flag message');
-    this.#star.title = this.#flagged ? 'Unflag (F)' : 'Flag (F)';
+  set color(value) {
+    this.#color = Number(value) || 0;
+    this.#star.color = this.#color;
+    const on = !!this.#color;
+    this.#star.title = on ? 'Unflag (F)' : 'Flag (F)';
+    this.#star.setAttribute('aria-label', on ? 'Unflag message' : 'Flag message');
   }
 
   set raw(bytes) {

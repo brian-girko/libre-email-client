@@ -37,7 +37,7 @@
 
 'use strict';
 
-import {KNOWN_FLAG_NAMES, knownFlags, md5hex, sameFlags} from '../maildir.mjs';
+import {KNOWN_FLAG_NAMES, knownFlags, md5hex, sameFlags, STAR_COLOR_KEYWORDS} from '../maildir.mjs';
 import {msgidOf, validateMail} from '../snapshot.mjs';
 
 // server flags that never mean anything outside their session — never
@@ -526,6 +526,14 @@ async function rowsFor(name, uidnext) {
     selected = null;
     const survey = await surveyNow();
     const {snap, folders, allFolders = []} = survey;
+    // Star-color keywords diff like any standard flag. Once a server proves
+    // it rejects keyword STOREs (flagsServer exec records starKeywords:false
+    // in the account prefs), colors degrade to local-only filenames: $star-*
+    // leaves the comparison on both sides and never gets planned again.
+    const starKeywordsOff = (await store.loadPrefs()).starKeywords === false;
+    const diffFlags = flags => starKeywordsOff
+      ? knownFlags(flags).filter(f => !STAR_COLOR_KEYWORDS.includes(f))
+      : knownFlags(flags);
 
     const ops = [];
     const conflicts = [];
@@ -950,9 +958,9 @@ async function rowsFor(name, uidnext) {
               // message, so ITS flags are the freshest state: a local read/
               // un-read/flag edit must push up, never be rewritten back to
               // the server's row (that would unmark local flag changes)
-              const sFlags = knownFlags(row.flags);
+              const sFlags = diffFlags(row.flags);
               if (!sameFlags(entry.flags, row.flags)) {
-                const lFlags = knownFlags(entry.flags);
+                const lFlags = diffFlags(entry.flags);
                 ops.push({
                   kind: 'flagsServer',
                   folder: name,
@@ -992,9 +1000,9 @@ async function rowsFor(name, uidnext) {
           continue;
         }
         if (entry) {
-          const sFlags = knownFlags(row.flags);
-          const kFlags = knownFlags(k.flags);
-          const lFlags = knownFlags(entry.flags);
+          const sFlags = diffFlags(row.flags);
+          const kFlags = diffFlags(k.flags);
+          const lFlags = diffFlags(entry.flags);
           const sChanged = !sameFlags(sFlags, kFlags);
           const lChanged = !sameFlags(lFlags, kFlags);
           if (sChanged) {
@@ -1036,7 +1044,7 @@ async function rowsFor(name, uidnext) {
           await sweepDuplicates(moved.folder, moved.entry);
           continue;
         }
-        if (!sameFlags(knownFlags(row.flags), knownFlags(k.flags))) {
+        if (!sameFlags(diffFlags(row.flags), diffFlags(k.flags))) {
           conflicts.push({
             folder: name,
             uid,
@@ -1114,7 +1122,7 @@ async function rowsFor(name, uidnext) {
           folder: name,
           entry,
           fileName: entry.fileName,
-          flags: knownFlags(entry.flags ?? []),
+          flags: diffFlags(entry.flags ?? []),
           msgid: id,
           size: await store.fileSize(entry)
         });
@@ -1501,8 +1509,38 @@ async function rowsFor(name, uidnext) {
           }
           case 'flagsServer': {
             await select(op.folder, {force: true});
-            await mail.markMail(Number(op.uid), op.add, op.remove);
-            emitLog('apply', `server flags ${op.folder}/${op.uid} +[${(op.add ?? []).join(',')}] -[${(op.remove ?? []).join(',')}]`);
+            try {
+              await mail.markMail(Number(op.uid), op.add, op.remove);
+            }
+            catch (e) {
+              // a server without keyword support rejects keyword STOREs:
+              // retry flags-only once so the run still completes, then pin
+              // starKeywords:false in the account prefs so the next plan
+              // stops diffing $star-* (colors become local-only filenames)
+              const star = f => STAR_COLOR_KEYWORDS.includes(f);
+              const starAdd = (op.add ?? []).filter(star);
+              const starRemove = (op.remove ?? []).filter(star);
+              if (!starAdd.length && !starRemove.length) {
+                throw e;
+              }
+              await mail.markMail(
+                Number(op.uid),
+                (op.add ?? []).filter(f => !star(f)),
+                (op.remove ?? []).filter(f => !star(f))
+              );
+              try {
+                const prefs = await store.loadPrefs();
+                if (prefs.starKeywords !== false) {
+                  await store.savePrefs({...prefs, starKeywords: false});
+                  emitLog('apply', 'server rejected star-color keywords; colored stars stay local-only on this account', 'warn');
+                }
+              }
+              catch {}
+              emitLog('apply', `server flags ${op.folder}/${op.uid} WITHOUT keywords` +
+                ` +[${(op.add ?? []).filter(f => !star(f)).join(',')}]` +
+                ` -[${(op.remove ?? []).filter(f => !star(f)).join(',')}]` +
+                ` (${e?.message || e})`, 'warn');
+            }
             break;
           }
           case 'moveServer': {

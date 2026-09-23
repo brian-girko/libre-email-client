@@ -25,6 +25,7 @@
 //   await api.close();
 
 import { initSync, MailClient, TransportRx } from './mail_core.mjs';
+import { decodeMimeWords } from '../mime.mjs';
 
 let wasmReady = false;
 
@@ -59,33 +60,6 @@ function toU8(data) {
     if (data instanceof Uint8Array) return data;
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
     return new Uint8Array(data?.buffer ?? data, data?.byteOffset ?? 0, data?.byteLength ?? data?.length ?? 0);
-}
-
-// ---- RFC 2047 MIME encoded-word decoding -------------------------------
-// IMAP ENVELOPE strings arrive raw, e.g. subject "=?utf-8?B?...?=". Decode:
-// parse the token, get the raw bytes (B: base64, Q: _=space, =XX=hex), then
-// TextDecoder(charset). Idempotent on already-decoded text.
-
-function b64ToBytes(b64) {
-    const bin = atob(b64.replace(/\s+/g, ''));
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-}
-
-function qToBytes(q) {
-    q = q.replace(/_/g, ' ');
-    const out = new Uint8Array(q.length);
-    let n = 0;
-    for (let i = 0; i < q.length; i++) {
-        if (q[i] === '=' && /^[0-9A-Fa-f]{2}$/.test(q.slice(i + 1, i + 3))) {
-            out[n++] = parseInt(q.slice(i + 1, i + 3), 16);
-            i += 2;
-        } else {
-            out[n++] = q.charCodeAt(i) & 0xff;
-        }
-    }
-    return out.subarray(0, n);
 }
 
 // ---- IMAP SEARCH criteria builder -----------------------------------------
@@ -137,19 +111,6 @@ export function buildCriteria(query) {
         }
     }
     return parts.join(' ');
-}
-
-function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) return input;
-    // whitespace between adjacent encoded words is not part of the text
-    const joined = input.replace(/(\?=)[ \t\r\n]+(=\?)/g, '$1$2');
-    return joined.replace(/=\?([^?\s]+)\?([BbQq])\?([^?\s]*)\?=/g, (token, charset, enc, data) => {
-        try {
-            const bytes = enc.toUpperCase() === 'B' ? b64ToBytes(data) : qToBytes(data);
-            return new TextDecoder(charset.toLowerCase()).decode(bytes).replace(/\s+/g, ' ').trim();
-        } catch {
-            return token; // unknown charset or malformed: leave untouched
-        }
-    });
 }
 
 /**

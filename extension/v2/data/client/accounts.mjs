@@ -35,6 +35,20 @@ export async function listAccounts() {
 
 let select = null;
 
+// the sync-events status line keys on the currently selected account
+const changeListeners = new Set();
+
+/** @returns {string|null} the account picker's current value, if any */
+function selected() {
+  return select?.value || null;
+}
+
+function onSelectionChange(fn) {
+  if (typeof fn === 'function') {
+    changeListeners.add(fn);
+  }
+}
+
 async function loadAccounts() {
   const accounts = await listAccounts();
   if (!accounts.length) {
@@ -63,8 +77,11 @@ function init(element) {
   select.addEventListener('change', () => {
     setPref('account', select.value);
     loadDirs(select.value);
+    for (const fn of changeListeners) {
+      fn(selected());
+    }
   });
   loadAccounts();
 }
 
-export {init};
+export {init, selected, onSelectionChange};

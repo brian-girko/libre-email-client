@@ -1,3 +1,6 @@
+import {starColorOf, threadStarColor} from '../star-colors.mjs';
+import './star-toggle.js';
+
 const timeFormat = new Intl.DateTimeFormat(undefined, {hour: '2-digit', minute: '2-digit'});
 const dayFormat = new Intl.DateTimeFormat(undefined, {month: 'short', day: 'numeric'});
 const fullFormat = new Intl.DateTimeFormat(undefined, {year: 'numeric', month: 'short', day: 'numeric'});
@@ -373,7 +376,7 @@ class ListView extends HTMLElement {
         .grid {
           flex: 1 0 auto;
           display: grid;
-          grid-template-columns: auto auto auto auto minmax(120px, 22%) minmax(0, 1fr) max-content;
+          grid-template-columns: auto auto auto auto auto minmax(0, 1fr) max-content;
           align-content: start;
           align-items: center;
           padding: calc(4px * var(--font-scale, 1));
@@ -420,7 +423,6 @@ class ListView extends HTMLElement {
           margin: 0;
           cursor: pointer;
         }
-        .star,
         .chev {
           flex: none;
           width: calc(24px * var(--font-scale, 1));
@@ -434,11 +436,9 @@ class ListView extends HTMLElement {
           cursor: pointer;
           color: var(--line, #d9dce1);
         }
-        .star:hover,
         .chev:hover {
           color: var(--dim, #8a8f98);
         }
-        .star svg,
         .chev svg {
           width: calc(16px * var(--font-scale, 1));
           height: calc(16px * var(--font-scale, 1));
@@ -446,12 +446,6 @@ class ListView extends HTMLElement {
           stroke: currentColor;
           stroke-width: 1.5;
           stroke-linejoin: round;
-        }
-        .star[aria-pressed="true"] {
-          color: light-dark(#e8a013, #f5b301);
-        }
-        .star[aria-pressed="true"] svg {
-          fill: currentColor;
         }
         .chev svg {
           transition: transform 0.12s ease;
@@ -464,6 +458,8 @@ class ListView extends HTMLElement {
           flex: none;
         }
         .sender {
+          min-width: 0;
+          max-width: min-content;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
@@ -1377,8 +1373,7 @@ class ListView extends HTMLElement {
       row.classList.toggle('unread', thread.unread > 0);
       const star = row.querySelector('.star');
       if (star) {
-        star.setAttribute('aria-pressed', String(thread.flagged));
-        star.setAttribute('aria-label', thread.flagged ? 'Unflag conversation' : 'Flag conversation');
+        star.color = threadStarColor(thread.messages);
       }
       const tcount = row.querySelector('.tcount');
       if (tcount && thread.count > 1) {
@@ -1392,9 +1387,7 @@ class ListView extends HTMLElement {
         sub.classList.toggle('unread', !hasFlag(item.flags, '\\Seen'));
         const star = sub.querySelector('.star');
         if (star) {
-          const flagged = hasFlag(item.flags, '\\Flagged');
-          star.setAttribute('aria-pressed', String(flagged));
-          star.setAttribute('aria-label', flagged ? 'Unflag message' : 'Flag message');
+          star.color = starColorOf(item.flags);
         }
       }
     }
@@ -1403,6 +1396,11 @@ class ListView extends HTMLElement {
   isFlagged(uid) {
     const item = this.#findMsg(uid);
     return !!item && hasFlag(item.flags, '\\Flagged');
+  }
+
+  starColor(uid) {
+    const item = this.#findMsg(uid);
+    return item ? starColorOf(item.flags) : 0;
   }
 
   isRead(uid) {
@@ -1831,11 +1829,7 @@ class ListView extends HTMLElement {
     return thread.messages.every(item => this.#selected.has(item.uid)) && thread.messages.length > 0;
   }
 
-  #starSvg() {
-    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.6l2.9 6 6.6.9-4.8 4.6 1.2 6.5-5.9-3.2-5.9 3.2 1.2-6.5-4.8-4.6 6.6-.9z"/></svg>';
-  }
-
-  #chevSvg() {
+   #chevSvg() {
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5.5l7 6.5-7 6.5"/></svg>';
   }
 
@@ -1871,16 +1865,13 @@ class ListView extends HTMLElement {
     });
     input.addEventListener('change', () => this.#toggleUids(uids, input, row, this.#lastShift));
 
-    const star = document.createElement('button');
-    star.type = 'button';
+    const star = document.createElement('star-toggle');
     star.className = 'star';
-    star.setAttribute('aria-pressed', String(thread.flagged));
-    star.setAttribute('aria-label', thread.flagged ? 'Unflag conversation' : 'Flag conversation');
-    star.innerHTML = this.#starSvg();
-    star.addEventListener('click', e => {
+    star.color = threadStarColor(thread.messages);
+    star.addEventListener('star', e => {
       e.stopPropagation();
       this.dispatchEvent(new CustomEvent('star', {
-        detail: {uids: [...uids], flagged: !thread.flagged},
+        detail: {uids: [...uids], color: e.detail.color},
         bubbles: true,
         composed: true
       }));
@@ -1966,7 +1957,6 @@ class ListView extends HTMLElement {
   }
 
   #msgRow(thread, item) {
-    const flagged = hasFlag(item.flags, '\\Flagged');
     const unread = !hasFlag(item.flags, '\\Seen');
     const checked = this.#selected.has(item.uid);
     const failed = this.#failures.has(Number(item.uid));
@@ -1993,16 +1983,13 @@ class ListView extends HTMLElement {
     });
     input.addEventListener('change', () => this.#toggleMsg(item, input, row, this.#lastShift));
 
-    const star = document.createElement('button');
-    star.type = 'button';
+    const star = document.createElement('star-toggle');
     star.className = 'star';
-    star.setAttribute('aria-pressed', String(flagged));
-    star.setAttribute('aria-label', flagged ? 'Unflag message' : 'Flag message');
-    star.innerHTML = this.#starSvg();
-    star.addEventListener('click', e => {
+    star.color = starColorOf(item.flags);
+    star.addEventListener('star', e => {
       e.stopPropagation();
       this.dispatchEvent(new CustomEvent('star', {
-        detail: {uids: [item.uid], flagged: !flagged},
+        detail: {uids: [item.uid], color: e.detail.color},
         bubbles: true,
         composed: true
       }));

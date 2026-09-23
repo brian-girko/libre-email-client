@@ -8,6 +8,7 @@
 
 import {isSearching, sync} from './list.mjs';
 import {mirrorChanged} from './local-api.mjs';
+import {starPickerOpen} from './components/star-toggle.js';
 
 let selected = null; // {accountId, name} of the open folder
 
@@ -21,6 +22,12 @@ function handleMirrorChanged(evt) {
     return;
   }
   if (accountId !== selected.accountId || isSearching()) {
+    return;
+  }
+  // The sync rebuilds every row, which would detach the star color picker's
+  // host element and drop the open popover; the optimistic applyFlags already
+  // shows the right state, the next mirror event reconciles normally.
+  if (starPickerOpen()) {
     return;
   }
   if (!dirs.includes(selected.name)) {

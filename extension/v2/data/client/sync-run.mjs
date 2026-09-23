@@ -1,22 +1,27 @@
 'use strict';
 
-// sync-run.mjs — background sync runs from the mail client's Sync button.
+// sync-run.mjs — background sync runs from the mail client's Sync combo.
 //
-// A plain click submits a 'sync-request' job for the selected account —
-// the same chain the sync panel uses: the worker boots the offscreen
-// engine on demand and forwards the job; the engine queues and runs it
-// serially. The account config (with the just-in-time decrypted password)
-// travels IN the request: the engine document has no chrome.storage.
-// The stored filter list travels with it: after the run lands, the
-// engine filters the NEW INBOX messages of the synced account on the
-// spot (the sync interface's own Sync button carries no filters — its
-// behavior is unchanged).
-// Shift+Click keeps opening the sync interface instead (index.mjs).
+// A plain click on a combo segment submits a 'sync-request' job for the
+// selected account — the same chain the sync panel uses: the worker boots
+// the offscreen engine on demand and forwards the job; the engine queues
+// and runs it serially. The account config (with the just-in-time decrypted
+// password) travels IN the request: the engine document has no
+// chrome.storage. The "Account" segment submits a full-account run; the
+// "Dir" segment submits a dir-scoped run (kind 'sync-dir', dir travels in
+// the job — the engine's only-this-folder scoping). The stored filter list
+// travels with full-account runs only: after the run lands, the engine
+// filters the NEW INBOX messages of the synced account on the spot (the
+// sync interface's own buttons carry no filters — their behavior is
+// unchanged). Shift+Click keeps opening the sync interface instead
+// (index.mjs).
 //
 // Feedback is one pinned logger entry per run: queued while the engine
 // holds it, done/failed once the engine's sync-jobs broadcast drops the
-// rid — the same settle signal the sync panel pins its buttons by. No
-// log streaming: run details stay in the sync client's own log pane.
+// rid — the same settle signal the sync panel pins its buttons by. The
+// engine's log stream ('sync-log') rides along: the newest line's raw
+// content shows as the pinned entry's detail while the run is live (full
+// history stays in the sync client's log pane).
 //
 // The tracked run is mirrored into chrome.storage.session
 // ('sync.clientRun'): the record survives page reloads and reaches every
@@ -41,9 +46,9 @@ const RUN_KEY = 'sync.clientRun';
 let promptEl = null;
 let onSynced = null;
 
-// the one tracked run: {rid, slug, id, name, startedAt, synced}. Guarded,
-// so re-clicks while a run is pending — or while a master-password prompt
-// is open — are no-ops.
+// the one tracked run: {rid, slug, id, name, dir, startedAt, synced}.
+// Guarded, so re-clicks while a run is pending — or while a
+// master-password prompt is open — are no-ops.
 let active = null;
 let ridSeq = 0;
 
@@ -144,10 +149,11 @@ async function reconstruct(run) {
 
 /** one pinned entry for a run (fresh or reconstructed) */
 function pinRun(run) {
+  const scope = run.dir ? ' · ' + run.dir : '';
   logger.begin({
     id: run.rid,
     kind: 'sync',
-    label: 'sync · ' + (run.name || run.id),
+    label: 'sync · ' + (run.name || run.id) + scope,
     doneLabel: 'sync finished'
   });
   logger.update(run.rid, {state: 'running'});
@@ -193,6 +199,18 @@ function onMessage(msg) {
     logger.fail(job.rid, 'sync stopped');
     return;
   }
+  // mid-run detail: the newest engine log line rides on the pinned
+  // entry as its detail (raw content — no prefix). Batches arrive per
+  // flush; only the last one shows, a moving "last message" ticker.
+  if (msg?.type === 'sync-log') {
+    const lines = (msg.lines || []).filter(l =>
+      l?.content != null && String(l.content).trim());
+    const last = lines[lines.length - 1];
+    if (last) {
+      logger.update(active.rid, {detail: String(last.content)});
+    }
+    return;
+  }
   // clean-completion stamp: the engine hands this to the worker only
   // when a run ended without failure, before the rid drop
   if (msg?.type === 'sync-synced' &&
@@ -228,13 +246,16 @@ function onMessage(msg) {
 }
 
 /**
- * Submits one full-account sync for the client-side account id (the
- * granted-directory slug) without opening the sync interface. One run
- * at a time — across every client window: a click while a run is
+ * Submits one sync run for the client-side account id (the
+ * granted-directory slug) without opening the sync interface — a
+ * full-account run, or a dir-scoped one when opts.dir names a folder.
+ * One run at a time — across every client window: a click while a run is
  * pending re-pins that run's entry here and submits nothing.
  * @param {string} accountId
+ * @param {object} [opts]
+ * @param {string} [opts.dir] sync only this folder of the account
  */
-export async function requestSync(accountId) {
+export async function requestSync(accountId, {dir} = {}) {
   if (active) {
     return;
   }
@@ -254,10 +275,11 @@ export async function requestSync(accountId) {
     return;
   }
   const rid = 'job-' + Date.now().toString(36) + '-' + (++ridSeq);
+  const scope = typeof dir === 'string' && dir ? ' · ' + dir : '';
   logger.begin({
     id: rid,
     kind: 'sync',
-    label: 'sync · ' + (registry.name || registry.id),
+    label: 'sync · ' + (registry.name || registry.id) + scope,
     doneLabel: 'sync finished'
   });
   active = {
@@ -265,6 +287,7 @@ export async function requestSync(accountId) {
     slug: registry.slug,
     id: registry.id,
     name: registry.name || registry.id,
+    dir: scope ? dir : undefined,
     startedAt: Date.now(),
     synced: false
   };
@@ -284,18 +307,30 @@ export async function requestSync(accountId) {
     const payload = {
       type: 'sync-request',
       rid,
-      kind: 'sync',
+      kind: scope ? 'sync-dir' : 'sync',
       account: {...registry, pass}
     };
-    // the offscreen engine has no chrome.storage: the stored filter list
-    // travels IN the job, and after the run lands the engine filters the
-    // NEW INBOX messages (this run's pulls — new, not merely unread) on
-    // the spot. The raw list goes over as stored: the engine applies the
-    // runnable filter itself and numbers matches by stored order, exactly
-    // like the sync interface's own "all filters" run.
-    const filters = await loadFilters().catch(() => []);
-    if (Array.isArray(filters) && filters.length) {
-      payload.filters = filters;
+    if (scope && dir.toUpperCase() !== 'INBOX') {
+      payload.dir = dir;
+    }
+    else {
+      if (scope) {
+        // an INBOX-scoped dir run behaves like the account sync for
+        // filters: the pass targets the run's own new INBOX pulls
+        payload.dir = dir;
+      }
+      // the offscreen engine has no chrome.storage: the stored filter list
+      // travels IN the job, and after the run lands the engine filters the
+      // NEW INBOX messages (this run's pulls — new, not merely unread) on
+      // the spot. The raw list goes over as stored: the engine applies the
+      // runnable filter itself and numbers matches by stored order, exactly
+      // like the sync interface's own "all filters" run. Dir-scoped runs
+      // carry filters only when the run IS the INBOX — any other folder
+      // syncs bare, no filters run.
+      const filters = await loadFilters().catch(() => []);
+      if (Array.isArray(filters) && filters.length) {
+        payload.filters = filters;
+      }
     }
     const res = await chrome.runtime.sendMessage(payload);
     if (!res?.ok || res?.started === false) {
@@ -313,6 +348,7 @@ export async function requestSync(accountId) {
         slug: registry.slug,
         id: registry.id,
         name: registry.name || registry.id,
+        dir: scope ? dir : undefined,
         startedAt: active.startedAt
       });
     }

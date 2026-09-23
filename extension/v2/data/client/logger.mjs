@@ -89,6 +89,7 @@ export function begin({
     doneLabel: String(doneLabel ?? label ?? kind),
     state: 'queued',
     error: null,
+    detail: null,
     cancelable: !!cancelable,
     quiet: !!quiet,
     progress: normalizeProgress(progress),
@@ -139,6 +140,7 @@ export function done(id, label) {
   if (label != null) {
     entry.doneLabel = String(label);
   }
+  entry.detail = null;
   if (entry.quiet) {
     remove(id);
     return entry;
@@ -155,6 +157,7 @@ export function fail(id, error) {
   }
   entry.state = 'failed';
   entry.error = error == null ? 'failed' : String(error);
+  entry.detail = null;
   if (entry.quiet) {
     remove(id);
     return entry;

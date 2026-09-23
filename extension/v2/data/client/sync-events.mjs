@@ -4,13 +4,14 @@
 //
 // The engine-era module received the worker's sync activity broadcasts and
 // master-password prompts; with the local-only client there is nothing to
-// listen to. What survives is the persistent logger status line: one
-// "last synced" segment per account, read from the account's
-// .sync-state.json (written by the sync interface's runs), refreshed when
-// the local store reports a change.
+// listen to. What survives is the persistent logger status line: the
+// currently SELECTED account's "last synced" stamp, read from the
+// account's .sync-state.json (written by the sync interface's runs),
+// re-rendered when the local store reports a change or the account
+// picker changes.
 
 import * as logger from './logger.mjs';
-import {listAccounts} from './accounts.mjs';
+import {listAccounts, selected as selectedAccount, onSelectionChange} from './accounts.mjs';
 import {getMailApi} from './mail.mjs';
 import {findRegistryAccount} from './sync-run.mjs';
 
@@ -44,11 +45,14 @@ function toMs(ts) {
   return Number.isFinite(p) ? p : 0;
 }
 
-// The persistent status: one segment per known account, each with its own
-// clock; rendered compactly by the logger view.
-function refreshStatus(accountId = null) {
-  const ids = accountId != null && accounts.has(accountId)
-    ? [accountId]
+// The persistent status: the SELECTED account's stamp only. The picker's
+// current value is read live at every render — no stale mirror — and a
+// selection change repaints (wiring below). Fallback: all known accounts,
+// for pages/tests that never had a picker.
+function refreshStatus() {
+  const pick = selectedAccount();
+  const ids = pick && (accounts.has(pick) || lastSynced.has(pick))
+    ? [pick]
     : [...new Set([...accounts.keys(), ...lastSynced.keys()])];
   const parts = [];
   for (const id of ids) {
@@ -62,7 +66,7 @@ function refreshStatus(accountId = null) {
   logger.setStatus(parts.join(' · '), {tone: 'info', time: Date.now()});
 }
 
-function noteSynced(accountId, syncedAt, {silent = false} = {}) {
+function noteSynced(accountId, syncedAt) {
   const at = toMs(syncedAt);
   if (!accountId || !at) {
     return;
@@ -71,12 +75,9 @@ function noteSynced(accountId, syncedAt, {silent = false} = {}) {
     return; // monotonic: a folder-only touch never rewinds the clock
   }
   lastSynced.set(accountId, at);
-  if (!silent) {
-    refreshStatus(accountId);
-  }
-  else {
-    refreshStatus(null);
-  }
+  // the status line follows the selection, so a run of another account
+  // only updates the clock here — its stamp shows once it's selected
+  refreshStatus();
 }
 
 // Even silently-updated clocks want the status visible on the first paint:
@@ -85,7 +86,7 @@ let statusShown = false;
 
 function maybeShow() {
   if (!statusShown && lastSynced.size) {
-    refreshStatus(null);
+    refreshStatus();
     statusShown = true;
   }
 }
@@ -151,8 +152,17 @@ chrome.runtime.onMessage.addListener(msg => {
   }).catch(() => {});
 });
 
+// The account picker changed: repaint the status for the new selection —
+// its clock may already be seeded (or landed silently).
+onSelectionChange(() => refreshStatus());
+
 function init() {
   loadAccounts().then(loadPersistence);
+  onSelectionChange(() => {
+    if (statusShown) {
+      refreshStatus();
+    }
+  });
 }
 
 export {init};

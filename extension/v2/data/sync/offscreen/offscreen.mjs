@@ -437,16 +437,25 @@ function reportDelimiter(account, summary) {
  * read state, never the unread heuristic — are filtered right here on
  * the store the run just wrote. First match wins per message in the
  * filters' stored order ('of Filter N' numbering); every match is
- * renamed into its destination Maildir (keepFmd5), the next sync pushes
- * the server move. Interface-submitted jobs carry no filters: the sync
- * interface keeps its own behavior — its filter row stays fully manual.
- * A pass failure logs a warn and never fails the sync itself.
+  * renamed into its destination Maildir (keepFmd5), the next sync pushes
+  * the server move. Dir-scoped runs carry filters only when the run is
+  * the INBOX itself; other folders sync bare. Interface-submitted jobs
+  * carry no filters: the sync interface keeps its own behavior — its
+  * filter row stays fully manual.
+  * A pass failure logs a warn and never fails the sync itself.
  */
 async function runPostSyncFilters(job, plan, store, account) {
   const stored = Array.isArray(job.filters) ? job.filters : [];
   const filters = stored.filter(f => f && f.enabled !== false &&
     typeof f.query === 'string' && f.folder);
-  if (job.kind !== 'sync' || !filters.length) {
+  // full-account runs and INBOX-scoped dir runs filter their new INBOX
+  // pulls; any other folder's dir run is bare — no filter pass
+  const dirScopedInbox = job.kind === 'sync-dir' &&
+    String(job.dir || '').toUpperCase() === 'INBOX';
+  if (job.kind !== 'sync' && !dirScopedInbox) {
+    return;
+  }
+  if (!filters.length) {
     return;
   }
   const newUids = (plan?.ops ?? [])
