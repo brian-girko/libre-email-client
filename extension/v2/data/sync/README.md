@@ -18,11 +18,15 @@ data/sync/
                    the picker-persisted external directory)
   maildir.mjs    ← Maildir store on the granted root handle (shared layer)
   snapshot.mjs   ← .sync-state.json (uid → msgid/flags last-good view)
-  offscreen/     ← hidden host document (offscreen.html) running the engine
-                   directly (offscreen.mjs), with the IMAP facade
-                   (client.mjs) and the engine itself (sync.mjs) alongside
-  README.md      ← this file
+  offscreen/     ← the sync engine, running inside the SHARED offscreen
+                    host document (/offscreen/index.html, manager.mjs);
+                    the module here is loaded on its first routed message
+   README.md      ← this file
 ```
+The one offscreen document lives at /offscreen → it lazily imports the
+sync engine (data/sync/offscreen/offscreen.mjs) and the local badge
+counter (data/badge/offscreen.mjs) and closes itself once every module
+is idle — see /offscreen/manager.mjs for that lifecycle.
 
 The sync interface is `<sync-view>`
 (data/sync/client/components/sync-view.js), hosted by the sync client at
@@ -84,12 +88,27 @@ silently, no prompt) and **No** (the confirm is declined as if the user
 had aborted it). Preferences live in `chrome.storage.local` under flat
 `sync-ui.`-prefixed keys — `sync-ui.purge`, `sync-ui.drop`,
 `sync-ui.discard` — one value (`ask|yes|no`) per key; without an open panel
-the engine's headless `DECISIONS` defaults still stand in (both destructive
-gates decline), which the dialog states in each row's hint. The gate
-answering happens panel-side (the offscreen engine has no `chrome.storage`):
-a `sync-confirm-req` whose kind matches a non-`ask` preference is answered
-over the normal `sync-confirm` port without ever showing the prompt, so the
-port protocol, grace window and timeouts stay untouched.
+the job-carried stored choice stands in (see below), falling back to the
+engine's headless `DECISIONS` defaults when nothing is stored (both
+destructive gates decline), which the dialog states in each row's hint. The
+gate answering happens panel-side (the offscreen engine has no
+`chrome.storage`): a `sync-confirm-req` whose kind matches a non-`ask`
+preference is answered over the normal `sync-confirm` port without ever
+showing the prompt, so the port protocol, grace window and timeouts stay
+untouched.
+
+**Headless gates follow the stored preference.** The offscreen engine cannot
+read `chrome.storage`, so the stored `sync-ui.purge` / `sync-ui.drop`
+choices travel IN the job: the service worker attaches them to every
+forwarded `sync-job` (manual client runs and the sync interface alike) and
+the scheduler attaches them to its alarm-driven runs. When a run's gate is
+answered headless (no panel connected within `DECISIONS.gateGraceMs`), a
+stored `yes` approves and a stored `no` declines — only `ask` (or nothing
+stored) falls back to the built-in `DECISIONS.noUiPurgeServer` /
+`noUiDropLocalDir` defaults. An open panel answering over its port still
+wins; the pref only decides when no interface responds. A closed panel that
+still receives a `sync-confirm-req` broadcast answers from the stored value
+the same way instead of declining unconditionally.
 
 ## Why this exists
 
@@ -277,12 +296,15 @@ destructive/shape question when no sync panel is open —
 `pullQuantum`/`pullBatch` (see below) and `noUiPurgeServer` /
 `noUiDropLocalDir` (destructive `deleteServer`/`dropLocal` ops are
 declined by default without a UI, instead of hanging on the 90 s gate
-timeout). Gate transport is port-only: every `sync-confirm-req` broadcast
-goes out even when nobody is connected — a panel that survived an engine
-restart re-establishes its `chrome.runtime.connect` port when it sees the
-request (or the first log of a new generation), and if no port has
-(re)connected within `DECISIONS.gateGraceMs` the headless default answers
-on the user's behalf.
+timeout). The stored preferences override these when the job carries them
+(the user set *Purge from server* / *Drop local dir* to yes/no — see the
+Preferences section above). Gate transport is port-only: every
+`sync-confirm-req` broadcast goes out even when nobody is connected — a
+panel that survived an engine restart re-establishes its
+`chrome.runtime.connect` port when it sees the request (or the first log of
+a new generation), and if no port has (re)connected within
+`DECISIONS.gateGraceMs` the effective default (stored preference first,
+`DECISIONS` fallback) answers on the user's behalf.
 
 **Batched pulls & dir priority:** message fetches run through a bounded
 worker pool (`mail.readMails(uids, {concurrency})` in offscreen/

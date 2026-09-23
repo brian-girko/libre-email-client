@@ -31,6 +31,7 @@
 'use strict';
 
 import {startWsTlsBridge} from '/core/native/ws-bridge-client.mjs';
+import {dlog} from '/core/debug-log.mjs';
 
 const NATIVE_HOST = 'com.add0n.node';
 const GRACE_MS = 30000;         // last-ref grace before the sandbox detach
@@ -50,12 +51,12 @@ function cancelGrace() {
 async function boot() {
   let live = null;            // the handle this boot owns
   const handle = await startWsTlsBridge(ev => {
-    console.log('[bridge] ' + (ev?.kind || '') + ': ' + (ev?.message || ''));
+    dlog('bridge', '[bridge] ' + (ev?.kind || '') + ': ' + (ev?.message || ''));
     // sandbox death (crash, SW-killed port): clear the live state so a late
     // release becomes a no-op and the next acquire reboots from scratch
     if (ev?.kind === 'down' && live && bridge === live) {
       bridge = null;
-      console.log('[bridge] sandbox died: refs stay, next acquire reboots');
+      dlog('bridge', '[bridge] sandbox died: refs stay, next acquire reboots');
     }
   });
   live = handle;
@@ -64,7 +65,7 @@ async function boot() {
     url,
     detach: handle.detach
   };
-  console.log('[bridge] serving ' + url);
+  dlog('bridge', '[bridge] serving ' + url);
   return {ok: true, url};
 }
 
@@ -78,7 +79,7 @@ async function acquire(key = 'default') {
     return {ok: true, url: bridge.url};
   }
   if (!booting) {
-    console.log('[bridge] booting (for ' + key + ')');
+    dlog('bridge', '[bridge] booting (for ' + key + ')');
     booting = boot();
     booting.finally(() => {
       booting = null;
@@ -113,7 +114,7 @@ async function release(key = 'default') {
     }
     catch {}
     bridge = null;
-    console.log('[bridge] dropped (idle)');
+    dlog('bridge', '[bridge] dropped (idle)');
   };
   if (!graceTimer) {
     graceTimer = setTimeout(drop, GRACE_MS);

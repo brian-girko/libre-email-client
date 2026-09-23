@@ -51,14 +51,17 @@ class ComboView extends HTMLElement {
           font: inherit;
           font-size: calc(12px * var(--font-scale, 1));
         }
+        .body {
+          display: flex;
+          align-items: stretch;
+        }
         .segment {
           display: inline-flex;
           align-items: stretch;
-          margin: 0 calc(3px * var(--font-scale, 1));
+          padding-inline: calc(6px * var(--font-scale, 1));
         }
         .segment + .segment {
-          border-left: 1px solid var(--fg, #1b1d21);
-          padding-inline: 10px;
+          border-left: 1px solid var(--line, #d9dce1);
         }
         ::slotted(button) {
           display: inline-flex;

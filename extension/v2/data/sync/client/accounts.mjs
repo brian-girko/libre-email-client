@@ -187,3 +187,22 @@ export async function clearSynced(id) {
   await chrome.storage.local.remove(LAST_SYNC_PREFIX + id);
   return true;
 }
+
+/**
+ * The stored gate preferences (the sync panel's dialog, flat
+ * `sync-ui.purge` / `sync-ui.drop` keys): 'yes' | 'no', or null for
+ * 'ask' / anything unset. The offscreen engine has no chrome.storage —
+ * callers (worker, scheduler) carry these IN the job so a run with no
+ * open panel answers its purge / dir-drop gates per the stored choice
+ * instead of the hardcoded decline.
+ * @returns {Promise<{purge: string|null, drop: string|null}>}
+ */
+export async function loadGatePrefs() {
+  const stored = await chrome.storage.local
+    .get(['sync-ui.purge', 'sync-ui.drop'])
+    .catch(() => ({}));
+  const one = key => ['yes', 'no'].includes(stored['sync-ui.' + key])
+    ? stored['sync-ui.' + key]
+    : null;
+  return {purge: one('purge'), drop: one('drop')};
+}

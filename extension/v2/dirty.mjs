@@ -30,6 +30,21 @@
 //                      when an id is given).
 //   sync-dirty-clear  {accountId?} → clear all stored jobs (one account's
 //                      when an id is given).
+//   sync-pending-dirs {accountId, slug, dirs} → the engine's ground-truth
+//                      report after a settled sync: every local dir left
+//                      holding interlopers (pending keepFmd5 moves).
+//                      State decides the mark, not the mutating agent —
+//                      the report is scanned, the listed dirs marked
+//                      (first stamp wins), an empty or unknown-account
+//                      report is a no-op. Retires every init that has
+//                      no work here: a run that leaves nothing pending
+//                      sends nothing.
+//
+// The auto-sync scheduler (/sync-scheduler.mjs) submits its jobs straight
+// to the engine — a service worker never hears its own runtime messages,
+// so the 'sync-request' eavesdrop below never fires for them. It clears
+// exactly the submitted dirs through the clearDirs() export instead, once
+// the engine has accepted the job.
 //
 // Records live in chrome.storage.session under one key as
 // {[accountId]: {[dirName]: timestamp}}: browser-session truth that dies
@@ -37,9 +52,12 @@
 // accountId here is the client's slug (its granted-directory folder
 // name); the sync registry's options-page id never appears as a key, but
 // a job's account object carries both spellings, so clears match either.
-// Writes go through a promise chain so a report racing a clear cannot
-// interleave read-modify-writes. Note the offscreen document has no
-// chrome.storage at all — it never reports here; client pages do.
+// The engine's 'sync-pending-dirs' report follows the same convention
+// (its payload carries both spellings; the slug is recorded, matching
+// the client-edit keying). Writes go through a promise chain so a report
+// racing a clear cannot interleave read-modify-writes. Note the offscreen
+// document has no chrome.storage at all — it can never report edits; its
+// sync-pending-dirs messages reach the worker like any other broadcast.
 
 'use strict';
 
@@ -203,6 +221,38 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         .then(() => respond({ok: true}))
         .catch(e => respond({ok: false, error: e?.message || String(e)}));
       return true;
+    // the engine's state report: every dir left holding pending moves
+    // needs a resync — mark them (first stamp wins) under the slug (or
+    // id as fallback), like client-edit reports key the store. The
+    // scheduler eavesdrops the same message to re-arm the alarm.
+    case 'sync-pending-dirs': {
+      const dirs = Array.isArray(msg.dirs)
+        ? msg.dirs.filter(d => typeof d === 'string' && d)
+        : [];
+      const id = typeof msg.slug === 'string' && msg.slug
+        ? msg.slug
+        : (typeof msg.accountId === 'string' ? msg.accountId : null);
+      if (id && dirs.length) {
+        update(async () => {
+          const store = await readStore();
+          const account = store[id] || (store[id] = {});
+          const now = Date.now();
+          let changed = false;
+          for (const dir of dirs) {
+            if (!(dir in account)) {
+              account[dir] = now;
+              changed = true;
+            }
+          }
+          if (changed) {
+            await writeStore(store);
+            console.log('[dirty] marked from engine report:',
+              id, dirs.join(', '));
+          }
+        }).catch(() => {});
+      }
+      return false;
+    }
     // a real sync job was accepted: everything it will resync leaves the
     // store now. Dry runs are surveys — ignored. No response: the worker's
     // own listener owns this message.
@@ -250,4 +300,56 @@ async function getNeeded(accountId = null) {
   return accountId ? (store[accountId] || {}) : store;
 }
 
-export {clearAll, clearAccount, getNeeded};
+/**
+ * Drop specific dirs from one account's record — the scheduler's own
+ * enqueue clear: its jobs reach the engine without a 'sync-request'
+ * passing through, so nothing here eavesdrops for them.
+ * @param {string|Array<string>} keys every spelling the account may be
+ *   stored under (a registry account carries both its id and slug)
+ * @param {string[]} dirs the dirs the submitted job will resync
+ * @returns {Promise<{keys: string[], dirs: string[]}|null>} what was
+ *   cleared, or null when nothing on record matched. Marks that landed
+ *   after the job was built keep their stamps (only listed dirs go).
+ */
+function clearDirs(keys, dirs) {
+  const keyList = (Array.isArray(keys) ? keys : [keys])
+    .filter(key => typeof key === 'string' && key);
+  const dirList = (Array.isArray(dirs) ? dirs : [])
+    .filter(dir => typeof dir === 'string' && dir);
+  if (!keyList.length || !dirList.length) {
+    return Promise.resolve(null);
+  }
+  return update(async () => {
+    const store = await readStore();
+    const before = JSON.stringify(store);
+    const hitKeys = [];
+    const hitDirs = [];
+    for (const key of keyList) {
+      const account = store[key];
+      if (!account) {
+        continue;
+      }
+      const gone = dirList.filter(dir => dir in account);
+      if (!gone.length) {
+        continue;
+      }
+      for (const dir of gone) {
+        delete account[dir];
+        if (!hitDirs.includes(dir)) {
+          hitDirs.push(dir);
+        }
+      }
+      hitKeys.push(key);
+      if (!Object.keys(account).length) {
+        delete store[key];
+      }
+    }
+    if (JSON.stringify(store) === before) {
+      return null;
+    }
+    await writeStore(store);
+    return {keys: hitKeys, dirs: hitDirs};
+  });
+}
+
+export {clearAll, clearAccount, clearDirs, getNeeded};

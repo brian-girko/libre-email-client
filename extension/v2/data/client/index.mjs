@@ -4,6 +4,7 @@ import './components/logger-view.js';
 import {initTheme} from './theme.mjs';
 import {initFontScale} from './font-scale.mjs';
 import {init as initDirs, load as loadDirs, refresh as refreshDirs} from './dirs.mjs';
+import {loadAccounts} from '../sync/client/accounts.mjs';
 import {init as initList, load as loadList, runSearch, clearSearch, isSearching,
   syncCurrent} from './list.mjs';
 import {init as initPreview} from './preview.mjs';
@@ -65,14 +66,15 @@ applyPopupSize();
 // The client is a local Maildir viewer only — it carries no sync interface.
 // A plain click on a combo segment submits a background sync (sync-run.mjs —
 // one pinned logger line, no interface): "Dir" scopes the run to the selected
-// folder of the selected account, "Account" syncs the whole account.
-// Shift+Click on either segment still opens the sync client
-// (data/sync/client/index.html) on a new tab without syncing. The
-// selected-account mirror lives further down; the synced callback only reads
-// it from callbacks, long after this module finished evaluating.
+// folder of the selected account, "Account" syncs the whole account, and
+// "Open" just opens the sync client (data/sync/client/index.html) on a new
+// tab without syncing. The selected-account mirror lives further down; the
+// synced callback only reads it from callbacks, long after this module
+// finished evaluating.
 
 const syncDirBtn = document.getElementById('sync-dir');
 const syncAccountBtn = document.getElementById('sync-account');
+const syncOpenBtn = document.getElementById('sync-open');
 
 initSyncRun({
   prompt: document.getElementById('prompt'),
@@ -86,19 +88,25 @@ initSyncRun({
   }
 });
 
-// shift+click on either segment: open the sync interface, sync nothing
-function syncTab(e) {
-  if (e.shiftKey) {
-    chrome.tabs.create({url: chrome.runtime.getURL('/data/sync/client/index.html')});
-    return true;
-  }
-  return false;
-}
+// first open of the client: if any stored password is encrypted and the
+// master password is not confirmed for this session, ask for it NOW —
+// even without a sync request — so scheduled runs finish waiting for a
+// page that is already open. Success caches master.pass into
+// chrome.storage.session (verified against master.hash); a cancel leaves
+// the warn status and the next open (or the next sync click) asks again.
+// Plain and empty passwords never reach the prompt path.
+loadAccounts(document.getElementById('prompt')).catch(e => {
+  setLogStatus('master password not confirmed — scheduled runs will skip ' +
+    'encrypted accounts (' + (e?.message || e) + ')',
+    {tone: 'warn', time: Date.now()});
+});
 
-syncDirBtn.addEventListener('click', e => {
-  if (syncTab(e)) {
-    return;
-  }
+// the third segment: open the sync interface, sync nothing
+syncOpenBtn.addEventListener('click', () => {
+  chrome.tabs.create({url: chrome.runtime.getURL('/data/sync/client/index.html')});
+});
+
+syncDirBtn.addEventListener('click', () => {
   const id = currentAccountId();
   const dir = currentDirName();
   if (id && dir) {
@@ -110,10 +118,7 @@ syncDirBtn.addEventListener('click', e => {
   }
 });
 
-syncAccountBtn.addEventListener('click', e => {
-  if (syncTab(e)) {
-    return;
-  }
+syncAccountBtn.addEventListener('click', () => {
   const id = currentAccountId();
   if (id) {
     requestSync(id);

@@ -271,8 +271,8 @@ class SyncView extends HTMLElement {
               <span class="prefs-label">
                 <span class="title">Purge from server</span>
                 <span class="hint">Messages gone from the local Maildir are
-                  deleted on the server too. No panel open: declined
-                  automatically.</span>
+                  deleted on the server too. No panel open: the stored
+                  choice stands in (Ask → declined).</span>
               </span>
               <select data-pref="purge">
                 <option value="ask">Ask</option>
@@ -284,8 +284,8 @@ class SyncView extends HTMLElement {
               <span class="prefs-label">
                 <span class="title">Drop local dir</span>
                 <span class="hint">A server folder was deleted — its local
-                  Maildir is dropped too. No panel open: declined
-                  automatically.</span>
+                  Maildir is dropped too. No panel open: the stored choice
+                  stands in (Ask → declined).</span>
               </span>
               <select data-pref="drop">
                 <option value="ask">Ask</option>

@@ -83,7 +83,16 @@
         <label class="check">
           <input type="checkbox" id="f-badge-debug"> Debug badge counter (log check failures to the console)
         </label>
-        <p class="hint">Bridge debug applies when the built-in bridge (re)starts; in external mode the external server does its own logging.</p>
+        <label class="check">
+          <input type="checkbox" id="f-offscreen-debug"> Debug offscreen document (lifecycle trace)
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-bridge-debug"> Debug bridge (boot, drop, sandbox events)
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-scheduler-debug"> Debug sync scheduler (alarms, sweeps)
+        </label>
+        <p class="hint">Bridge debug applies when the built-in bridge (re)starts; in external mode the external server does its own logging. Offscreen and scheduler logs print in the service worker's console.</p>
       </fieldset>
       <fieldset>
         <legend>Email list</legend>
@@ -110,10 +119,6 @@
         <label class="check">
           <input type="checkbox" id="f-badge-enabled" checked> Enable the badge counter
         </label>
-        <label>Check every
-          <input type="number" id="f-badge-interval" min="1" max="120" placeholder="5">
-          minutes
-        </label>
         <label>Count only emails newer than
           <select id="f-badge-max-age">
             <option value="0" selected>No limit (ignore)</option>
@@ -125,16 +130,12 @@
             <option value="720">12 hours</option>
           </select>
         </label>
-        <label class="check">
-          <input type="checkbox" id="f-badge-idle" checked> Check again when the computer returns from idle
-        </label>
         <div class="row">
           <button type="button" id="check-badge">Check now</button>
           <span id="badge-status" class="hint"></span>
         </div>
-        <p class="hint">The service worker asks every badge-enabled account for unread mail on this interval. The badge shows the combined unread total when it is not zero, and its title lists each account's count. Accounts without a usable password in this browser session are reported there but skipped.</p>
-        <p class="hint">With the return-from-idle check on, the badge also runs one silent check whenever the machine becomes active again (wake, unlock or resume), so the count is fresh the moment you are back.</p>
-        <p class="hint">The age limit restricts the badge to unread mail newer than the chosen window; older unread mail no longer counts. It applies to the folder mode and to search-query mode alike. When the IMAP core build lacks search support, the coarse folder fallback count cannot be age-filtered and ignores the limit.</p>
+        <p class="hint">The badge reads the LOCAL maildir only (no server round-trip): every badge-enabled account's unread count comes from the message files themselves. The badge shows the combined unread total when it is not zero, and its title lists each account's count. A check runs after local edits and after each landed sync run (and on this button); there is no periodic look.</p>
+        <p class="hint">By default an account's badge counts its INBOX; pick a folder to count that folder instead, or a query to count query-matched unread mail across all folders (see the account editor). The age limit restricts the count to unread mail newer than the chosen window in both modes; a message whose Date header cannot be parsed does not count against an age-limited badge.</p>
       </fieldset>
       <fieldset>
         <legend>Preferences backup</legend>

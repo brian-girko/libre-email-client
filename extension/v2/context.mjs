@@ -8,6 +8,7 @@
 
 import {LIGHT_THEMES, DARK_THEMES, THEME_DEFAULTS} from '/data/client/themes.mjs';
 import {FONT_SIZES, normalizeFontScale} from '/data/client/font-scale.mjs';
+import {runAllAccounts} from '/sync-scheduler.mjs';
 
 const THEME_USES = [
   {id: 'auto', title: 'Auto (OS theme)'},
@@ -104,11 +105,23 @@ chrome.runtime.onInstalled.addListener(async () => {
       contexts: ['action']
     });
   }
+
+  chrome.contextMenus.create({
+    id: 'sync.run',
+    title: 'Sync Now',
+    contexts: ['action']
+  });
 });
 
 chrome.contextMenus.onClicked.addListener(info => {
   const id = info.menuItemId;
   // radio menus update their own check marks, only the stored pref changes
+  if (id === 'sync.run') {
+    // no UI: the scheduler submits a full run per account straight to
+    // the engine and resets each account's cadence timer
+    runAllAccounts('menu');
+    return;
+  }
   if (id.startsWith('theme.light.')) {
     chrome.storage.local.set({'ui.theme.light': id.slice(12)});
     return;

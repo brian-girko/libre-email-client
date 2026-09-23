@@ -38,13 +38,14 @@ const wsUrlEl = document.getElementById('f-ws-url');
 const wsDebugEl = document.getElementById('f-ws-debug');
 const mailDebugEl = document.getElementById('f-mail-debug');
 const badgeDebugEl = document.getElementById('f-badge-debug');
+const offscreenDebugEl = document.getElementById('f-offscreen-debug');
+const bridgeDebugEl = document.getElementById('f-bridge-debug');
+const schedulerDebugEl = document.getElementById('f-scheduler-debug');
 const pageSizeEl = document.getElementById('f-page-size');
 const flaggedTopEl = document.getElementById('f-flagged-top');
 const syncPrefetchEl = document.getElementById('f-sync-prefetch');
 const badgeEnabledEl = document.getElementById('f-badge-enabled');
-const badgeIntervalEl = document.getElementById('f-badge-interval');
 const badgeMaxAgeEl = document.getElementById('f-badge-max-age');
-const badgeIdleEl = document.getElementById('f-badge-idle');
 const pickerAutoOpenEl = document.getElementById('f-picker-auto-open');
 const checkBadgeBtn = document.getElementById('check-badge');
 const badgeStatusEl = document.getElementById('badge-status');
@@ -513,12 +514,13 @@ async function loadGlobalPrefs() {
     'ws.debug': false,
     'mail.debug': false,
     'badge.debug': false,
+    'offscreen.debug': false,
+    'bridge.debug': false,
+    'scheduler.debug': false,
     'ui.mailPageSize': 50,
     'ui.mailFlaggedTop': false,
     'mail.syncPrefetch': 'all',
     'badge.enabled': true,
-    'badge.idleCheck': true,
-    'badge.interval': 5,
     'badge.maxAge': 0,
     'picker.autoOpen': true
   });
@@ -532,15 +534,15 @@ async function loadGlobalPrefs() {
   wsDebugEl.checked = !!res['ws.debug'];
   mailDebugEl.checked = !!res['mail.debug'];
   badgeDebugEl.checked = !!res['badge.debug'];
+  offscreenDebugEl.checked = !!res['offscreen.debug'];
+  bridgeDebugEl.checked = !!res['bridge.debug'];
+  schedulerDebugEl.checked = !!res['scheduler.debug'];
   pageSizeEl.value = res['ui.mailPageSize'];
   flaggedTopEl.checked = !!res['ui.mailFlaggedTop'];
   syncPrefetchEl.value = ['all', 200, 50, 20].map(String).includes(String(res['mail.syncPrefetch']))
     ? String(res['mail.syncPrefetch'])
     : 'all';
   badgeEnabledEl.checked = res['badge.enabled'] !== false;
-  badgeIdleEl.checked = res['badge.idleCheck'] !== false;
-  const interval = Number(res['badge.interval']);
-  badgeIntervalEl.value = Number.isInteger(interval) && interval > 0 ? interval : 5;
   badgeMaxAgeEl.value = BADGE_MAX_AGES.includes(Number(res['badge.maxAge']))
     ? String(Number(res['badge.maxAge']))
     : '0';
@@ -581,11 +583,6 @@ saveGlobalBtn.addEventListener('click', async () => {
     flashGlobal('Emails per page must be an integer between 1 and 500', true);
     return;
   }
-  const badgeInterval = badgeIntervalEl.value.trim() === '' ? 5 : Number(badgeIntervalEl.value);
-  if (!Number.isInteger(badgeInterval) || badgeInterval < 1 || badgeInterval > 120) {
-    flashGlobal('Badge check interval must be an integer between 1 and 120 minutes', true);
-    return;
-  }
   await chrome.storage.local.set({
     'storage.mode': nextStorageMode,
     'ws.mode': mode,
@@ -593,14 +590,15 @@ saveGlobalBtn.addEventListener('click', async () => {
     'ws.debug': wsDebugEl.checked,
     'mail.debug': mailDebugEl.checked,
     'badge.debug': badgeDebugEl.checked,
+    'offscreen.debug': offscreenDebugEl.checked,
+    'bridge.debug': bridgeDebugEl.checked,
+    'scheduler.debug': schedulerDebugEl.checked,
     'ui.mailPageSize': pageSize,
     'ui.mailFlaggedTop': flaggedTopEl.checked,
     'mail.syncPrefetch': ['all', 200, 50, 20].map(String).includes(syncPrefetchEl.value)
       ? (syncPrefetchEl.value === 'all' ? 'all' : Number(syncPrefetchEl.value))
       : 'all',
     'badge.enabled': badgeEnabledEl.checked,
-    'badge.idleCheck': badgeIdleEl.checked,
-    'badge.interval': badgeInterval,
     'badge.maxAge': BADGE_MAX_AGES.includes(Number(badgeMaxAgeEl.value))
       ? Number(badgeMaxAgeEl.value)
       : 0,
@@ -917,7 +915,7 @@ checkBadgeBtn.addEventListener('click', async () => {
     badgeStatusEl.textContent = 'Badge counter is disabled.';
     return;
   }
-  badgeStatusEl.textContent = 'Checking…';
+  badgeStatusEl.textContent = 'Syncing + checking…';
   try {
     const response = await chrome.runtime.sendMessage({type: 'badge-check'});
     if (response?.ok && response.result) {

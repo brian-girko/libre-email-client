@@ -1,19 +1,19 @@
 // worker.mjs — MV3 module service worker (module SW).
 //
-// Three jobs:
+// Jobs:
 //   action click → picker page (unchanged)
-//   sync offscreen lifecycle → the sync engine runs directly in a hidden
-//   offscreen document (data/sync/offscreen/offscreen.html): no UI. Opening a sync
-//   panel must NOT boot the document — it only exists while jobs are
-//   queued. Pages send {type:'sync-request'} and this worker creates the
-//   doc on demand, waits for its 'sync-ready' handshake and forwards the
-//   job ({type:'sync-job'}); the offscreen enqueues and runs them
-//   one-by-one, and when its job list runs empty it asks {type:'sync-close'}
-//   to be closed again. {type:'sync-kill'} (the interface's Stop button)
-//   asks the offscreen for a goodbye-broadcast, then closes the doc and
-//   force-releases the bridge ref the killed run never returned. The
-//   offscreen broadcasts {type:'sync-running'} whenever the busy state
-//   changes; log lines ({type:'sync-log'}) never pass through this worker.
+//   offscreen acquisition → the sync engine and the badge counter both run
+//   in the one shared offscreen document (/offscreen/index.html, hosted by
+//   manager.mjs there); the doc imports each module on its first routed
+//   message and closes ITSELF (window.close()) once every loaded module is
+//   idle. This worker only creates the doc on demand via core/offscreen.mjs
+//   (ensure() until the 'offscreen-ready' handshake) and force-closes it on
+//   Stop: pages send {type:'sync-request'} and this worker ensures the doc
+//   and forwards {type:'sync-job'}; {type:'sync-kill'} asks for a
+//   goodbye-broadcast, closes the doc and force-releases the bridge ref the
+//   killed run never returned. The offscreen broadcasts
+//   {type:'sync-running'} on busy-state changes; log lines
+//   ({type:'sync-log'}) never pass through this worker.
 //   bridge hosting → the com.add0n.node ws->tls bridge is refcounted in
 //   core/bridge.mjs; any module acquires a named ref over runtime messages
 //   (bridge-acquire/bridge-release) and the bridge drops when the last ref
@@ -25,14 +25,21 @@
 'use strict';
 
 import {acquire, release} from '/core/bridge.mjs';
-import {markSynced, clearSynced} from '/data/sync/client/accounts.mjs';
-// side-effect import: /dirty.mjs registers its own runtime listener — the
+import {ensure, closeNow, activeGen} from '/core/offscreen.mjs';
+import {markSynced, clearSynced, loadGatePrefs} from '/data/sync/client/accounts.mjs';
+import {loadFilters} from '/data/sync/filters/route.mjs';
+import {dlog} from '/core/debug-log.mjs';
+// side-effect imports: /dirty.mjs registers its own runtime listener — the
 // resync bookkeeping (dirs that need a server sync) lives there, not in
-// the switch below
+// the switch below; /badge/worker.mjs owns every badge-trigger listener and
+// rides the SAME offscreen document (its close is the doc's own doing);
+// /sync-scheduler.mjs own alarm wiring feeds the same ensure()+'sync-job'
+// handoff the page-visible flow uses
 import '/dirty.mjs';
 import '/context.mjs';
+import '/data/badge/worker.mjs';
+import '/sync-scheduler.mjs';
 
-const OFFSCREEN_URL = 'data/sync/offscreen/offscreen.html';
 chrome.action.onClicked.addListener(tab => {
   chrome.tabs.create({
     url: chrome.runtime.getURL('data/picker/index.html'),
@@ -41,78 +48,11 @@ chrome.action.onClicked.addListener(tab => {
 });
 
 // ---------------------------------------------------------------- offscreen
-
-let creating = null;   // Promise while the doc is being created + handshakes
-
-function hasOffscreen() {
-  return chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)]
-  }).then(contexts => contexts.length > 0)
-    .catch(() => false);
-}
-
-async function ensureOffscreen() {
-  if (creating) {
-    const known = await creating;
-    if (known) {
-      return true;
-    }
-    creating = null;   // stale memo: the doc was closed again, recreate
-  }
-  if (await hasOffscreen()) {
-    creating = Promise.resolve(true);
-    return true;
-  }
-  creating = (async () => {
-    const ready = waitForReady();   // armed first: the ready broadcast races us
-    try {
-      await chrome.offscreen.createDocument({
-        url: OFFSCREEN_URL,
-        reasons: ['DOM_SCRAPING'],
-        justification: 'Hidden IMAP sync engine (no UI, message relay only)'
-      });
-    }
-    catch (e) {
-      if (!String(e?.message || e).includes('single offscreen document')) {
-        throw e;
-      }
-      // created concurrently; tolerate the race
-    }
-    await ready;
-    return true;
-  })();
-  return creating;
-}
-
-/** resolves once the fresh offscreen doc says 'sync-ready' (10s timeout) */
-function waitForReady() {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      chrome.runtime.onMessage.removeListener(listener);
-      reject(new Error('offscreen sync document did not come up'));
-    }, 10000);
-    const listener = msg => {
-      if (msg?.type === 'sync-ready') {
-        clearTimeout(timer);
-        chrome.runtime.onMessage.removeListener(listener);
-        resolve();
-      }
-    };
-    chrome.runtime.onMessage.addListener(listener);
-  });
-}
-
-async function closeOffscreen() {
-  if (await hasOffscreen()) {
-    try {
-      await chrome.offscreen.closeDocument();
-    }
-    catch {}
-  }
-  // the memo must not claim the doc still exists after this
-  creating = null;
-}
+//
+// The single shared offscreen document (/offscreen/index.html, manager.mjs)
+// hosts both the sync engine and the badge counter and closes ITSELF when
+// every module is idle. Here the worker only acquires it (create + wait for
+// the manager's ready handshake) and force-closes it on the Stop path.
 
 // There is no chrome.storage in an offscreen document, so the engine
 // reports run results over runtime messages and this worker stamps
@@ -122,37 +62,59 @@ async function closeOffscreen() {
 //     null (the discard path): remove the stamp so the next run re-pulls
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   switch (msg?.type) {
-    // a sync job: make sure the offscreen doc exists, then hand the job
-    // over as 'sync-job' (its response settles the page's own). Opening a
-    // sync panel never routes here — only actual job requests do.
-    case 'sync-request':
-      ensureOffscreen()
-        .then(() => chrome.runtime.sendMessage({...msg, type: 'sync-job'}))
+    // a sync job: make sure the shared offscreen doc exists, then hand the
+    // job over as 'sync-job' (its response settles the page's own). Opening
+    // a sync panel never routes here — only actual job requests do.
+    //
+    // Post-sync filters are DEFAULT-ON here: the engine cannot read
+    // chrome.storage, so the stored filter list rides in every forwarded
+    // job and the engine applies it to the run's new INBOX pulls — the
+    // only opt-out is the sync interface's own submissions (bare: true;
+    // its filter row stays manual). Non-INBOX scopes / dry runs / discard
+    // harmlessly carry filters: the engine's guard never runs the pass
+    // for them.
+    //
+    // The stored gate preferences (sync-ui.purge / sync-ui.drop) ride
+    // along the same way: when the run's gates are answered headless
+    // (no panel connected within the grace window), the stored
+    // 'Purge from server' / 'Drop local dir' choice stands in — an open
+    // panel answering over its port still wins.
+    case 'sync-request': {
+      const withFilters = msg?.bare === true
+        ? Promise.resolve(null)
+        : loadFilters().then(list =>
+            (Array.isArray(list) && list.length) ? list : null)
+          .catch(() => null);
+      ensure('sync')
+        .then(() => Promise.all([withFilters, loadGatePrefs().catch(() => null)]))
+        .then(([filters, prefs]) => chrome.runtime.sendMessage({
+          ...msg,
+          type: 'sync-job',
+          ...(filters ? {filters} : {}),
+          ...(prefs ? {prefs} : {})
+        }))
         .then(res => respond(res ?? {ok: false, error: 'engine did not answer'}))
         .catch(e => respond({ok: false, error: e?.message || String(e)}));
       return true;
+    }
     // the interface's Stop button: let the offscreen broadcast its goodbye
-    // to every open panel, then tear the doc (current job included) down.
-    // The killed run never gets to return its bridge ref — drop it here.
+    // to every open panel, then force-tear the doc (current job included)
+    // down. The killed run never gets to return its bridge ref — drop it
+    // here. Badge jobs die with the document; the next trigger re-acquires.
     case 'sync-kill':
       (async () => {
         try {
-          if (await hasOffscreen()) {
-            const res = await chrome.runtime.sendMessage({type: 'sync-stop'});
-            return {ok: true, dropped: res?.dropped};
-          }
-          return {ok: true, dropped: 0};
+          const res = await chrome.runtime
+            .sendMessage({type: 'sync-stop'})
+            .catch(() => null);   // no document up: nothing to kill
+          return {ok: true, dropped: res?.dropped};
         }
         finally {
-          await closeOffscreen();
+          await closeNow();
           await release('sync').catch(() => {});
         }
       })().then(respond).catch(e => respond({ok: false, error: e?.message || String(e)}));
       return true;
-    // the offscreen's job list ran empty: it closes itself off
-    case 'sync-close':
-      closeOffscreen();
-      return false;
     // worker/page capability; offscreen documents get the ready ws:// url
     // only. Refs are per-module keys; the bridge drops after the LAST
     // release plus the idle grace — 'sync-bridge-ensure' is the legacy
@@ -170,15 +132,28 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         .then(() => respond({ok: true}))
         .catch(e => respond({ok: false, error: e?.message || String(e)}));
       return true;
+    // the shared document's manager decided every module is idle: the
+    // dependable closer lives here, since message delivery is never
+    // throttled while the hidden renderer's timers are
+    case 'offscreen-close':
+      if (msg?.gen === activeGen()) {
+        // only tear down a document THIS worker armed — a stale broadcast
+        // from a previous incarnation must not kill a fresh doc
+        closeNow();
+      }
+      return false;
+    case 'offscreen-debug':
+      dlog('offscreen', '[offscreen]', msg?.ev, msg?.key ?? '', msg?.extra ?? '');
+      return false;
     // the engine pings every 20s during a run: resets the SW idle timer so
     // the native port (and the sandbox behind it) survive the whole run
     case 'sync-bridge-ping':
       respond({ok: true});
       return false;
     // engine broadcasts (this worker only notes them; pages listen direct);
-    // close is NOT driven here: the offscreen decides, on an empty job
-    // list, via 'sync-close'; the bridge has its own refcount — see
-    // core/bridge.mjs — not this flag
+    // close is NOT driven here: /offscreen/manager.mjs owns the document's
+    // lifecycle (sync-close marks the sync module idle for it); the bridge
+    // has its own refcount — see core/bridge.mjs — not this flag
     case 'sync-running':
       return false;
     case 'sync-synced': {
@@ -216,6 +191,6 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       return false;
     }
     default:
-      return false;          // sync-ui-init / sync-confirm / sync-log → offscreen + pages
+      return false;          // sync-ui-init / sync-confirm / sync-log / sync-close → offscreen + pages
   }
 });

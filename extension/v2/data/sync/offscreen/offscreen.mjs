@@ -1,5 +1,6 @@
-// offscreen.mjs — the sync engine, run directly in the offscreen document
-// (data/sync/offscreen/offscreen.html). No UI:
+// offscreen.mjs — the sync engine, run inside the SHARED offscreen host
+// document (/offscreen/index.html, routed by manager.mjs; this module is
+// the 'sync-*' loader there). No UI:
 // the whole interface is chrome.runtime messages.
 //
 //   sync-job       {kind:'sync'|'dry'|'sync-dir'|'dry-dir'|'discard'|
@@ -36,13 +37,20 @@
 // gate declines instantly; with no responder at all the gate waits out a
 // generous timeout and auto-declines.
 //
-// Lifecycle: this document only exists while jobs are going. The worker
-// creates it for the first 'sync-job' it forwards; when the job list runs
-// empty this document asks the worker (sync-close) to close it again.
+// Lifecycle: this document only exists while jobs are going — and it is the
+// SHARED offscreen host now (/offscreen, manager.mjs): the manager imports
+// this module on its first routed 'sync-*' message and hands the routed
+// traffic + the 'sync-confirm' gate ports over; when the job list runs empty
+// the module says so (sync-close + the manager's idle hook) and the manager
+// closes the document itself once no other module has work either.
 //
 // Every settled non-dry job ends with a 'sync-refresh' broadcast
 // {accountId, slug}: the writes happened here, so the open mail clients
-// refresh their folder tree and open folder on receipt.
+// refresh their folder tree and open folder on receipt. The same settled
+// run reports the store's leftover state as 'sync-pending-dirs': every
+// dir left holding interlopers (unclaimed keepFmd5 moves, filter-pass
+// dest dirs) — the worker's dirty store marks them and its scheduler
+// re-arms the resync alarm from that report.
 
 'use strict';
 
@@ -183,8 +191,11 @@ let gateSeq = 0;
  * pending gate declines instantly. Every gate broadcast goes out EVEN when
  * nobody is connected: a panel can survive an engine restart (its port died
  * with the old document) — if no port (re)connects within
- * DECISIONS.gateGraceMs, the DECISIONS default answers on the user's behalf;
- * gates whose panel went silent still time out to a decline.
+ * DECISIONS.gateGraceMs, the effective default answers on the user's behalf:
+ * the job-carried stored preference ('Purge from server' / 'Drop local dir'
+ * set to yes/no in the preferences dialog) when there is one, the DECISIONS
+ * headless default otherwise; gates whose panel went silent still time out
+ * to a decline.
  */
 async function askGate(kind, {ops, describe, count}) {
   const lines = ops.slice(0, 10).map(op => '   ' + describe(op)).join('\n');
@@ -195,13 +206,22 @@ async function askGate(kind, {ops, describe, count}) {
       ? `Remove ${count} message${count === 1 ? '' : 's'} from the server?`
       : `Remove ${count} local dir${count === 1 ? '' : 's'}?`) +
     '\n\n' + lines + more + (more ? '' : '\n');
+  // the effective headless answer: a stored yes/no preference wins over
+  // the built-in default (a 'yes' follows the user's standing approval,
+  // a 'no' declines like an aborted confirm)
+  const pref = gatePrefs[kind === 'purge' ? 'purge' : 'drop'];
+  const grantedDefault = pref !== null
+    ? pref === 'yes'
+    : DECISIONS[kind === 'purge' ? 'noUiPurgeServer' : 'noUiDropLocalDir'];
+  const defaultSource = pref !== null
+    ? `stored ${kind === 'purge' ? 'purge from server' : 'drop local dir'} preference (${pref})`
+    : 'default decision';
   engineLog('system',
-    `(waiting for the ${kind} confirmation — answer in the open sync interface)` +
-    (gatePorts.size ? '' : ` (nobody is connected yet — the default decision ` +
-      (DECISIONS[kind === 'purge' ? 'noUiPurgeServer' : 'noUiDropLocalDir']
-        ? '(proceed)' : '(decline)') + `stands in after ${DECISIONS.gateGraceMs / 1000}s)`)
+    `waiting for the ${kind} confirmation — answer in the open sync interface` +
+    (gatePorts.size ? '' : ` (nobody is connected yet — the ${defaultSource} ` +
+      `(${grantedDefault ? 'proceed' : 'decline'}) stands in after ` +
+      `${DECISIONS.gateGraceMs / 1000}s)`)
   );
-  const grantedDefault = DECISIONS[kind === 'purge' ? 'noUiPurgeServer' : 'noUiDropLocalDir'];
   return new Promise(resolve => {
     let settled = false;
     const settle = (ok, value) => {
@@ -221,13 +241,13 @@ async function askGate(kind, {ops, describe, count}) {
     }, CONFIRM_TIMEOUT);
     // a panel may survive an engine restart (its port died with the old
     // document): the request still goes out so the panel reconnects
-    // immediately — the headless default only falls through when NO port
+    // immediately — the effective default only falls through when NO port
     // has (re)connected within the grace window
     const graceTimer = DECISIONS.gateGraceMs
       ? setTimeout(() => {
         if (!gatePorts.size) {
           resolveGate(grantedDefault,
-            `(no sync interface connected within the grace window — ${kind} default decision: ${grantedDefault ? 'proceed' : 'decline'})`);
+            `(no sync interface connected within the grace window — ${defaultSource}: ${grantedDefault ? 'proceed' : 'decline'})`);
         }
       }, DECISIONS.gateGraceMs)
       : null;
@@ -253,7 +273,8 @@ function resolveGate(ok, line, value) {
   }
 }
 
-chrome.runtime.onConnect.addListener(port => {
+/** every gate port — live or arriving later, via onGatePort('sync-confirm') */
+function attachGatePort(port) {
   if (port.name !== 'sync-confirm') {
     return;
   }
@@ -276,7 +297,15 @@ chrome.runtime.onConnect.addListener(port => {
       resolveGate(false, '(confirm gate declined — the sync interface closed)');
     }
   });
-});
+}
+
+// Called by /offscreen/manager.mjs with every sync-confirm port it accepted
+// BEFORE this module loaded (a panel may have opened the channel long
+// before the first sync job made the manager import this module — this
+// listener cannot be retroactively re-registered against older ports).
+function onGatePort(port) {
+  attachGatePort(port);
+}
 
 const confirmPurge = arg => askGate('purge', arg);
 const confirmDropDirectory = arg => askGate('drop', arg);
@@ -296,6 +325,21 @@ const queue = [];             // {rid, kind, account, dir} — rid = caller-
 let draining = false;         // one session at a time (serial queue; no job
                               // kind is parallel yet)
 let activeLabel = null;
+
+// the job-carried gate preferences (sync-ui.purge / sync-ui.drop, resolved
+// by a chrome.storage-owning caller): the headless gate default below
+// follows the stored choice instead of the hardcoded decline
+let gatePrefs = {purge: null, drop: null};
+
+/** normalize one job's carried prefs to {purge, drop} of 'yes'|'no'|null */
+function gatePrefsOf(msg) {
+  const raw = msg?.prefs;
+  const one = value => (['yes', 'no'].includes(value) ? value : null);
+  return {
+    purge: one(raw?.purge),
+    drop: one(raw?.drop)
+  };
+}
 
 const DIRS_LABEL_MAX = 3;         // names shown before "+N more"
 
@@ -347,7 +391,10 @@ function enqueueJob(msg) {
     dir: msg.dir, dirs: Array.isArray(msg.dirs) ? msg.dirs.slice() : null,
     // the mail client's syncs carry the stored filter list for the
     // post-sync pass over the NEW INBOX messages (runPostSyncFilters)
-    filters: Array.isArray(msg.filters) ? msg.filters.slice() : null
+    filters: Array.isArray(msg.filters) ? msg.filters.slice() : null,
+    // the stored gate preferences (sync-ui.purge / sync-ui.drop): only a
+    // saved yes/no counts, null = ask (the DECISIONS default stands in)
+    prefs: gatePrefsOf(msg)
   });
   engineLog('queue',
     `${describeJob(msg)} requested — ` +
@@ -463,7 +510,7 @@ async function runPostSyncFilters(job, plan, store, account) {
       Number.isFinite(Number(op.uid)))
     .map(op => Number(op.uid));
   if (!newUids.length) {
-    engineLog('filter', '(no new INBOX messages — filter pass skipped)', 'hint');
+    engineLog('filter', 'no new INBOX messages — filter pass skipped', 'hint');
     return;
   }
   const note = (content, cls = '') => engineLog('filter', content, cls);
@@ -496,12 +543,54 @@ async function runPostSyncFilters(job, plan, store, account) {
   }
 }
 
+/**
+ * The ground-truth dirty report: after every non-dry run, each local dir
+ * that holds INTERLOPERS — files whose FMD5 names another folder, the
+ * keepFmd5 pending-move marker — really needs a resync, whatever moved
+ * them there (this run's filter pass, a leftover the run did not claim,
+ * anything else that wrote the store). A resync filters on the disk
+ * state, not on who touched it: this runs the store over the fresh
+ * local layout and reports the dirty dirs — the worker's dirty store
+ * marks them, and its scheduler re-arms the alarm. Self-terminating:
+ * once a sync claims and pushes the interlopers, the scan finds them
+ * gone. The report rides the regular 'sync-pending-dirs' message.
+ */
+async function reportPendingMoves(store, account) {
+  try {
+    const dirs = [];
+    for (const dir of await store.listFolders()) {
+      const listing = await store.listLocal(dir).catch(() => null);
+      if (listing?.interlopers?.length) {
+        dirs.push(dir);
+      }
+    }
+    if (!dirs.length) {
+      return;
+    }
+    broadcast({
+      type: 'sync-pending-dirs',
+      accountId: account.id,
+      slug: account.slug,
+      dirs
+    });
+    engineLog('sync',
+      'pending-move report handed over: ' + dirs.join(', '));
+  }
+  catch (e) {
+    engineLog('warn',
+      'pending-move scan FAILED: ' + (e?.stack || e), 'warn');
+  }
+}
+
 /** every job boots its own client + engine and tears them down after */
 async function withSession(job) {
   let mail = null;
   let store = null;
   let refHeld = false;
   try {
+    // the stored gate preferences ride in the job: the headless defaults
+    // follow them until this session ends (the last job's prefs stand)
+    gatePrefs = job.prefs || {purge: null, drop: null};
     const gate = await recheckHandle();
     access = {
       granted: gate.ok,
@@ -530,7 +619,7 @@ async function withSession(job) {
     activeLabel = label;
     updateBusy();
     keepBridgeAlive();
-    engineLog('system', `— ${label} —`, 'system');
+    engineLog('system', `Sync starts for ${label}`, 'system');
     // the com.add0n.node bridge lives in the service worker (connectNative
     // is not an offscreen capability); acquire one ref for this job and ask
     // for the ready ws:// url (one ref, dropped in the finally below)
@@ -590,10 +679,21 @@ async function withSession(job) {
             miningBatch,
             only: dir
           });
-          const {summary} = await engine.run({dry: false});
+          const {plan, summary} = await engine.run({dry: false});
           reportDelimiter(account, summary);
           engineLog('summary', summary);
-          if (!summary.finishedAt || summary.failed) {
+          if (summary.finishedAt && !summary.failed) {
+            // INBOX dirty runs filter like every other non-interface
+            // sync: the shim kind harnesses the full-run filter pass for
+            // just this dir's new pulls (failure logs, never fails the
+            // sync — see runPostSyncFilters)
+            if (dir.toUpperCase() === 'INBOX' &&
+                Array.isArray(job.filters) && job.filters.length) {
+              await runPostSyncFilters({...job, kind: 'sync-dir', dir},
+                plan, store, account);
+            }
+          }
+          else {
             failed++;
           }
         }
@@ -653,6 +753,12 @@ async function withSession(job) {
         // messages are filtered right here, before the job settles
         await runPostSyncFilters(job, plan, store, account);
       }
+    }
+    // the state the store is left in decides the next resync: whatever
+    // dirs still hold pending moves are reported dirty now (dry runs
+    // include the survey's honest view, discard wipes the whole account)
+    if (store && job.kind !== 'discard') {
+      await reportPendingMoves(store, account);
     }
     return {started: true};
   }
@@ -716,9 +822,11 @@ async function scheduleDrain() {
     draining = false;
     updateBusy();
   }
-  // idle → end of this document's life: hand the close back to the worker
-  engineLog('queue', 'empty — closing the offscreen document');
+  // idle → the shared document's close decision (/offscreen/manager.mjs
+  // re-evaluates once no other module has work either)
+  engineLog('queue', 'empty — sync is idle');
   broadcast({type: 'sync-close'});
+  idleSync();
 }
 
 // ---------------------------------------------------------------- requests
@@ -755,23 +863,30 @@ const acceptsJob = msg =>
     Array.isArray(msg.dirs) && msg.dirs.length &&
     msg.dirs.every(d => typeof d === 'string' && d)));
 
-chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+/**
+ * The engine has own-message dispatch replaced by the manager contract:
+ * handle(msg) returns what the old listener used to respond() with
+ * (synchronously, or a Promise), and the manager owns both chrome.* sides
+ * (onMessage registration, 'sync-confirm' port registration via
+ * onGatePort). Returning `undefined` means no ack was intended.
+ *
+ * @param {object} msg routed runtime message
+ * @returns {object|undefined} the responder's payload where one existed
+ */
+function handle(msg) {
   switch (msg?.type) {
     case 'sync-ui-init':        // a panel opened: hand over the whole log var
-      respond(handleInit());
-      return false;
-    case 'sync-job': {          // forwarded here by the worker after ensure
+      return handleInit();
+    case 'sync-job': {          // routed here by the manager (worker → doc)
       if (!acceptsJob(msg)) {
         engineLog('request',
           `rejected bad request: ${JSON.stringify(msg?.kind)} · ` +
           JSON.stringify(msg?.account), 'warn'
         );
-        respond({ok: true, started: false, reason: 'bad-request'});
-        return false;
+        return {ok: true, started: false, reason: 'bad-request'};
       }
       enqueueJob(msg);
-      respond({ok: true, started: true, queued: queue.length});
-      return false;
+      return {ok: true, started: true, queued: queue.length};
     }
     case 'sync-stop': {
       // the kill path: the current job is torn down WITH this document
@@ -788,23 +903,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
       // every panel before the doc dies (flush emits synchronously)
       emitJobs();
       flush();
-      respond({ok: true});
-      return false;
+      return {ok: true};
     }
     case 'sync-confirm': {      // legacy answer path (sendMessage; the live
-      // path is the 'sync-confirm' port, see onConnect above)
+      // path is the 'sync-confirm' port routed by the manager)
       if (pendingConfirm?.requestId === msg.requestId) {
         pendingConfirm.resolve(!!msg.ok, msg.value);
       }
-      return false;
+      return undefined;
     }
     default:
-      return false;
+      return undefined;
   }
-});
+}
 
-// Handshake for the worker (it answers sync-request only after this arrived)
-broadcast({type: 'sync-ready'});
+/** idles the shared document's manager (/offscreen/manager.mjs) */
+function idleSync() {
+  globalThis.__offscreen?.idle?.('sync');
+}
+
+export {handle, onGatePort};
 
 // prime the access state so a panel opening mid-queue sees a real verdict
 rechecking().catch(() => {});

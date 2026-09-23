@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>offscreen</title>
+</head>
+<body>
+  <!-- The single offscreen host document. It carries no logic: manager.mjs
+       routes runtime messages to lazily-imported modules (data/sync/offscreen
+       for sync work, data/badge/offscreen for the badge counter) and closes
+       this document itself (window.close()) once every loaded module is idle
+       and nothing has arrived for a grace period. -->
+  <script type="module" src="manager.mjs"></script>
+</body>
+</html>

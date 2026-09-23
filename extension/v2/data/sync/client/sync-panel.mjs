@@ -13,8 +13,9 @@
 // interface closed = instant decline), and an explicit Keep/Cancel answer
 // carries reason:'rejected' so its decline is narrated distinctly.
 //
-// The sync engine itself lives in an offscreen document (data/sync/
-// offscreen.html): the host page only configures it, requests runs
+// The sync engine itself lives in the shared offscreen host document
+// (/offscreen/index.html, manager.mjs): the host page only configures it,
+// requests runs
 // and shows its logs. Logs travel chrome.runtime.sendMessage both ways:
 // opening the panel pulls the engine's current log array (sync-ui-init)
 // and then appends the broadcast batches ('sync-log'). Several panels —
@@ -234,7 +235,10 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
         ensureGatePort();
       }
       if (!syncOpen || !promptEl) {
-        replyConfirm(msg.requestId, false, 'rejected');
+        // no live interface to prompt in: a stored yes/no preference still
+        // answers on the user's behalf; 'ask' (or anything unset) declines
+        // like an aborted confirm
+        replyConfirmStored(msg);
         return;
       }
       const GATES = new Map([
@@ -270,6 +274,29 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       return;
     }
   });
+
+  /**
+   * A gate request reaching a panel that is not open (or has no prompt
+   * host): no live interface to show the choice in, so the STORED
+   * preference answers on the user's behalf — 'yes' approves, 'no' (and
+   * 'ask' / anything unset) declines like an aborted confirm. Read fresh
+   * from storage: the panel's in-memory prefs only load on open().
+   */
+  function replyConfirmStored(msg) {
+    const kind = msg?.kind === 'drop' ? 'drop' : 'purge';
+    chrome.storage.local
+      .get('sync-ui.' + kind)
+      .catch(() => ({}))
+      .then(stored => {
+        const value = stored['sync-ui.' + kind];
+        if (value === 'yes') {
+          replyConfirm(msg.requestId, true);
+        }
+        else {
+          replyConfirm(msg.requestId, false, 'rejected');
+        }
+      });
+  }
 
   /**
    * Gate answers travel over the 'sync-confirm' port (runtime.sendMessage
@@ -465,9 +492,6 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     if (forcedAccount) {
       syncView.setLockedAccount(forcedAccount);
       announceAccount();       // label now known (populateSelects resolved)
-    }
-    else if (!data?.ok) {
-      syncView.localNote('(sync engine not running — press Sync to start a job)', 'hint');
     }
   }
 
@@ -868,7 +892,10 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     if (kind !== 'discard' || await confirmDiscard(account)) {
       pendingRids.set(rid, btnOf);
       applyPending();
-      const payload = {type: 'sync-request', rid, kind, account, dir};
+      // bare:true — this is the ONE unfiltered submitter: the sync
+      // interface's filter row stays manual (the worker's default-on
+      // filter attach applies to every other 'sync-request' source)
+      const payload = {type: 'sync-request', rid, kind, account, dir, bare: true};
       if (kind === 'sync-dirs') {
         payload.dirs = dirtyDirs;
       }
@@ -896,11 +923,11 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
   async function confirmDiscard(account) {
     const pref = prefOf('discard');
     if (pref === 'yes') {
-      syncView.localNote('(discard approved automatically by preference)', 'hint');
+      syncView.localNote('discard approved automatically by preference', 'hint');
       return true;
     }
     if (pref === 'no') {
-      syncView.localNote('(discard declined automatically by preference)', 'hint');
+      syncView.localNote('discard declined automatically by preference', 'hint');
       return false;
     }
     try {
