@@ -130,8 +130,6 @@ class ListView extends HTMLElement {
   #pagePrev;
   #pageNext;
   #pageLast;
-  #unreadToggle;
-  #threadToggle;
   #refreshBtn;
   #unreadOnly = false;
   #threadMode = true;
@@ -309,31 +307,12 @@ class ListView extends HTMLElement {
           stroke-linecap: round;
           stroke-linejoin: round;
         }
-        .action.icon[data-action="unread-only"] svg {
-          fill: none;
-          stroke: currentColor;
-          stroke-width: 2;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-        }
-        .action.icon[data-action="thread-mode"] svg {
-          fill: none;
-          stroke: currentColor;
-          stroke-width: 2;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-        }
         .action.icon[data-action="refresh"] svg {
           fill: none;
           stroke: currentColor;
           stroke-width: 2;
           stroke-linecap: round;
           stroke-linejoin: round;
-        }
-        .action.icon[aria-pressed="true"] {
-          color: var(--accent, AccentColor);
-          background: color-mix(in srgb, var(--accent, AccentColor) 18%, transparent);
-          border-color: color-mix(in srgb, var(--accent, AccentColor) 55%, transparent);
         }
         .pager {
           display: flex;
@@ -648,8 +627,6 @@ class ListView extends HTMLElement {
           <button class="action icon" type="button" data-action="spam" accesskey="s" title="Spam (S)" aria-label="Spam"><svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="16 3 21 8 21 16 16 21 8 21 3 16 3 8 8 3"/><path d="M12 8v5"/><line x1="12" y1="16" x2="12" y2="16"/></svg></button>
           <button class="action icon" type="button" data-action="move" accesskey="m" title="Move (M)" aria-label="Move"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="M 4.1139706,4.8308824 C 3.9819908,4.8308824 3.875,4.9378731 3.875,5.0698529 V 18.930147 c 0,0.131912 0.1070588,0.238971 0.2389706,0.238971 H 19.886029 c 0.13198,0 0.238971,-0.106991 0.238971,-0.238971 V 7.8772794 c 0,-0.1319798 -0.106991,-0.2389706 -0.238971,-0.2389706 H 11.78875 c -0.553658,1.677e-4 -1.071532,-0.2736219 -1.383162,-0.73125 L 9.0635294,4.9360294 C 9.0189217,4.8700335 8.9443628,4.8306033 8.8647059,4.8308824 Z M 2,4.75 C 2,3.784 2.784,3 3.75,3 h 4.971 c 0.58,0 1.12,0.286 1.447,0.765 l 1.404,2.063 c 0.04647,0.068748 0.12402,0.1099591 0.207,0.11 h 8.471 c 0.966,0 1.75,0.783 1.75,1.75 V 19.25 C 22,20.216498 21.216498,21 20.25,21 H 3.75 C 2.7835017,21 2,20.216498 2,19.25 Z"/></svg></button>
           <button class="action icon" type="button" data-action="preview" accesskey="p" title="Preview (P)" aria-label="Preview"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M 4,3 C 2.9,3 2,3.9 2,5 v 14 c 0,1.1 0.9,2 2,2 h 16 c 1.1,0 2,-0.9 2,-2 V 5 C 22,3.9 21.1,3 20,3 Z M 4,5 H 20 V 19 H 4 Z m 8,3 c -3.3,0 -6,3.3 -6,4 0,0.7 2.7,4 6,4 3.3,0 6,-3.5 6,-4 0,-0.5 -2.7,-4 -6,-4 z m 0,1.5 V 11 c 0,0.6 0.4,1 1,1 h 1.5 c 0,1.6 -1.5,2.8 -3.2,2.4 C 10.5,14.2 9.8,13.5 9.5,12.6 9.2,11 10.4,9.5 12,9.5 Z"/></svg></button>
-          <button class="action icon" type="button" data-action="unread-only" accesskey="n" title="Show unread only (N)" aria-label="Show unread only" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.8874 5.17157C7.46546 4.59351 7.75449 4.30448 8.12203 4.15224C8.48957 4 8.89832 4 9.71582 4H14.326C15.1517 4 15.5646 4 15.9351 4.15505C16.3056 4.31011 16.5954 4.60419 17.175 5.19234L18.849 6.89105C19.4171 7.46745 19.7011 7.75566 19.8505 8.12024C20 8.48482 20 8.88945 20 9.69871V14.3431C20 15.1606 20 15.5694 19.8478 15.9369C19.6955 16.3045 19.4065 16.5935 18.8284 17.1716L17.1716 18.8284C16.5935 19.4065 16.3045 19.6955 15.9369 19.8478C15.5694 20 15.1606 20 14.3431 20H9.69871C8.88945 20 8.48482 20 8.12024 19.8505C7.75566 19.7011 7.46745 19.4171 6.89105 18.849L5.19235 17.175C4.60419 16.5954 4.31011 16.3056 4.15505 15.9351C4 15.5646 4 15.1517 4 14.326V9.71583C4 8.89832 4 8.48957 4.15224 8.12203C4.30448 7.75449 4.59351 7.46546 5.17157 6.8874L6.8874 5.17157Z"/><path d="M8 11L8.42229 11.2111C10.6745 12.3373 13.3255 12.3373 15.5777 11.2111L16 11"/><path d="M12 12.5V14"/><path d="M9 12L8.5 13"/><path d="M15 12L15.5 13"/></svg></button>
-          <button class="action icon" type="button" data-action="thread-mode" accesskey="r" title="Show single messages (R)" aria-label="Show single messages" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15h13.01m0 0a6 6 0 0 1-5.23-3.058l-1.06-1.884A6 6 0 0 0 4.49 7H3m13.01 8H21m0 0-3 3m3-3-3-3"/></svg></button>
           <button class="action icon" type="button" data-action="refresh" title="Refresh (re-read from local copy)" aria-label="Refresh list from the local copy"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg></button>
           <combo-view label="Mark as" type="button">
             <button data-action="mark-read" accesskey="r"><u>r</u>ead</button>
@@ -725,9 +702,7 @@ class ListView extends HTMLElement {
     this.#count = root.querySelector('.count');
     this.#selectAll = root.querySelector('.all input');
     this.#note = root.querySelector('.note');
-    this.#buttons = [...root.querySelectorAll('[data-action]')].filter(button => button.dataset.action !== 'unread-only' && button.dataset.action !== 'thread-mode' && button.dataset.action !== 'refresh');
-    this.#unreadToggle = root.querySelector('[data-action="unread-only"]');
-    this.#threadToggle = root.querySelector('[data-action="thread-mode"]');
+    this.#buttons = [...root.querySelectorAll('[data-action]')].filter(button => button.dataset.action !== 'refresh');
     this.#refreshBtn = root.querySelector('[data-action="refresh"]');
     this.#filter = root.querySelector('.filter');
     this.#clearFilter = root.querySelector('.clear-filter');
@@ -786,14 +761,6 @@ class ListView extends HTMLElement {
         }));
       });
     }
-    // view toggle: independent of the selection, always clickable
-    this.#unreadToggle.addEventListener('click', () => {
-      this.unreadOnly = !this.#unreadOnly;
-    });
-    // thread-mode toggle: independent of the selection, always clickable
-    this.#threadToggle.addEventListener('click', () => {
-      this.threadMode = !this.#threadMode;
-    });
     // refresh: independent of the selection, always clickable
     this.#refreshBtn.addEventListener('click', () => {
       this.dispatchEvent(new CustomEvent('refresh', {
@@ -947,7 +914,6 @@ class ListView extends HTMLElement {
 
   set threadMode(on) {
     const next = !!on;
-    this.#threadToggle.setAttribute('aria-pressed', String(next));
     if (this.#threadMode === next) {
       return;
     }
@@ -1090,7 +1056,6 @@ class ListView extends HTMLElement {
 
   set unreadOnly(on) {
     const next = !!on;
-    this.#unreadToggle.setAttribute('aria-pressed', String(next));
     if (this.#unreadOnly === next) {
       return;
     }

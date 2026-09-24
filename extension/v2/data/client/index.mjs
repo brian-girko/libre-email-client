@@ -16,6 +16,7 @@ import {init as initSyncEvents} from './sync-events.mjs';
 import {subscribe as subscribeLog, setStatus as setLogStatus} from './logger.mjs';
 import {init as initSyncRun, requestSync} from './sync-run.mjs';
 import {cancel as cancelJob, dismiss as dismissJob} from './jobs.mjs';
+import {getPref, setPref} from './prefs.mjs';
 import * as counters from './counters.mjs';
 
 initTheme();
@@ -134,6 +135,56 @@ const explorerOpen = document.getElementById('explorer-open');
 explorerOpen.addEventListener('click', () => {
   chrome.tabs.create({url: chrome.runtime.getURL('/data/explorer/index.html')});
 });
+
+// ---- client settings: status bar gear → checkbox dialog ----------------------
+//
+// The same style of preferences dialog the sync client carries: one gear
+// button on the status bar (the footer) opens a Cancel/Save dialog whose
+// checkboxes drive the list view's view toggles (unreadOnly / threadMode —
+// their change events persist and reload the folder through list.mjs) and
+// the folder tree's auto-expansion (ui.dirsExpandSub).
+
+const emailsView = document.getElementById('emails');
+const prefsDialog = document.getElementById('client-prefs');
+const prefsInputs = new Map(
+  [...prefsDialog.querySelectorAll('input[data-pref]')]
+    .map(input => [input.dataset.pref, input])
+);
+
+async function openClientPrefs() {
+  const [unread, thread, expand] = await Promise.all([
+    getPref('mailUnreadOnly', false),
+    getPref('mailThreadMode', true),
+    getPref('dirsExpandSub', false)
+  ]);
+  prefsInputs.get('unread').checked = !!unread;
+  prefsInputs.get('single').checked = !thread;
+  prefsInputs.get('expand').checked = !!expand;
+  prefsDialog.showModal();
+}
+
+function saveClientPrefs() {
+  const unread = prefsInputs.get('unread').checked;
+  const single = prefsInputs.get('single').checked;
+  // one write per pref; the list view's own change events persist the
+  // mail list toggles too (and re-render / reload the folder on change only)
+  emailsView.unreadOnly = unread;
+  emailsView.threadMode = !single;
+  const expand = prefsInputs.get('expand').checked;
+  setPref('dirsExpandSub', expand).catch(e =>
+    console.error('[client] settings save failed:', e));
+  // moving on only adds parents to the current tree (the setter is
+  // self-sufficient); switching off keeps the user-opened folders open
+  dirsView.expandSubs = expand;
+  prefsDialog.close();
+}
+
+document.getElementById('settings-open').addEventListener('click',
+  () => openClientPrefs().catch(e => console.error(e)));
+document.getElementById('client-prefs-cancel').addEventListener('click', () => {
+  prefsDialog.close();
+});
+document.getElementById('client-prefs-save').addEventListener('click', saveClientPrefs);
 
 // server-side search: Enter runs it, Esc clears; the ✕ button mirrors Esc.
 // Scope "this folder" vs "all folders" comes from an all: prefix.

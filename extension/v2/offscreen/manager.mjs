@@ -53,7 +53,8 @@ const ROUTES = [
   {
     key: 'sync',
     url: '../data/sync/offscreen/offscreen.mjs',
-    types: new Set(['sync-job', 'sync-ui-init', 'sync-stop', 'sync-confirm']),
+    types: new Set(['sync-job', 'sync-ui-init', 'sync-stop', 'sync-confirm',
+      'sync-job-drop']),
     busy: new Set(['sync-job', 'sync-stop']),
     ports: 'sync-confirm'
   },

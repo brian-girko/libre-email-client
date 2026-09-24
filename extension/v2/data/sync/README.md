@@ -34,7 +34,8 @@ data/sync/client/index.html and wired by `initSyncPanel(...)`
 (data/sync/client/sync-panel.mjs):
 
 - The mail client (data/client/index.mjs) carries no sync interface: its
-  Sync button (accesskey Y) in the footer opens this page on a new tab.
+  Sync combo in the footer runs the account (accesskey Y), the picked
+  folder (D) or just opens this page (N) on a new tab.
 - Without parameters the Account/Dir selectors are shown; with
   `?account=<id>` the account is dictated and its selector hides.
 
@@ -55,6 +56,37 @@ Jobs are deduped per view, not in the queue: a submitted request carries a
 rid, its own button stays pinned until the engine's 'sync-jobs' broadcast
 drops the rid — other views (and other job kinds in the same view) can
 still submit anything while jobs are pending.
+
+**Queue folding.** Before a request joins the queue it folds into the
+same account's jobs (identity: account id, else slug; dry runs and sync
+runs are separate families never merged into each other):
+
+- a folder-based request (`sync-dir` / `dry-dir` / `sync-dirs`) merges its
+  folders into the earlier pending folder-based job of the same
+  account+family (a single-dir job spreads into the `-dirs` form — the
+  earlier job keeps its rid, filters and prefs; the incoming rid leaves
+  the queue and its view's button unpins via the broadcast);
+- a folder-based request is dropped outright ("already covered", logged
+  on the queue) when a full-account run of the same family for that
+  account is queued or already running;
+- a full request folds every queued folder-based job of the same
+  account+family, and dedupes against a queued twin of its own;
+- `discard` jobs are never merged and never folded away; the running job
+  is never merged into (Stop is its only end).
+
+Every folding decision is narrated in the log; the dropped/merged job's
+panel sees its button release as usual. Because the pending list (below)
+shows every queued job, the queued sync kinds (Sync / Dry run, their
+per-Dir twins and Sync suggested dirs) never pin their buttons — only the
+destructive Discard and the panel-side filter runs stay pinned until they
+settle.
+
+**Pending jobs list.** Every panel shows the pending queue (one row per
+queued job, label + drop button) above the log pane, fed from the
+`sync-jobs` broadcast and seeded from `sync-ui-init`. A drop button sends
+`sync-job-drop {rid}` (worker forwards to the engine, which removes that
+one pending entry and re-broadcasts); the running job refuses a drop —
+only the Stop button ends a live session.
 
 ## Accounts (accounts.mjs)
 

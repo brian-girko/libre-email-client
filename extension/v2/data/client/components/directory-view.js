@@ -78,6 +78,7 @@ class DirectoryView extends HTMLElement {
   #roots = [];
   #byName = new Map();
   #expanded = new Set();
+  #expandSubs = false;
   #selected = null;
   #counts = new Map();
   #mode = 'loading';
@@ -585,12 +586,41 @@ class DirectoryView extends HTMLElement {
     return true;
   }
 
+  /**
+   * Whether folders with sub-folders auto-expand on (re)build (the client
+   * settings dialog's "Expand sub dirs" checkbox — default off, the tree
+   * starts fully collapsed apart from the selected folder's ancestors).
+   */
+  get expandSubs() {
+    return this.#expandSubs;
+  }
+
+  set expandSubs(on) {
+    const next = !!on;
+    if (this.#expandSubs === next) {
+      return;
+    }
+    this.#expandSubs = next;
+    if (next) {
+      // the built tree's parents are not in #expanded yet: add them right
+      // away so the re-render below shows the change without a re-read
+      for (const node of this.#byName.values()) {
+        if (node.children.length) {
+          this.#expanded.add(node.name);
+        }
+      }
+    }
+    this.#render();
+  }
+
   #build() {
     const {roots, byName} = buildTree(this.#list);
     this.#expanded = new Set([...this.#expanded].filter(name => byName.has(name)));
-    for (const node of roots) {
-      if (node.children.length) {
-        this.#expanded.add(node.name);
+    if (this.#expandSubs) {
+      for (const node of byName.values()) {
+        if (node.children.length) {
+          this.#expanded.add(node.name);
+        }
       }
     }
     if (this.#selected && !byName.has(this.#selected)) {

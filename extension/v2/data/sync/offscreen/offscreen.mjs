@@ -4,10 +4,19 @@
 // the whole interface is chrome.runtime messages.
 //
 //   sync-job       {kind:'sync'|'dry'|'sync-dir'|'dry-dir'|'discard'|
-//                   'sync-dirs', account, dir?, dirs?, filters?} →
+//                   'sync-dirs'|'dry-dirs', account, dir?, dirs?, filters?}
+//                   → sync-dirs/dry-dirs run one scoped pass per listed dir
 //                   {ok, queued} —
 //                   the job ENQUEUES and runs after the previous one;
-//                   never a 'busy' rejection. 'sync-dirs' runs one scoped
+//                   never a 'busy' rejection. Before enqueuing, same-
+//                   account jobs FOLD: a folder-based request merges its
+//                   folders into the earlier pending job of the same
+//                   family (sync/dry kept apart) and is dropped outright
+//                   when a queued or running full run of that family
+//                   covers the account; a full request folds the queued
+//                   folder-based jobs of its account away (every decision
+//                   narrated on the queue log). 'sync-dirs'/'dry-dirs'
+//                   runs one scoped
 //                   sync per dir in its dirs array (one session, per-dir
 //                   failures logged and skipped; lastSyncAt stamps only
 //                   when every dir finished clean). A full 'sync' job may
@@ -15,6 +24,8 @@
 //                   the NEW INBOX messages are filtered on the spot
 //                   (runPostSyncFilters) — interface jobs never carry
 //                   filters, their behavior is unchanged
+//   sync-job-drop  {rid} → {ok, dropped} — removes ONE pending job from
+//                   the queue (the running one refuses; use sync-stop)
 //   sync-stop                       → the kill path: drops the queued jobs,
 //                   says goodbye to the sync-views (a final log broadcast
 //                   they all receive) and lets the worker close this document
@@ -325,6 +336,9 @@ const queue = [];             // {rid, kind, account, dir} — rid = caller-
 let draining = false;         // one session at a time (serial queue; no job
                               // kind is parallel yet)
 let activeLabel = null;
+let activeJob = null;         // the RUNNING job (queue[0] while draining):
+                              // merges and drops only ever consider the
+                              // pending entries, never the live sessions
 
 // the job-carried gate preferences (sync-ui.purge / sync-ui.drop, resolved
 // by a chrome.storage-owning caller): the headless gate default below
@@ -358,7 +372,7 @@ function describeDirs(dirs) {
 const describeJob = job => {
   const a = job.account || {};
   const name = a.name || a.id || 'account';
-  if (job.kind === 'sync-dirs') {
+  if (job.kind === 'sync-dirs' || job.kind === 'dry-dirs') {
     return `${job.kind} · ${name}` +
       (describeDirs(job.dirs) ? ' · ' + describeDirs(job.dirs) : '');
   }
@@ -366,15 +380,21 @@ const describeJob = job => {
     (job.kind.endsWith('-dir') && job.dir ? ' · ' + job.dir : '');
 };
 
+/** the queue-shape every consumer sees: rid included, the RUNNING job
+ *  (activeJob) carries running:true — the interface's list renders it
+ *  without a drop button (Stop ends a live session, never the ✕) */
+const queueShape = () => queue.map(job => ({
+  rid: job.rid, kind: job.kind, dir: job.dir, dirs: job.dirs,
+  label: describeJob(job),
+  running: job === activeJob
+}));
+
 /** every queue mutation broadcasts the full list, rid included */
 function emitJobs() {
   emit({
     type: 'sync-jobs',
     busy: draining || queue.length > 0,
-    items: queue.map(job => ({
-      rid: job.rid, kind: job.kind, dir: job.dir, dirs: job.dirs,
-      label: describeJob(job)
-    }))
+    items: queueShape()
   });
 }
 
@@ -385,7 +405,105 @@ function updateBusy() {
   broadcast({type: 'sync-running', busy, label: busy ? label : null});
 }
 
+/** families the queue cares about: the full-account run of a family covers
+ *  every folder of it, and folder-based jobs merge only inside their family
+ *  (a queued dry run stays independent of a queued sync) */
+const FULL_KINDS = new Set(['sync', 'dry']);
+const DIR_KINDS = new Set(['sync-dir', 'dry-dir', 'sync-dirs', 'dry-dirs']);
+const familyOf = kind => String(kind ?? '').startsWith('dry') ? 'dry' : 'sync';
+
+/** identity of an account as far as the queue cares */
+const accountKey = a =>
+  a?.id ?? a?.slug ?? `${a?.host}:${a?.user}`;
+
+/**
+ * Queue hygiene before a fresh job joins (never touches the RUNNING job):
+ * - a folder-based request is dropped when a full run of the same
+ *   account+family is queued or already running (it covers every folder)
+ * - folder-based requests merge their folders into the earlier pending
+ *   job of the same account+family (a single-dir job spreads into the
+ *   -dirs form); the earlier job keeps its rid/filters/prefs, the
+ *   incoming rid leaves the queue (its view unpins via the broadcast)
+ * - a full request folds away every pending folder-based job of the same
+ *   account+family ahead of itself, and dedupes against a queued twin
+ * - discard jobs ride past untouched
+ * Every folding decision is narrated on the queue log.
+ * @returns {'queued'|'merged'|'dropped'} what became of the request
+ */
+function mergeQueue(msg) {
+  const kind = msg.kind;
+  if (kind === 'discard') {
+    return 'queued';
+  }
+  const family = familyOf(kind);
+  const accKey = accountKey(msg.account);
+  const sameAcc = j => familyOf(j.kind) === family &&
+    accountKey(j.account) === accKey;
+
+  if (DIR_KINDS.has(kind)) {
+    // a full run in flight already sweeps the whole account
+    if (FULL_KINDS.has(activeJob?.kind) && sameAcc(activeJob)) {
+      engineLog('queue',
+        `${describeJob(msg)} dropped — a full ${family === 'dry' ? 'dry' : 'sync'} run is in flight for this account`);
+      return 'dropped';
+    }
+    const fullIdx = queue.findIndex(j => j !== activeJob && FULL_KINDS.has(j.kind) && sameAcc(j));
+    if (fullIdx >= 0) {
+      engineLog('queue',
+        `${describeJob(msg)} dropped — covered by the queued ${describeJob(queue[fullIdx])}`);
+      return 'dropped';
+    }
+    const idx = queue.findIndex(j => j !== activeJob && DIR_KINDS.has(j.kind) && sameAcc(j));
+    if (idx >= 0) {
+      const target = queue[idx];
+      const incomingDirs = kind.endsWith('-dirs') ? msg.dirs.slice() : [msg.dir];
+      const haveDirs = target.kind.endsWith('-dirs')
+        ? (target.dirs ?? []).slice()
+        : [target.dir];
+      const merged = [...new Set([...haveDirs, ...incomingDirs])]
+        .filter(d => typeof d === 'string' && d)
+        .sort((a, b) => a.localeCompare(b));
+      target.kind = family === 'dry' ? 'dry-dirs' : 'sync-dirs';
+      target.dir = null;
+      target.dirs = merged;
+      engineLog('queue',
+        `${describeJob(msg)} merged into the queued ${describeJob(target)}`);
+      return 'merged';
+    }
+  }
+  else if (FULL_KINDS.has(kind)) {
+    if (FULL_KINDS.has(activeJob?.kind) && sameAcc(activeJob)) {
+      engineLog('queue',
+        `${describeJob(msg)} dropped — an identical full run is in flight`);
+      return 'dropped';
+    }
+    const dupIdx = queue.findIndex(j => j !== activeJob && FULL_KINDS.has(j.kind) && sameAcc(j));
+    if (dupIdx >= 0) {
+      engineLog('queue',
+        `${describeJob(msg)} dropped — already queued (${describeJob(queue[dupIdx])})`);
+      return 'dropped';
+    }
+    const folded = queue.filter(j => j !== activeJob &&
+      DIR_KINDS.has(j.kind) && sameAcc(j));
+    for (const job of folded) {
+      queue.splice(queue.indexOf(job), 1);
+      engineLog('queue', `${describeJob(job)} dropped — the queued full run covers it`);
+    }
+    if (folded.length) {
+      emitJobs();
+    }
+  }
+  return 'queued';
+}
+
 function enqueueJob(msg) {
+  const outcome = mergeQueue(msg);
+  if (outcome !== 'queued') {
+    emitJobs();   // dropped/merged rids leave (or never entered) the queue:
+                  // their views unpin right away
+    scheduleDrain();
+    return;
+  }
   queue.push({
     rid: msg.rid, kind: msg.kind, account: msg.account,
     dir: msg.dir, dirs: Array.isArray(msg.dirs) ? msg.dirs.slice() : null,
@@ -612,7 +730,7 @@ async function withSession(job) {
     const rootHandle = gate.handle;
     const account = job.account;
     const only = job.kind.endsWith('-dir') ? job.dir : undefined;
-    const dirsNote = job.kind === 'sync-dirs'
+    const dirsNote = (job.kind === 'sync-dirs' || job.kind === 'dry-dirs')
       ? ` · ${describeDirs(job.dirs)}`
       : '';
     const label = `${account.name || account.id}${only ? ' · ' + only : ''}${dirsNote}`;
@@ -655,14 +773,16 @@ async function withSession(job) {
       broadcast({type: 'sync-synced', accountId: account.id, finishedAt: null});
       engineLog('discard', 'lastSyncAt handed to the service worker — press Sync for the full re-pull');
     }
-    else if (job.kind === 'sync-dirs') {
-      // one session, one scoped sync per suggested dir: each run reuses
-      // the single-dir scoping (only: dir) and its own snapshot read —
-      // a per-dir failure logs and moves on, the rest still sync
+    else if (job.kind === 'sync-dirs' || job.kind === 'dry-dirs') {
+      // one session, one scoped sync per dir: each run reuses the
+      // single-dir scoping (only: dir) and its own snapshot read — a
+      // per-dir failure logs and moves on, the rest still sync. dry-dirs
+      // is the merge-fused form of queued dry-dir jobs: survey-only.
+      const dry = job.kind.startsWith('dry');
       const dirs = (job.dirs || []).filter(d =>
         typeof d === 'string' && d);
       if (!dirs.length) {
-        engineLog('sync', '(no dirs listed — nothing to sync)');
+        engineLog(dry ? 'dry' : 'sync', '(no dirs listed — nothing to sync)');
         return {started: true};
       }
       let failed = 0;
@@ -679,10 +799,15 @@ async function withSession(job) {
             miningBatch,
             only: dir
           });
-          const {plan, summary} = await engine.run({dry: false});
+          const {plan, summary} = await engine.run({dry});
           reportDelimiter(account, summary);
           engineLog('summary', summary);
-          if (summary.finishedAt && !summary.failed) {
+          if (dry) {
+            if (!plan.ops.length && !plan.conflicts.length) {
+              engineLog('summary', '(nothing to do)');
+            }
+          }
+          else if (summary.finishedAt && !summary.failed) {
             // INBOX dirty runs filter like every other non-interface
             // sync: the shim kind harnesses the full-run filter pass for
             // just this dir's new pulls (failure logs, never fails the
@@ -702,9 +827,16 @@ async function withSession(job) {
           engineLog('warn', `FAILED ${dir}: ` + (e?.stack || e), 'warn');
         }
       }
-      // lastSyncAt is account-level: stamp it only when EVERY dir ran clean,
-      // so a partial pass never looks like a completed account sync
-      if (failed) {
+      // lastSyncAt is account-level: stamp it only when EVERY dir ran
+      // clean, so a partial pass never looks like a completed account sync
+      // (dry runs never stamp, and dry failures never count as real)
+      if (dry) {
+        if (failed) {
+          engineLog('sync',
+            `${failed} of ${dirs.length} dir(s) failed (dry run)`);
+        }
+      }
+      else if (failed) {
         engineLog('sync',
           `${failed} of ${dirs.length} dir(s) failed — lastSyncAt left untouched`);
       }
@@ -797,9 +929,11 @@ async function scheduleDrain() {
     while (queue.length) {
       const job = queue[0];
       const left = queue.length;
+      activeJob = job;
       engineLog('queue', `starting ${describeJob(job)} (1 of ${left})`);
       await withSession(job);
       queue.shift();
+      activeJob = null;
       emitJobs();
       // the run (and its filter pass) wrote into the account dir from
       // this invisible document — every open mail client needs the
@@ -819,6 +953,7 @@ async function scheduleDrain() {
     emitJobs();
   }
   finally {
+    activeJob = null;
     draining = false;
     updateBusy();
   }
@@ -844,10 +979,7 @@ function handleInit() {
     // (e.g. the mail client's background sync, whose state survives its
     // own reloads in chrome.storage.session) ask whether THEIR rid is
     // still queued — same shape as the sync-jobs broadcast
-    items: queue.map(job => ({
-      rid: job.rid, kind: job.kind, dir: job.dir, dirs: job.dirs,
-      label: describeJob(job)
-    })),
+    items: queueShape(),
     granted: access.granted,
     reason: access.reason,
     raw: access.raw,
@@ -856,10 +988,11 @@ function handleInit() {
 }
 
 const acceptsJob = msg =>
-  ['sync', 'dry', 'sync-dir', 'dry-dir', 'sync-dirs', 'discard'].includes(msg.kind) &&
+  ['sync', 'dry', 'sync-dir', 'dry-dir', 'sync-dirs', 'dry-dirs',
+    'discard'].includes(msg.kind) &&
   !!(msg.account && typeof msg.account === 'object' &&
      msg.account.host && msg.account.port && msg.account.user) &&
-  (msg.kind !== 'sync-dirs' || (
+  (msg.kind !== 'sync-dirs' && msg.kind !== 'dry-dirs' || (
     Array.isArray(msg.dirs) && msg.dirs.length &&
     msg.dirs.every(d => typeof d === 'string' && d)));
 
@@ -904,6 +1037,23 @@ function handle(msg) {
       emitJobs();
       flush();
       return {ok: true};
+    }
+    case 'sync-job-drop': {
+      // drop ONE pending job by rid (the interface's queue list button);
+      // the running job refuses — killing a live session is Stop's job
+      const idx = queue.findIndex(job => job.rid === msg.rid && job !== activeJob);
+      if (idx < 0) {
+        const running = activeJob?.rid === msg.rid;
+        return {ok: true, dropped: false,
+          reason: running ? 'running' : 'not-queued'};
+      }
+      engineLog('queue',
+        `${describeJob(queue[idx])} dropped from the queue by the interface`);
+      queue.splice(idx, 1);
+      emitJobs();
+      scheduleDrain();   // re-evaluates the close/idle decision on an
+                         // emptied queue
+      return {ok: true, dropped: true};
     }
     case 'sync-confirm': {      // legacy answer path (sendMessage; the live
       // path is the 'sync-confirm' port routed by the manager)

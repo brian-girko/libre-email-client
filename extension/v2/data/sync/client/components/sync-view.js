@@ -31,6 +31,7 @@ class SyncView extends HTMLElement {
   #dirtyline;
   #status;
   #regrant;
+  #queue;
   #out;
   #buttons = {};   // id → button element
   #filters = [];   // [{id, label}] offered by the wiring (setFilters)
@@ -91,9 +92,57 @@ class SyncView extends HTMLElement {
           flex-wrap: wrap;
           padding: 8px;
         }
-      .row[hidden] {
+        .row[hidden] {
           display: none;
       }
+        /* pending queue: one row per queued job, dropped individually */
+        #queue {
+          flex: 0 0 auto;
+          overflow: hidden;
+          border-top: 1px solid var(--line, #d9dce1);
+          padding: 4px 8px;
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          max-height: 30vh;
+          overflow-y: auto;
+        }
+        #queue[hidden] { display: none; }
+        .queue-head {
+          color: var(--dim, #6f747d);
+          font-size: 11px;
+          padding-bottom: 2px;
+        }
+        .queue-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+        }
+        .queue-label {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .queue-drop {
+          font: inherit;
+          font-size: 11px;
+          min-height: 22px;
+          min-width: 22px;
+          padding: 0 4px;
+          margin-left: auto;
+          border: 1px solid var(--line, #d9dce1);
+          border-radius: var(--radius, 10px);
+          background: var(--bg, #f5f6f8);
+          color: var(--fg, #1b1d21);
+          cursor: pointer;
+          flex: 0 0 auto;
+        }
+        .queue-drop:hover {
+          border-color: #8c3a3a;
+          color: light-dark(#b3261e, #f2b8b5);
+        }
         select, #discard, #kill, #clearlog, #syncdirs {
           font: inherit;
           min-height: 28px;
@@ -252,6 +301,7 @@ class SyncView extends HTMLElement {
             <button id="syncdirs" type="button" disabled>Sync suggested dirs</button>
           </div>
         </header>
+        <div id="queue" hidden></div>
        <main>
          <log-view id="out" timestamps max-lines="500"></log-view>
        </main>
@@ -327,6 +377,7 @@ class SyncView extends HTMLElement {
     this.#scope = this.#shadow.getElementById('scope');
     this.#status = this.#shadow.querySelector('.status');
     this.#regrant = this.#shadow.getElementById('regrant');
+    this.#queue = this.#shadow.getElementById('queue');
     this.#out = this.#shadow.getElementById('out');
     // the status bar's gear opens the preferences dialog
     const dialog = this.#shadow.getElementById('prefs-dialog');
@@ -631,6 +682,55 @@ class SyncView extends HTMLElement {
   }
 
   /**
+   * The engine's pending queue (the 'sync-jobs' broadcast / sync-ui-init
+   * items, rid included), rendered as one row per queued job above the
+   * log pane — each carrying its own drop button ('sync-job-drop' event,
+   * handled by the wiring). An empty list hides the section entirely.
+   */
+  setQueue(items) {
+    const rows = (Array.isArray(items) ? items : [])
+      .filter(item => item && typeof item.rid === 'string' && item.label);
+    this.#queue.hidden = !rows.length;
+    this.#queue.replaceChildren();
+    if (!rows.length) {
+      return;
+    }
+    const head = document.createElement('div');
+    head.className = 'queue-head';
+    head.textContent =
+      `pending jobs (${rows.length}) — dropped jobs never run`;
+    this.#queue.appendChild(head);
+    for (const item of rows) {
+      const row = document.createElement('div');
+      row.className = 'queue-row';
+      const label = document.createElement('span');
+      label.className = 'queue-label';
+      // a live run is untouchable — Stop is its only end
+      label.textContent = item.running ? item.label + ' · running' : item.label;
+      label.title = item.running
+        ? 'running — use the Stop button to end it'
+        : item.label;
+      row.appendChild(label);
+      if (!item.running) {
+        const drop = document.createElement('button');
+        drop.type = 'button';
+        drop.className = 'queue-drop';
+        drop.textContent = '✕';
+        drop.title = 'Drop this queued job';
+        drop.addEventListener('click', () => {
+          this.dispatchEvent(new CustomEvent('sync-job-drop', {
+            detail: {rid: item.rid},
+            bubbles: true,
+            composed: true
+          }));
+        });
+        row.appendChild(drop);
+      }
+      this.#queue.appendChild(row);
+    }
+  }
+
+  /**
    * Seeds the dialog's selects from the wiring (the stored sync-ui.*
    * preferences); a plain preferences state is remembered locally so the
    * dialog re-opens with the current values even before the setter ran.
@@ -704,7 +804,12 @@ class SyncView extends HTMLElement {
    * Pins/unpins request buttons per this view's own submitted jobs. A pin
    * means "the engine still has this rid pending": the button is disabled
    * regardless of busy state, while everything else stays submittable —
-   * several job kinds and other views never lock each other.
+   * several job kinds and other views never lock each other. Queued sync
+   * kinds (Sync / Dry run, their Per-Dir twins and Sync suggested dirs)
+   * NEVER pin: the queue folds duplicate same-account requests (merge
+   * folders / dedupe against the twin) and the pending list shows what is
+   * on the way, so they stay pressable while their jobs queue. Only the
+   * destructive Discard and the panel-side filter runs keep the pin.
    */
   setPendingButtons(ids = []) {
     this.#pending = new Set(ids);
@@ -749,7 +854,9 @@ class SyncView extends HTMLElement {
           : id === 'syncdirs'
             ? !hasAccount || !this.#suggested.length
             : !hasAccount;
-      btn.disabled = this.#pending.has(id) || base;
+      const queued = new Set(['sync', 'dry', 'syncdir', 'drydir', 'syncdirs']);
+      const pin = this.#pending.has(id) && !queued.has(id);
+      btn.disabled = pin || base;
     }
     // the Stop button lives with the run: only meaningful while busy
     this.#buttons.kill.hidden = !this.#busy;

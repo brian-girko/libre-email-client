@@ -320,6 +320,19 @@ export function createClient(settings) {
       await run(api => api.moveTo(list, mailbox));
     },
 
+    /** CREATE of one mailbox on the server (locally-born dirs) */
+    async createDir(name) {
+      if (!name || typeof name !== 'string') {
+        throw new Error('createDir: folder name required');
+      }
+      await run(async api => {
+        if (typeof api.createDir !== 'function') {
+          throw new Error('createDir: core MailApi build has no createDir; wire a create passthrough next to the other mutation wrappers in core/rust-imap-client/api.mjs');
+        }
+        await api.createDir(name);
+      });
+    },
+
     /** DELETE of one mailbox from the server (empty-dir mirror deletions) */
     async deleteDir(name) {
       if (!name || typeof name !== 'string') {

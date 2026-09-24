@@ -115,6 +115,31 @@
         <p class="hint">The extension keeps a local copy of your mail (folders, lists and message bodies) and syncs it with the server periodically and on every action. "All" stores every message body for instant offline reading; the older-window options only fetch the newest N bodies per folder, everything else is pulled on demand when you open an email.</p>
       </fieldset>
       <fieldset>
+        <legend>Automatic sync</legend>
+        <label class="check">
+          <input type="checkbox" id="f-sync-auto-enabled" checked> Enable automatic sync
+        </label>
+        <p class="hint">Master switch for every scheduled sync below. When off, nothing syncs on its own — manual syncs from the client or the sync interface still work. Toggles apply without a restart.</p>
+        <label class="check">
+          <input type="checkbox" id="f-sync-full-enabled" checked> Periodic full sync
+        </label>
+        <label>Full sync interval (minutes)
+          <input type="number" id="f-sync-full-interval" min="5" placeholder="15">
+        </label>
+        <p class="hint">How often every account is fully synced with the server (every folder, one job per account; the minimum is 5 minutes, the default 15). A manual full sync resets that account's timer — the next automated run lands one interval after it.</p>
+        <label class="check">
+          <input type="checkbox" id="f-sync-dirty-enabled" checked> Dirty (partial) sync
+        </label>
+        <label>Dirty sync delay (seconds)
+          <input type="number" id="f-sync-dirty-delay" min="10" placeholder="60">
+        </label>
+        <p class="hint">After a local edit, the changed folders are re-synced with the server after this delay (coalescing bursts of edits; minimum 10 seconds, the default 60). Note that Chrome delays alarm delivery below ~30s, so a 10–29s setting effectively fires at ~30s. The marks are kept and covered by a manual or the next full sync.</p>
+        <label class="check">
+          <input type="checkbox" id="f-sync-idle-enabled" checked> Sync on return from idle
+        </label>
+        <p class="hint">Runs the same full sweep as the browser start whenever the computer becomes active again after being idle or locked (a transition is detected after ~10 minutes away). When off, nothing syncs on the wake-up — the regular cadence continues on its own.</p>
+      </fieldset>
+      <fieldset>
         <legend>Badge counter</legend>
         <label class="check">
           <input type="checkbox" id="f-badge-enabled" checked> Enable the badge counter

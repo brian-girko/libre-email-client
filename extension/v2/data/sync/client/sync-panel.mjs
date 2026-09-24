@@ -192,9 +192,11 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       syncView.appendLogs(msg.lines || []);
       return;
     }
-    // queue state: unpin this view's rids that are no longer pending; the
-    // broadcast carries every pending job, but only OUR rids were pinned
+    // queue state: render the pending list, unpin this view's rids that
+    // are no longer pending; the broadcast carries every pending job, but
+    // only OUR rids were pinned
     if (msg?.type === 'sync-jobs') {
+      syncView.setQueue(msg.items || []);
       const live = new Set((msg.items || []).map(j => j.rid));
       let dirty = false;
       for (const rid of [...pendingRids.keys()]) {
@@ -478,6 +480,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     const data = await chrome.runtime.sendMessage({type: 'sync-ui-init'})
       .catch(() => null);
     syncView.replaceLogs(data?.logs || []);
+    syncView.setQueue(data?.items || []);
     if (!data?.ok) {
       // a dead engine holds no jobs: this view's old pins can't complete
       pendingRids.clear();
@@ -689,6 +692,42 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
         refreshDirty().catch(() => {});
       })
       .catch(e => syncView.setStatus('stop failed: ' + (e?.message || String(e))));
+  });
+
+  // one queued job's drop button: removes exactly that pending entry —
+  // the running job is untouchable (Stop is the only way out of a live run)
+  syncView.addEventListener('sync-job-drop', e => {
+    const rid = e?.detail?.rid;
+    if (typeof rid !== 'string' || !rid) {
+      return;
+    }
+    syncView.setStatus('dropping queued job…');
+    chrome.runtime.sendMessage({type: 'sync-job-drop', rid})
+      .then(res => {
+        if (!res?.ok) {
+          syncView.setStatus('drop failed: ' +
+            (res?.error || res?.reason ||
+              'the engine did not answer — the running engine document' +
+              ' may still be the old code (press Stop to reload it)'));
+          return;
+        }
+        if (!res.dropped) {
+          syncView.setStatus('not queued anymore — ' +
+            (res?.reason === 'running'
+              ? 'the job is running (use Stop to end it)'
+              : 'the job already left the queue'));
+          return;
+        }
+        syncView.setStatus(null);
+        // the rid left the queue (the broadcast would unpin too, but the
+        // dropped job's button releases at once) — the dirty report may
+        // have picked the dropped job's dirs back up: re-read it
+        pendingRids.delete(rid);
+        applyPending();
+        refreshDirty().catch(() => {});
+      })
+      .catch(err => syncView.setStatus(
+        'drop failed: ' + (err?.message || String(err))));
   });
 
   /**

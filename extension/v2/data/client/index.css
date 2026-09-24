@@ -128,6 +128,109 @@ body {
   cursor: pointer;
 }
 
+/* the status bar's gear: icon-only square like the sync client's */
+#settings-open {
+  flex: none;
+  align-self: flex-start;
+  min-height: calc(26px * var(--font-scale, 1));
+  min-width: calc(26px * var(--font-scale, 1));
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: inherit;
+  color: var(--fg);
+  background: var(--pane-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  cursor: pointer;
+}
+
+#settings-open svg {
+  width: calc(14px * var(--font-scale, 1));
+  height: calc(14px * var(--font-scale, 1));
+  display: block;
+  fill: currentColor;
+}
+
+#settings-open:hover {
+  border-color: var(--dim);
+}
+
+/* the client settings dialog (same style as the sync client's preferences) */
+#client-prefs {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  background: var(--pane-bg);
+  color: var(--fg);
+  font: calc(13px * var(--font-scale, 1))/1.5 system-ui, -apple-system,
+        "Segoe UI", Roboto, sans-serif;
+  padding: calc(14px * var(--font-scale, 1));
+  width: min(480px, 92vw);
+}
+
+#client-prefs::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+#client-prefs .prefs-head {
+  font-weight: 600;
+  margin-bottom: calc(10px * var(--font-scale, 1));
+}
+
+#client-prefs .prefs-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: calc(10px * var(--font-scale, 1));
+  padding: calc(6px * var(--font-scale, 1)) 0;
+  border-top: 1px solid var(--line);
+}
+
+#client-prefs .prefs-label {
+  min-width: 0;
+}
+
+#client-prefs .prefs-label .title {
+  display: block;
+}
+
+#client-prefs .prefs-label .hint {
+  display: block;
+  color: var(--dim);
+  font-size: calc(11px * var(--font-scale, 1));
+}
+
+#client-prefs .settings-check {
+  margin-top: calc(4px * var(--font-scale, 1));
+  accent-color: var(--accent, AccentColor);
+}
+
+#client-prefs .prefs-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: calc(8px * var(--font-scale, 1));
+  margin-top: calc(12px * var(--font-scale, 1));
+}
+
+#client-prefs .prefs-actions button {
+  min-height: calc(28px * var(--font-scale, 1));
+  padding: calc(2px * var(--font-scale, 1)) calc(10px * var(--font-scale, 1));
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+  cursor: pointer;
+}
+
+#client-prefs .prefs-actions button:hover {
+  border-color: var(--dim);
+}
+
 /* combo segments share one bordered body; the border lives on the host */
 #sync-combo {
   flex: none;

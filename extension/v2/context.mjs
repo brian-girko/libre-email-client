@@ -8,7 +8,7 @@
 
 import {LIGHT_THEMES, DARK_THEMES, THEME_DEFAULTS} from '/data/client/themes.mjs';
 import {FONT_SIZES, normalizeFontScale} from '/data/client/font-scale.mjs';
-import {runAllAccounts} from '/sync-scheduler.mjs';
+import {runAllAccounts, syncBadgeDirs} from '/sync-scheduler.mjs';
 
 const THEME_USES = [
   {id: 'auto', title: 'Auto (OS theme)'},
@@ -111,6 +111,12 @@ chrome.runtime.onInstalled.addListener(async () => {
     title: 'Sync Now',
     contexts: ['action']
   });
+
+  chrome.contextMenus.create({
+    id: 'sync.badge',
+    title: 'Update Badge Now',
+    contexts: ['action']
+  });
 });
 
 chrome.contextMenus.onClicked.addListener(info => {
@@ -120,6 +126,13 @@ chrome.contextMenus.onClicked.addListener(info => {
     // no UI: the scheduler submits a full run per account straight to
     // the engine and resets each account's cadence timer
     runAllAccounts('menu');
+    return;
+  }
+  if (id === 'sync.badge') {
+    // no UI: a dirty check for the badge counter's folders — the folders
+    // the badge counts that the dirty store lists are synced at once
+    // (no alarm, no delay), then the recount follows the settled runs
+    syncBadgeDirs('menu');
     return;
   }
   if (id.startsWith('theme.light.')) {

@@ -97,6 +97,19 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         .catch(e => respond({ok: false, error: e?.message || String(e)}));
       return true;
     }
+    // drop ONE pending job by rid (the panel's queue list): the engine
+    // removes that pending entry and re-broadcasts 'sync-jobs'. No doc up
+    // means no queue — there is nothing to drop.
+    case 'sync-job-drop': {
+      if (typeof msg?.rid !== 'string' || !msg.rid) {
+        respond({ok: false, error: 'missing rid'});
+        return true;
+      }
+      chrome.runtime.sendMessage({type: 'sync-job-drop', rid: msg.rid})
+        .then(res => respond(res ?? {ok: false, error: 'engine did not answer'}))
+        .catch(() => respond({ok: true, dropped: false, reason: 'not-queued'}));
+      return true;
+    }
     // the interface's Stop button: let the offscreen broadcast its goodbye
     // to every open panel, then force-tear the doc (current job included)
     // down. The killed run never gets to return its bridge ref — drop it

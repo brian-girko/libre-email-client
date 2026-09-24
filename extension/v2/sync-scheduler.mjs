@@ -14,7 +14,7 @@
 //
 //   dirty  — a client edit ('sync-dirty-report') re-arms
 //            'sync.auto.dirty.<accountId>' to fire
-//            <sync.auto.dirtyDelay> seconds out (default 30; Chrome
+//            <sync.auto.dirtyDelay> seconds out (default 60; Chrome
 //            delays alarm delivery below 30s, and a burst of edits
 //            coalesces into the last report), then a fired alarm
 //            submits ONE 'sync-dirs' job carrying exactly the dirs the
@@ -30,7 +30,7 @@
 //            before submitting, so the result is a self-continuing
 //            cadence — one skipped or failed run is retried by the
 //            NEXT alarm <sync.auto.fullInterval> seconds later
-//            (default 300), never remembered here. A manual full sync
+//            (default 900), never remembered here. A manual full sync
 //            (client combo or sync interface — both arrive as a
 //            'sync-request', which this module eavesdrops on) resets
 //            THAT account's timer alone: the next automated run lands
@@ -67,6 +67,12 @@
 // that skipped for an unconfirmed master sync right away. The engine's
 // post-run 'sync-pending-dirs' state report re-arms the account's dirty
 // alarm, so dirs left holding pending moves resync on the dirty cadence.
+// The context menu adds two more: a full sweep ('Sync Now') and a badge
+// dirty sweep ('Update Badge Now' — syncBadgeDirs, one 'sync-dirs' job per
+// badge-enabled account over its badge-defined folder, or over the account's
+// dirty-store dirs for query-mode badges, submitted at once with no alarm).
+// The idle-end full sweep can be switched off on its own
+// ('sync.auto.idleEnabled').
 
 'use strict';
 
@@ -77,17 +83,25 @@ import {loadFilters} from '/data/sync/filters/route.mjs';
 import {getNeeded, clearDirs, clearAccount} from '/dirty.mjs';
 
 const ENABLED = 'sync.auto.enabled';
+const FULL_ENABLED = 'sync.auto.fullEnabled';
+const DIRTY_ENABLED = 'sync.auto.dirtyEnabled';
 const DIRTY_DELAY = 'sync.auto.dirtyDelay';
+const IDLE_ENABLED = 'sync.auto.idleEnabled';
 const FULL_INTERVAL = 'sync.auto.fullInterval';
 
 const DIRTY_PREFIX = 'sync.auto.dirty.';   // keyed by the report's id
 const FULL_PREFIX = 'sync.auto.full.';     // keyed by the registry id
 
-// the documented defaults: a 5-min full cadence, edits coalescing into
-// a 30s dirty alarm — Chrome delays alarm delivery below 30s, so nothing
-// may sit under that floor
-const DEFAULT_DIRTY_S = 30;
-const DEFAULT_FULL_S = 300;
+// the documented defaults: a 15-min full cadence, edits coalescing into
+// a 60s dirty alarm — Chrome delays alarm delivery below 30s, so the
+// dirty alarm never sits under that floor
+const DEFAULT_DIRTY_S = 60;
+const DEFAULT_FULL_S = 900;
+
+// the hard floors: Chrome's alarm delivery granularity for the dirty
+// delay, and a 5-minute minimum cadence for the full run
+const MIN_DIRTY_S = 30;
+const MIN_FULL_S = 300;
 
 // return-from-idle trigger threshold: 10 minutes of inactivity — the
 // onStateChanged detection interval (seconds; re-asserted per wake)
@@ -106,15 +120,19 @@ let chain = Promise.resolve();   // scheduled submissions never run concurrently
 
 async function settings() {
   const res = await chrome.storage.local
-    .get([ENABLED, DIRTY_DELAY, FULL_INTERVAL])
+    .get([ENABLED, FULL_ENABLED, DIRTY_ENABLED, DIRTY_DELAY, IDLE_ENABLED,
+      FULL_INTERVAL])
     .catch(() => ({}));
   const delay = Math.round(Number(res[DIRTY_DELAY]) || DEFAULT_DIRTY_S);
   const full = Math.round(Number(res[FULL_INTERVAL]) || DEFAULT_FULL_S);
   return {
     enabled: res[ENABLED] !== false,
+    fullEnabled: res[FULL_ENABLED] !== false,
+    dirtyEnabled: res[DIRTY_ENABLED] !== false,
+    idleEnabled: res[IDLE_ENABLED] !== false,
     // Chrome delays alarm delivery below 30s — keep the floor honest
-    delayMs: Math.max(30, delay) * 1000,
-    fullMs: Math.max(30, full) * 1000
+    delayMs: Math.max(MIN_DIRTY_S, delay) * 1000,
+    fullMs: Math.max(MIN_FULL_S, full) * 1000
   };
 }
 
@@ -171,6 +189,13 @@ function armDirty(id, delayMs, tag) {
 /** whether an alarm name is one of ours (other modules' are untouched) */
 function isOurs(name) {
   return name.startsWith(DIRTY_PREFIX) || name.startsWith(FULL_PREFIX);
+}
+
+/** whether one of ours belongs to a kind whose periodic sync is disabled */
+function isOursDisabledKind(alarm, cfg) {
+  return alarm.name.startsWith(FULL_PREFIX)
+    ? !cfg.fullEnabled
+    : !cfg.dirtyEnabled;
 }
 
 function dropAlarm(name) {
@@ -261,6 +286,10 @@ async function pass(acc) {
  */
 function jobDirty(alarm) {
   const task = chain.then(async () => {
+    const cfg = await settings();
+    if (!cfg.enabled || !cfg.dirtyEnabled) {
+      return;   // disabled since the arm: marks stay, nothing runs
+    }
     const id = alarm.name.slice(DIRTY_PREFIX.length);
     const acc = findAccount(await registry(), id);
     if (!acc) {
@@ -376,15 +405,21 @@ function setKeyBadge() {
 function jobFull(alarm) {
   return chain.then(async () => {
     const cfg = await settings();
-    const id = alarm.name.slice(FULL_PREFIX.length);
-    const acc = findAccount(await registry(), id);
-    if (!acc) {
-      dlog('scheduler', '[scheduler] full: no registry account for', id,
-        '— alarm dropped');
-      await dropAlarm(alarm.name);
-      return;
+    if (cfg.enabled && cfg.fullEnabled) {
+      const id = alarm.name.slice(FULL_PREFIX.length);
+      const acc = findAccount(await registry(), id);
+      if (!acc) {
+        dlog('scheduler', '[scheduler] full: no registry account for', id,
+          '— alarm dropped');
+        await dropAlarm(alarm.name);
+        return;
+      }
+      await runFullAccountForSweep(acc, cfg, 'full fired — next ' + acc.id);
     }
-    await runFullAccountForSweep(acc, cfg, 'full fired — next ' + acc.id);
+    else {
+      // disabled since the arm: the cadence is over, nothing to re-arm
+      await dropAlarm(alarm.name);
+    }
   });
 }
 
@@ -417,8 +452,8 @@ async function runFullAccountForSweep(acc, cfg, tag) {
  * from INSIDE a chain task would deadlock: the sweep would await tasks
  * that only resolve once the sweep itself does). One skipped account
  * does not stop the sweep — a retry-next-alarm schedule stays honest
- * for it; the armed cadences land one interval after their run, so the
- * 5-min rhythm recovers by itself.
+  * for it; the armed cadences land one interval after their run, so the
+  * full rhythm recovers by itself.
  * @param {string} cause what asked for the runs ('startup', 'idle end',
  *   'menu', 'badge check')
  * @param {string[]|null} [accountIds] ONLY these registry accounts
@@ -428,7 +463,7 @@ async function runFullAccountForSweep(acc, cfg, tag) {
 function runAllAccounts(cause, accountIds = null) {
   const task = chain.then(async () => {
     const cfg = await settings();
-    if (!cfg.enabled) {
+    if (!cfg.enabled || !cfg.fullEnabled) {
       return;
     }
     let list = await registry();
@@ -452,6 +487,110 @@ function runAllAccounts(cause, accountIds = null) {
     dlog('scheduler', '[scheduler]', cause, 'sweep failed:', e?.message || e));
 }
 
+/**
+ * A sync pass over exactly the folders the badge counter counts — the
+ * context menu's 'Update Badge Now'. Like runAllAccounts it submits to the
+ * engine directly, but as ONE 'sync-dirs' job per badge-enabled account,
+ * fired immediately (no alarm, no delay). What each account contributes
+ * follows its badge preference:
+ *
+ *   folder mode — the defined badge folder, or the engine-side INBOX
+ *                 default when none is set; synced unconditionally (a
+ *                 server update always shows up in the badge count after
+ *                 this run's settled writes)
+ *   query mode  — the account's dirty-store marks: the query scans every
+ *                 local folder, so the dirs a server update could have
+ *                 landed in are exactly the dirs on record; with no marks
+ *                 the all-folder scan is already server truth
+ *
+ * The badge recounts by itself: every settled run broadcasts
+ * 'sync-refresh', which data/badge/worker.mjs consumes.
+ * @param {string} cause what asked for the runs ('menu')
+ */
+function syncBadgeDirs(cause) {
+  const task = chain.then(async () => {
+    const cfg = await settings();
+    if (!cfg.enabled || !cfg.dirtyEnabled) {
+      return;
+    }
+    const storage = await chrome.storage.local.get(null);
+    if (storage['badge.enabled'] === false) {
+      return;   // badge off: its folders are not a scope worth syncing
+    }
+    const registryAccounts = await registry();
+    const jobs = [];
+    const needed = await getNeeded().catch(() => ({}));
+    for (const acc of registryAccounts) {
+      if (storage['email.badge.' + acc.id] === false) {
+        continue;   // per-account opt-out, the same truth buildJob reads
+      }
+      const mode = storage['email.badgeMode.' + acc.id] === 'query'
+        ? 'query'
+        : 'folder';
+      if (mode === 'folder') {
+        const folder = String(storage['email.badgeFolder.' + acc.id] ?? '')
+          .trim();
+        // the engine-side INBOX default when the badge counts its INBOX
+        jobs.push({acc, dirs: [folder || 'INBOX']});
+        continue;
+      }
+      // query mode: every dir the all-folder scan would read server truth
+      const marks = needed[acc.id] || needed[acc.slug] || null;
+      const dirs = marks ? Object.keys(marks).sort() : [];
+      if (dirs.length) {
+        jobs.push({acc, dirs});
+      }
+    }
+    if (!jobs.length) {
+      dlog('scheduler', '[scheduler]', cause,
+        '— no badge folders / dirty marks to sync');
+      return;
+    }
+    dlog('scheduler', '[scheduler]', cause, '— dirty badge runs for',
+      jobs.length, 'account(s)');
+    await badgeBusy();
+    for (const {acc, dirs} of jobs) {
+      let passValue;
+      try {
+        passValue = await pass(acc);
+      }
+      catch (e) {
+        setKeyBadge();
+        dlog('scheduler', '[scheduler]', cause, ': skipping',
+          acc.name || acc.id, '—', e?.message || e);
+        continue;   // marks stay: a full cycle (or the next page) picks them up
+      }
+      try {
+        const list = await filters();
+        const prefs = await loadGatePrefs().catch(() => null);
+        const res = await submitJob({
+          type: 'sync-job',
+          rid: rid('badge-dirs'),
+          kind: 'sync-dirs',
+          account: {...acc, pass: passValue},
+          dirs,
+          ...(list.length ? {filters: list} : {}),
+          ...(prefs ? {prefs} : {})
+        });
+        if (res.started !== false) {
+          await clearDirs(accountKeys(acc), dirs)
+            .catch(e => dlog('scheduler', '[scheduler]', cause,
+              ': dir clear failed —', e?.message || e));
+        }
+      }
+      catch (e) {
+        dlog('scheduler', '[scheduler]', cause, ': dirty badge run failed for',
+          acc.name || acc.id, '—', e?.message || e);
+      }
+    }
+    await logNextRuns(cause);
+  });
+  chain = task.catch(() => {});
+  return task.catch(e =>
+    dlog('scheduler', '[scheduler]', cause, 'badge sweep failed:',
+      e?.message || e));
+}
+
 // -------------------------------------------------------------- reconcile
 
 /**
@@ -463,7 +602,7 @@ const booting = (async () => {
   try {
     const cfg = await settings();
     const accounts = await registry();
-    const existing = (await chrome.alarms.getAll()
+    let existing = (await chrome.alarms.getAll()
       .catch(() => []))
       .filter(a => isOurs(a.name));
     if (!cfg.enabled) {
@@ -476,6 +615,23 @@ const booting = (async () => {
           'alarm(s)');
       }
       return;
+    }
+    // a disabled kind clears its whole alarm set (the fire handlers apply
+    // the same switch mid-flight, so toggles never need a worker restart)
+    let droppedDisabled = 0;
+    for (const alarm of existing) {
+      const kindDisabled = alarm.name.startsWith(FULL_PREFIX)
+        ? !cfg.fullEnabled
+        : !cfg.dirtyEnabled;
+      if (kindDisabled) {
+        await dropAlarm(alarm.name);
+        droppedDisabled++;
+      }
+    }
+    existing = existing.filter(a => !isOursDisabledKind(a, cfg));
+    if (droppedDisabled) {
+      dlog('scheduler', '[scheduler] disabled kind(s) — cleared',
+        droppedDisabled, 'alarm(s)');
     }
     for (const alarm of existing) {
       const key = alarm.name.startsWith(DIRTY_PREFIX)
@@ -503,15 +659,18 @@ const booting = (async () => {
       }
     }
     for (const acc of accounts) {
-      // fresh cadence for accounts without one
-      if (!existing.some(a => a.name === FULL_PREFIX + acc.id)) {
+      // fresh cadence for accounts without one (only when full syncs are on)
+      if (cfg.fullEnabled &&
+          !existing.some(a => a.name === FULL_PREFIX + acc.id)) {
         await armFull(acc.id, cfg.fullMs, 'boot fresh ' + acc.id)
           .catch(() => {});
       }
       // a dirty alarm only when the store actually holds marks
+      // (and dirty syncs are on)
       const dirtyName = DIRTY_PREFIX + acc.id;
       const dirtySlug = DIRTY_PREFIX + acc.slug;
-      if (!existing.some(a => a.name === dirtyName ||
+      if (cfg.dirtyEnabled &&
+          !existing.some(a => a.name === dirtyName ||
                              a.name === dirtySlug)) {
         const marks = await dirtyDirs(acc.id, acc.slug);
         if (marks && Object.keys(marks).length) {
@@ -565,6 +724,10 @@ chrome.idle.onStateChanged.addListener(state => {
         (previous !== 'idle' && previous !== 'locked')) {
       return;
     }
+    const cfg = await settings();
+    if (!cfg.enabled || !cfg.idleEnabled) {
+      return;   // idle syncs disabled since the wake: no sweep
+    }
     await booting;
     await runAllAccounts('idle end');
   })().catch(e =>
@@ -601,7 +764,7 @@ chrome.runtime.onMessage.addListener(msg => {
         (async () => {
           await booting;
           const cfg = await settings();
-          if (!cfg.enabled) {
+          if (!cfg.enabled || !cfg.dirtyEnabled) {
             return;
           }
           await armDirty(id, cfg.delayMs, 'dirty report ' + id);
@@ -621,7 +784,7 @@ chrome.runtime.onMessage.addListener(msg => {
           (async () => {
             await booting;
             const cfg = await settings();
-            if (!cfg.enabled) {
+            if (!cfg.enabled || !cfg.dirtyEnabled) {
               return;
             }
             await armDirty(key, cfg.delayMs, 'pending dirs ' + key);
@@ -640,7 +803,7 @@ chrome.runtime.onMessage.addListener(msg => {
         (async () => {
           await booting;
           const cfg = await settings();
-          if (!cfg.enabled) {
+          if (!cfg.enabled || !cfg.fullEnabled) {
             return;
           }
           const key = msg.account?.id || msg.account?.slug;
@@ -664,4 +827,4 @@ function clearSchedules() {
     .then(() => undefined);
 }
 
-export {clearSchedules, runAllAccounts};
+export {clearSchedules, runAllAccounts, syncBadgeDirs};

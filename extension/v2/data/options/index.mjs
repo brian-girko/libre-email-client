@@ -47,6 +47,12 @@ const syncPrefetchEl = document.getElementById('f-sync-prefetch');
 const badgeEnabledEl = document.getElementById('f-badge-enabled');
 const badgeMaxAgeEl = document.getElementById('f-badge-max-age');
 const pickerAutoOpenEl = document.getElementById('f-picker-auto-open');
+const syncAutoEnabledEl = document.getElementById('f-sync-auto-enabled');
+const syncFullEnabledEl = document.getElementById('f-sync-full-enabled');
+const syncFullIntervalEl = document.getElementById('f-sync-full-interval');
+const syncDirtyEnabledEl = document.getElementById('f-sync-dirty-enabled');
+const syncDirtyDelayEl = document.getElementById('f-sync-dirty-delay');
+const syncIdleEnabledEl = document.getElementById('f-sync-idle-enabled');
 const checkBadgeBtn = document.getElementById('check-badge');
 const badgeStatusEl = document.getElementById('badge-status');
 const saveGlobalBtn = document.getElementById('save-global');
@@ -522,7 +528,13 @@ async function loadGlobalPrefs() {
     'mail.syncPrefetch': 'all',
     'badge.enabled': true,
     'badge.maxAge': 0,
-    'picker.autoOpen': true
+    'picker.autoOpen': true,
+    'sync.auto.enabled': true,
+    'sync.auto.fullEnabled': true,
+    'sync.auto.fullInterval': 900,
+    'sync.auto.dirtyEnabled': true,
+    'sync.auto.dirtyDelay': 60,
+    'sync.auto.idleEnabled': true
   });
   storageOpfsEl.checked = res['storage.mode'] !== MODE_EXTERNAL;
   storageExternalEl.checked = res['storage.mode'] === MODE_EXTERNAL;
@@ -547,6 +559,14 @@ async function loadGlobalPrefs() {
     ? String(Number(res['badge.maxAge']))
     : '0';
   pickerAutoOpenEl.checked = res['picker.autoOpen'] !== false;
+  syncAutoEnabledEl.checked = res['sync.auto.enabled'] !== false;
+  syncFullEnabledEl.checked = res['sync.auto.fullEnabled'] !== false;
+  syncFullIntervalEl.value =
+    Math.max(5, Math.round(Number(res['sync.auto.fullInterval']) / 60) || 15);
+  syncDirtyEnabledEl.checked = res['sync.auto.dirtyEnabled'] !== false;
+  syncDirtyDelayEl.value = Math.max(10, Number(res['sync.auto.dirtyDelay']) || 60);
+  syncIdleEnabledEl.checked = res['sync.auto.idleEnabled'] !== false;
+  updateSyncAutoUi();
   updateWsUrlState();
   updateStorageUi(); // async status line: no await, it lands when the query returns
 }
@@ -554,6 +574,22 @@ async function loadGlobalPrefs() {
 for (const el of [wsNativeEl, wsExternalEl]) {
   el.addEventListener('change', updateWsUrlState);
 }
+
+// disables the interval inputs whose checkbox is unchecked; the master
+// switch greys out the two sub-switches and inputs as a whole
+function updateSyncAutoUi() {
+  const master = syncAutoEnabledEl.checked;
+  syncFullEnabledEl.disabled = !master;
+  syncDirtyEnabledEl.disabled = !master;
+  syncIdleEnabledEl.disabled = !master;
+  syncFullIntervalEl.disabled = !master || !syncFullEnabledEl.checked;
+  syncDirtyDelayEl.disabled = !master || !syncDirtyEnabledEl.checked;
+}
+
+syncAutoEnabledEl.addEventListener('change', updateSyncAutoUi);
+syncFullEnabledEl.addEventListener('change', updateSyncAutoUi);
+syncDirtyEnabledEl.addEventListener('change', updateSyncAutoUi);
+syncIdleEnabledEl.addEventListener('change', updateSyncAutoUi);
 
 saveGlobalBtn.addEventListener('click', async () => {
   const url = wsUrlEl.value.trim();
@@ -583,6 +619,16 @@ saveGlobalBtn.addEventListener('click', async () => {
     flashGlobal('Emails per page must be an integer between 1 and 500', true);
     return;
   }
+  const syncFullInterval = (syncFullIntervalEl.value.trim() === '' ? 15 : Number(syncFullIntervalEl.value)) * 60;
+  if (!Number.isInteger(syncFullInterval) || syncFullInterval < 300) {
+    flashGlobal('Full sync interval must be at least 5 minutes', true);
+    return;
+  }
+  const syncDirtyDelay = syncDirtyDelayEl.value.trim() === '' ? 60 : Number(syncDirtyDelayEl.value);
+  if (!Number.isInteger(syncDirtyDelay) || syncDirtyDelay < 10) {
+    flashGlobal('Dirty sync delay must be at least 10 seconds', true);
+    return;
+  }
   await chrome.storage.local.set({
     'storage.mode': nextStorageMode,
     'ws.mode': mode,
@@ -602,7 +648,13 @@ saveGlobalBtn.addEventListener('click', async () => {
     'badge.maxAge': BADGE_MAX_AGES.includes(Number(badgeMaxAgeEl.value))
       ? Number(badgeMaxAgeEl.value)
       : 0,
-    'picker.autoOpen': pickerAutoOpenEl.checked
+    'picker.autoOpen': pickerAutoOpenEl.checked,
+    'sync.auto.enabled': syncAutoEnabledEl.checked,
+    'sync.auto.fullEnabled': syncFullEnabledEl.checked,
+    'sync.auto.fullInterval': syncFullInterval,
+    'sync.auto.dirtyEnabled': syncDirtyEnabledEl.checked,
+    'sync.auto.dirtyDelay': syncDirtyDelay,
+    'sync.auto.idleEnabled': syncIdleEnabledEl.checked
   });
   // Clients gate the root through data/sync/disk.mjs on every call, but the
   // pages themselves hold stale state under a mode whose gate now answers

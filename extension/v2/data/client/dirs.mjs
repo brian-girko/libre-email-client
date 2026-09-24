@@ -166,6 +166,14 @@ async function load(id) {
 }
 function init(element) {
   el = element;
+  // the settings dialog's "Expand sub dirs" checkbox (ui.dirsExpandSub, the
+  // client settings dialog is the only writer) gates the tree's auto-
+  // expansion; getPref caches, so folder loads read it without storage chatter
+  getPref('dirsExpandSub', false).then(on => {
+    if (el) {
+      el.expandSubs = !!on;
+    }
+  });
   // Tree cells live-update straight from the counter manager: every folder
   // base (sweep, open-folder refresh) re-emits here with any pending user
   // action prediction applied on top.

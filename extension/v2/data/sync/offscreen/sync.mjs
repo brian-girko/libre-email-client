@@ -97,6 +97,7 @@ function chunks(list, size) {
 
 const KIND2KEY = {
   resync: 'resyncs',
+  createServerFolder: 'serverFolderCreates',
   deleteServerFolder: 'serverFolderDeletes',
   purgeLocal: 'removed',
   dropLocal: 'droppedDirs',
@@ -110,7 +111,7 @@ const KIND2KEY = {
   pull: 'added'
 };
 const TIER = {
-  resync: 0, deleteServerFolder: 0, purgeLocal: 1, dropLocal: 1, relocate: 2,
+  resync: 0, createServerFolder: 0, deleteServerFolder: 0, purgeLocal: 1, dropLocal: 1, relocate: 2,
   reflag: 3, append: 4, flagsServer: 5, deleteServer: 6, moveServer: 7, pull: 8
 };
 
@@ -118,7 +119,7 @@ function blankCounts() {
   return {
     added: 0, removed: 0, droppedDirs: 0, pushed: 0,
     localFlagChanges: 0, localMoves: 0,
-    serverFlagChanges: 0, serverDeletes: 0, serverFolderDeletes: 0, serverMoves: 0,
+    serverFlagChanges: 0, serverDeletes: 0, serverFolderDeletes: 0, serverFolderCreates: 0, serverMoves: 0,
     resyncs: 0, adopted: 0
   };
 }
@@ -126,7 +127,7 @@ function blankCounts() {
 function blankSummary() {
   return {
     added: 0, removed: 0, droppedDirs: 0, localFlagChanges: 0, localMoves: 0,
-    serverFlagChanges: 0, serverDeletes: 0, serverFolderDeletes: 0, serverMoves: 0,
+    serverFlagChanges: 0, serverDeletes: 0, serverFolderDeletes: 0, serverFolderCreates: 0, serverMoves: 0,
     resyncs: 0, adopted: 0, skipped: 0, failed: 0,
     ops: {}, conflicts: 0, warnings: 0, folders: {}
   };
@@ -136,6 +137,8 @@ export function describeOp(op) {
   switch (op.kind) {
     case 'resync':
       return `resync ${op.folder} (${op.reason ?? 'uidvalidity changed'})`;
+    case 'createServerFolder':
+      return `create server folder ${op.folder} (born-local)`;
     case 'deleteServerFolder':
       return `delete server folder ${op.folder} (${op.reason ?? 'local dir deleted'})`;
     case 'pull':
@@ -1177,6 +1180,13 @@ async function rowsFor(name, uidnext) {
     // duplicate-uid files) keeps the dir on disk — the sync never destroys
     // unpushed local copies.
     for (const name of survey.localOnly) {
+      // born-local dir: no snapshot entry means the sync never knew this
+      // folder — it was created locally and never synced, NOT deleted on
+      // the server. It becomes a server CREATE, not a local drop.
+      if (!survey.snap.folders?.[name]) {
+        ops.push({kind: 'createServerFolder', folder: name});
+        continue;
+      }
       let listing = null;
       try {
         listing = await store.listLocal(name);
@@ -1467,6 +1477,13 @@ async function rowsFor(name, uidnext) {
             await store.wipe(op.folder);
             store.clearUidValidity(op.folder).catch(() => {});
             emitLog('apply', `wiped ${op.folder}`);
+            break;
+          }
+          case 'createServerFolder': {
+            await mail.createDir(op.folder);
+            // snapshot: the post-apply reconcile only sees pre-apply
+            // surveyed folders, the new folder picks up its entry next run
+            emitLog('apply', `created server folder ${op.folder}`);
             break;
           }
           case 'deleteServerFolder': {
