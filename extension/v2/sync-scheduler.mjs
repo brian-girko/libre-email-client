@@ -504,7 +504,7 @@ function runAllAccounts(cause, accountIds = null) {
  *                 the all-folder scan is already server truth
  *
  * The badge recounts by itself: every settled run broadcasts
- * 'sync-refresh', which data/badge/worker.mjs consumes.
+ * 'sync-refresh', which /badge.mjs consumes.
  * @param {string} cause what asked for the runs ('menu')
  */
 function syncBadgeDirs(cause) {

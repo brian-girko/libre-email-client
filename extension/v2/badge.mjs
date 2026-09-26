@@ -1,4 +1,4 @@
-// data/badge/worker.mjs — badge driver on the service worker.
+// badge.mjs — badge driver on the service worker.
 //
 // The badge shows unread counts read from the LOCAL maildir; the counting
 // itself runs in the shared offscreen document (data/badge/offscreen.mjs),
@@ -11,6 +11,9 @@
 //                 email.badgeQuery), read fresh per check; account slugs
 //                 come from the sync registry (loadAccounts with
 //                 decrypt:false — badge jobs never carry server creds).
+//                 Each account's sync.lastSyncAt.<id> stamp rides in the
+//                 job too, so the tooltip can always show "last synced"
+//                 per account (the offscreen document has no storage).
 //   triggers    — 'sync-dirty-report' (client-side local edits; the same
 //                 messages dirty.mjs consumes, so a burst of file renames =
 //                 ONE check after the 3 s coalesce window), 'sync-refresh'
@@ -22,9 +25,12 @@
 //                 chrome.storage.local['badge.last'] (the options status
 //                 line renders it live via storage.onChanged).
 //   badge write — chrome.action.setBadge{Text,BackgroundColor,Title}; 0 or
-//                 disabled clears the badge. The toolbar icon follows the
-//                 count: red when unread mail is pending, gray at a real
-//                 zero, default blue when no Maildir could be checked.
+//                 disabled clears the badge. The tooltip always lists every
+//                 account's last-sync time first, then the subjects of the
+//                 unread mail that contributes to the count. The toolbar
+//                 icon follows the count: red when unread mail is pending,
+//                 gray at a real zero, default blue when no Maildir could
+//                 be checked.
 
 'use strict';
 
@@ -38,6 +44,11 @@ const COALESCE_MS = 3000;   // an edit burst → one check, not one per rename
 // the engine's serial queue, this poll waits for the queue to empty
 const DRAIN_POLL_MS = 1000;
 const DRAIN_CAP_MS = 15 * 60 * 1000;
+
+// the tooltip's subject list: subjects of the mails that contribute to the
+// count, capped with one "+N more" line (Chrome truncates huge titles)
+const MAX_SUBJECTS = 20;
+const SUBJECT_CUT = 80;
 
 const ICON_PATHS = {
   blue: {}, gray: {}, red: {}
@@ -74,7 +85,10 @@ async function buildJob() {
       mode,
       // folder '' = the engine-side INBOX default (the badge's default scope)
       folder: mode === 'folder' ? folder : '',
-      query: mode === 'query' ? query : ''
+      query: mode === 'query' ? query : '',
+      // the tooltip's "last synced" line reads the same stamp the client's
+      // status line shows (worker-stamped on 'sync-synced', ISO or null)
+      lastSyncAt: storage['sync.lastSyncAt.' + acc.id] ?? null
     });
   }
   if (!accounts.length) {
@@ -173,26 +187,74 @@ function clearBadge() {
   return chrome.action.setBadgeText({text: ''}).catch(() => {});
 }
 
+/** the always-present first lines: "label: last synced <time>" per account
+ *  (the stamp every sync stamps, never absent from the tooltip) */
+function lastSyncLines(result) {
+  const lines = [];
+  for (const a of result?.accounts ?? []) {
+    const t = Date.parse(a.lastSyncAt ?? '');
+    lines.push((a.label || a.id) + ': last synced ' +
+      (Number.isFinite(t)
+        ? new Date(t).toLocaleString()
+        : 'never'));
+  }
+  return lines;
+}
+
+/** one subject per counted unread mail, collapsed flat across accounts.
+ *  The offscreen ranks entries as plain subject strings */
+function subjectLines(result) {
+  const lines = [];
+  let more = 0;
+  for (const a of result?.accounts ?? []) {
+    for (const s of (a.subjects || [])) {
+      if (lines.length >= MAX_SUBJECTS) {
+        break;   // account shape stays per-account; the cap is global
+      }
+      const s2 = String(s ?? '').replace(/\s+/g, ' ').trim();
+      lines.push(!s2
+        ? '(no subject)'
+        : (s2.length > SUBJECT_CUT ? s2.slice(0, SUBJECT_CUT - 1) + '…' : s2));
+    }
+    // the remainder the counter already computed (cap + budget-dry truth)
+    more += Math.max(0, Number(a.more) || 0);
+  }
+  if (more > 0 && lines.length) {
+    lines.push('… +' + more + ' more');
+  }
+  return lines;
+}
+
 function applyBadge(result) {
+  const lines = [];
+  if (result && result.accounts) {
+    lines.push(...lastSyncLines(result));
+  }
+  const subjects = result && result.total > 0 ? subjectLines(result) : [];
+  if (subjects.length) {
+    lines.push('');
+    lines.push(...subjects);
+  }
+  const title = lines.join('\n');
   if (result && result.total > 0) {
     setIcon('red');
     chrome.action.setBadgeBackgroundColor({color: BADGE_COLOR}).catch(() => {});
     chrome.action.setBadgeText({text: String(result.total)}).catch(() => {});
-    chrome.action.setTitle({
-      title: 'Unread: ' +
-        result.accounts.map(a => (a.label || a.id) + ': ' + (a.count || 0)).join(', ')
-    }).catch(() => {});
+    chrome.action.setTitle({title}).catch(() => {});
   }
   else if (result && result.maildir !== false) {
     setIcon('gray');
-    chrome.action.setTitle({
-      title: 'Unread: ' +
-        result.accounts.map(a => (a.label || a.id) + ': ' + (a.count || 0)).join(', ')
-    }).catch(() => {});
+    chrome.action.setTitle({title}).catch(() => {});
     clearBadge();
   }
   else {
     setIcon('blue');
+    if (title) {
+      chrome.action.setTitle({title}).catch(() => {});
+    }
+    else {
+      chrome.action.setTitle({title: 'Libre Email Client'}).catch(() => {});
+    }
     clearBadge();
   }
 }

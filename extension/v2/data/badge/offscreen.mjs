@@ -14,7 +14,7 @@
 //                 so the shared document can close.
 //
 // The job carries EVERYTHING the count needs — the offscreen document has no
-// chrome.storage — assembled by data/badge/worker.mjs on the service worker:
+// chrome.storage — assembled by /badge.mjs on the service worker:
 //
 //   {type:'badge-job', id, accounts:[{id, label, slug, mode, folder, query}],
 //    maxAge}
@@ -42,6 +42,11 @@ import {messageMeta} from '../client/headers.mjs';
 // count instead of endless parsing (the local-api search caps the same way)
 const MAX_HEADER_READS = 3000;
 const HEADER_BYTES = 65536;
+
+// the subject list the tooltip shows: subjects of the mails that contribute
+// to the count, up to this many per account (the driver renders a flat,
+// capped list with one "+N more" line over all accounts)
+const MAX_SUBJECTS = 40;
 
 // ------------------------------------------------------------- matching
 
@@ -161,13 +166,17 @@ function isLiveUnread(entry) {
  * Unread count of one account. Folder mode: `folder` exactly, INBOX when
  * no folder is configured (the default badge scope). Query mode: the query
  * filters every folder's unseen mail. Age filter: applies where the
- * (capped) header reads let it. Returns {count, scanned, detail, error}.
+ * (capped) header reads let it. Returns {count, scanned, subjects, more,
+ * detail, error}: `subjects` are the counted mails' subject lines — exactly
+ * the mails that contribute to the count — capped at MAX_SUBJECTS, and
+ * `more` is the remainder (also set when the header budget ran dry, since
+ * those candidates count but cannot show a subject).
  */
 async function countAccount(root, spec, maxAgeAt) {
   const account = await accountDir(root, spec.slug, {create: false});
   if (!account) {
-    return {count: 0, scanned: 0, detail: 'no local copy synced yet', error: null,
-      hasMaildir: false};
+    return {count: 0, scanned: 0, subjects: [], more: 0,
+      detail: 'no local copy synced yet', error: null, hasMaildir: false};
   }
   const folderSel = String(spec.folder ?? '').trim() || 'INBOX';
   const folders = spec.mode === 'query'
@@ -178,8 +187,10 @@ async function countAccount(root, spec, maxAgeAt) {
   }
   const terms = spec.mode === 'query' ? parseQuery(spec.query) : null;
   const budget = {left: MAX_HEADER_READS};
+  const subjects = new Set();   // keep duplicates out of the tooltip
   let unread = 0;
   let scanned = 0;
+  let remaining = false;   // budget dry / list cap: count kept, subject not shown
   for (const folder of folders) {
     const md = await folderDir(account, folder, {create: false, delimiter: '/'});
     if (!md) {
@@ -193,6 +204,18 @@ async function countAccount(root, spec, maxAgeAt) {
       scanned++;
       if (!maxAgeAt && !terms) {
         unread++;   // the common path: filename flags alone
+        if (subjects.size >= MAX_SUBJECTS) {
+          remaining = true;
+          continue;
+        }
+        // the common path reads its slice now, for the subject line
+        budget.left--;
+        const fh = await entry.file.getFile().catch(() => null);
+        if (fh) {
+          const meta = messageMeta(new Uint8Array(
+            await fh.slice(0, HEADER_BYTES).arrayBuffer()));
+          subjects.add(meta.subject ?? '');
+        }
         continue;
       }
       if (budget.left <= 0) {
@@ -200,6 +223,7 @@ async function countAccount(root, spec, maxAgeAt) {
         // for this candidate above? not necessarily — count it to keep the
         // badge an upper bound, never an undercount)
         unread++;
+        remaining = true;
         continue;
       }
       budget.left--;
@@ -218,11 +242,19 @@ async function countAccount(root, spec, maxAgeAt) {
         continue;
       }
       unread++;
+      if (subjects.size < MAX_SUBJECTS) {
+        subjects.add(meta.subject ?? '');
+      }
+      else {
+        remaining = true;
+      }
     }
   }
   return {
     count: unread,
     scanned,
+    subjects: [...subjects],
+    more: unread - subjects.size,
     hasMaildir: true,
     detail: (spec.mode === 'query'
       ? 'query · all folders'
@@ -281,6 +313,11 @@ async function handle(msg) {
           entry.count = r.count;
           entry.detail = r.detail;
           entry.hasMaildir = r.hasMaildir !== false;
+          // the tooltip's flat subject list: exactly the mails that
+          // contribute to the count, capped — `more` is the remainder
+          entry.subjects = (r.subjects ?? []).map(s =>
+            String(s ?? '').replace(/\s+/g, ' ').trim());
+          entry.more = Math.max(0, r.more ?? 0);
         }
         catch (e) {
           entry.error = e?.message || String(e);

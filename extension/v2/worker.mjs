@@ -31,13 +31,14 @@ import {loadFilters} from '/data/sync/filters/route.mjs';
 import {dlog} from '/core/debug-log.mjs';
 // side-effect imports: /dirty.mjs registers its own runtime listener — the
 // resync bookkeeping (dirs that need a server sync) lives there, not in
-// the switch below; /badge/worker.mjs owns every badge-trigger listener and
-// rides the SAME offscreen document (its close is the doc's own doing);
+// the switch below; /badge.mjs owns every badge-trigger listener and
+// drives the toolbar badge (the counter itself rides the SAME offscreen
+// document, data/badge/offscreen.mjs — its close is the doc's own doing);
 // /sync-scheduler.mjs own alarm wiring feeds the same ensure()+'sync-job'
 // handoff the page-visible flow uses
 import '/dirty.mjs';
 import '/context.mjs';
-import '/data/badge/worker.mjs';
+import '/badge.mjs';
 import '/sync-scheduler.mjs';
 
 chrome.action.onClicked.addListener(tab => {
