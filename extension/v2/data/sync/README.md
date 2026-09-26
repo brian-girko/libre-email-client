@@ -379,7 +379,12 @@ already sits in the destination on the server drops only the stale local
 file; a mismatch (uid reused by different mail) keeps the file, warns, and
 takes the normal re-pull. Scoped (`--dir`) runs survey the folder holding
 the pending-move file as a restricted extra, so a sync of the *source* dir
-replays the move too.
+replays the move too. Orphans nobody claimed (their source uid is gone from
+both the server and the snapshot — a replay whose marker-file removal
+failed, or a duplicate of a message the source still holds) are resolved by
+msgid in the final sweep: a copy whose message is already served somewhere
+on the server is purged as stale (this ended an endless warn-and-resync
+loop); a message served NOWHERE stays on disk with the unmatched warning.
 
 - Facade: `createClient(...).uploadMail(mailbox, raw)` → calls `api.appendMail`.
 - Layered below it in `core/rust-imap-client/api.mjs` (shared MailApi): the

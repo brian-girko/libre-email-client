@@ -1147,6 +1147,35 @@ async function rowsFor(name, uidnext) {
       })();
     }
 
+    /**
+     * An unclaimed interloper whose source folder still exists: the move it
+     * marks may already BE on the server (replayed by an earlier run whose
+     * marker-file removal failed, or by another client), or the source
+     * folder still holds its own copy of the same message (a duplicate, not
+     * a move). Either way the pending-move marker has no future: verify the
+     * file's identity by msgid and purge the stale copy, so the warning
+     * cannot loop the resync scheduler forever. A file whose message is
+     * served NOWHERE stays untouched (a genuine pending move the server
+     * lost — keep it, keep the warning).
+     * @returns {Promise<boolean>} true when a purge was planned
+     */
+    async function sweepStaleInterloper(folder, src, entry) {
+      const fileId = await localMsgid(entry);
+      if (!fileId) {
+        return false;
+      }
+      const served = msgidServedElsewhere(fileId, null);
+      if (!served) {
+        return false;
+      }
+      entry.claimed = true;
+      claimedInterlopers.add(entry);
+      ops.push({kind: 'purgeLocal', folder, uid: entry.uid, entry});
+      await sweepDuplicates(folder, entry);
+      warnings.push(`${folder}: foreign file from "${src}" whose message is already on the server in "${served.folder}" — stale pending-move copy dropped: ${entry.fileName}`);
+      return true;
+    }
+
     // interlopers nobody claimed: source folder gone from the server?
     // FMD5s resolve against the FULL server folder list (fmd5ToFolder,
     // built with the interloper index above) — under `only`, the scoped
@@ -1164,6 +1193,10 @@ async function rowsFor(name, uidnext) {
         }
         else if (only != null && !folders.has(src)) {
           warnings.push(`${folder}: foreign file from "${src}" (unverified under --dir), left unmatched: ${entry.fileName}`);
+        }
+        else if (await sweepStaleInterloper(folder, src, entry)) {
+          // resolved by identity — no "left unmatched" warning, nothing
+          // re-marks the dir dirty for a move that already happened
         }
         else {
           warnings.push(`${folder}: foreign file from "${src}", left unmatched: ${entry.fileName}`);
@@ -1580,7 +1613,14 @@ async function rowsFor(name, uidnext) {
           case 'moveServer': {
             await select(op.folder, {force: true});
             await mail.moveMail(Number(op.uid), op.toFolder);
-            await store.removeMessage(op.entry);
+            if (!await store.removeMessage(op.entry)) {
+              // the server move landed but the marker survives: committing
+              // the snapshot would orphan the file forever (its claimed uid
+              // is expunged from the source once the MOVE lands) — fail the
+              // op so the snapshot stays uncommitted and the next run
+              // re-detects the whole shape
+              throw new Error(`pending-move file could not be removed: ${op.entry.fileName}`);
+            }
             emitLog('apply', `server move ${op.folder}/${op.uid} → ${op.toFolder}`);
             break;
           }
