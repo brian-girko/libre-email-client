@@ -188,15 +188,28 @@ function clearBadge() {
 }
 
 /** the always-present first lines: "label: last synced <time>" per account
- *  (the stamp every sync stamps, never absent from the tooltip) */
+ *  (the stamp every sync stamps, never absent from the tooltip).
+ *  Every stamp shape normalizes here first: the engine's sync-synced
+ *  broadcasts carry epoch-ms numbers (stored as-is by the worker's
+ *  markSynced), and raw Date.parse renders those as "never". */
+function toMs(ts) {
+  if (typeof ts === 'number') {
+    return Number.isFinite(ts) ? ts : 0;
+  }
+  const n = Number(ts);
+  if (Number.isFinite(n) && n > 0) {
+    return n;
+  }
+  const p = Date.parse(ts);
+  return Number.isFinite(p) ? p : 0;
+}
+
 function lastSyncLines(result) {
   const lines = [];
   for (const a of result?.accounts ?? []) {
-    const t = Date.parse(a.lastSyncAt ?? '');
+    const t = toMs(a.lastSyncAt ?? '');
     lines.push((a.label || a.id) + ': last synced ' +
-      (Number.isFinite(t)
-        ? new Date(t).toLocaleString()
-        : 'never'));
+      (t ? new Date(t).toLocaleString() : 'never'));
   }
   return lines;
 }

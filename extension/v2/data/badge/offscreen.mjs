@@ -16,8 +16,8 @@
 // The job carries EVERYTHING the count needs — the offscreen document has no
 // chrome.storage — assembled by /badge.mjs on the service worker:
 //
-//   {type:'badge-job', id, accounts:[{id, label, slug, mode, folder, query}],
-//    maxAge}
+//   {type:'badge-job', id, accounts:[{id, label, slug, mode, folder, query,
+//    lastSyncAt}], maxAge}
 //
 // Folder mode counts the configured folder — INBOX when nothing is
 // configured (the badge's default scope). Query mode filters each folder's
@@ -293,7 +293,11 @@ async function handle(msg) {
           id: spec.id,
           label: spec.label || spec.id,
           count: 0,
-          detail: why
+          detail: why,
+          // the tooltip's "last synced" line: pass the stamp through even
+          // when nothing could be read — it lives in the storage the job
+          // carried in
+          lastSyncAt: spec.lastSyncAt ?? null
         });
       }
     }
@@ -306,7 +310,9 @@ async function handle(msg) {
           label: spec.label || spec.id,
           count: 0,
           detail: '',
-          error: null
+          error: null,
+          // the tooltip's "last synced" line: the stamp rides in the job
+          lastSyncAt: spec.lastSyncAt ?? null
         };
         try {
           const r = await countAccount(verdict.handle, spec, maxAgeAt);

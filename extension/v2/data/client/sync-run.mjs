@@ -25,6 +25,15 @@
 // always-current last-log line, whatever initiated the run (combo,
 // context menu, sync interface or the scheduler's automated passes).
 //
+// Runs of OTHER origin get the same account line here: the engine tags
+// its busy/queue broadcasts with the RUNNING job's structured identity
+// (accountId/slug/name, kind, dir/dirs — see offscreen.mjs scopeOf), and
+// this module mirrors it as one pinned entry whenever the page tracks no
+// run of its own. Settle mirrors the combo semantics (sync finished /
+// sync failed — see the sync client log); dry runs and discards settle
+// by their kind, the engine's warn lines keep the status line honest.
+// A kill line settles the mirror as 'sync stopped'.
+//
 // The tracked run is mirrored into chrome.storage.session
 // ('sync.clientRun'): the record survives page reloads and reaches every
 // client window, so a refreshed or newly opened client re-pins the entry
@@ -160,6 +169,136 @@ function pinRun(run) {
   logger.update(run.rid, {state: 'running'});
 }
 
+// ---- external runs (the engine's own narration) ------------------------------
+// A run submitted elsewhere — the sync interface, the scheduler, the
+// context menu — reaches this page only as broadcasts. The engine tags
+// its busy/queue state with the RUNNING job's structured identity
+// (accountId/slug/name, kind, dir/dirs), so the mirror entry shows the
+// same 'sync · <account>' line the client's own runs use.
+
+// the mirrored external run: {entryId, accountId, slug, name, kind, dir,
+// dirs, synced} or null; a settled mirror leaves null and its entry fades
+// via the logger's done-TTL (or stays failed until dismissed)
+let external = null;
+let extSeq = 0;
+
+/** the readable mirror label: family first, account, then the scope */
+function labelFor(run) {
+  const dry = typeof run.kind === 'string' && run.kind.startsWith('dry');
+  let scope = '';
+  if (run.kind === 'sync-dirs' || run.kind === 'dry-dirs') {
+    const dirs = (run.dirs || []).filter(Boolean);
+    if (dirs.length) {
+      scope = ' · ' + dirs.slice(0, 3).join(', ') +
+        (dirs.length > 3 ? ' (+' + (dirs.length - 3) + ' more)' : '');
+    }
+  }
+  else if (run.dir) {
+    scope = ' · ' + run.dir;
+  }
+  return (dry ? 'dry' : 'sync') + ' · ' +
+    (run.name || run.accountId || 'account') + scope;
+}
+
+/**
+ * Starts (or refreshes) the mirror entry from a broadcast's account scope.
+ * Same account still running → the scope fields refresh in place (the
+ * synced flag survives); a different account means the previous serial run
+ * settled already (its mirror left with the queue fade) and this opens a
+ * fresh entry. Never called for a run this page tracks itself (rid match).
+ */
+function mirrorExternal(meta) {
+  if (!meta?.accountId) {
+    return;
+  }
+  const sameRun = external && (external.accountId === meta.accountId ||
+    (external.slug && external.slug === meta.accountSlug));
+  if (!sameRun && external) {
+    // a different account is running: the previous serial run ended
+    // (the engine runs one session at a time) — settle it by whatever
+    // its sync-synced stamp said before this fresh pin
+    settleExternal();
+  }
+  let run;
+  if (sameRun) {
+    run = {...external,
+      name: meta.name || external.name,
+      kind: meta.kind ?? external.kind,
+      dir: meta.dir ?? external.dir,
+      dirs: Array.isArray(meta.dirs) ? meta.dirs : external.dirs};
+    logger.update(run.entryId, {label: labelFor(run), state: 'running'});
+  }
+  else {
+    run = {
+      entryId: 'ext-' + Date.now().toString(36) + '-' + (++extSeq),
+      accountId: meta.accountId,
+      slug: meta.accountSlug || null,
+      name: meta.name || meta.accountSlug || meta.accountId,
+      kind: meta.kind ?? null,
+      dir: meta.dir ?? null,
+      dirs: Array.isArray(meta.dirs) ? meta.dirs : null,
+      synced: false
+    };
+    logger.begin({
+      id: run.entryId,
+      kind: 'sync',
+      label: labelFor(run),
+      doneLabel: 'sync finished'
+    });
+    logger.update(run.entryId, {state: 'running'});
+  }
+  external = run;
+}
+
+/**
+ * Settles the mirror entry exactly like the combo's own run: clean →
+ * 'sync finished' (the logger's done-TTL removes it), anything else →
+ * the combo's own failure wording. Dry runs never stamp lastSyncAt (no
+ * sync-synced ever arrives) and a discard resets it (finishedAt null) —
+ * both settle by their kind; a failed pass still turns the status line
+ * red through the engine's FAILED warns. A reason (the kill path) fails
+ * the entry outright.
+ */
+function settleExternal(reason) {
+  const job = external;
+  if (!job) {
+    return;
+  }
+  external = null;
+  if (reason) {
+    logger.fail(job.entryId, reason);
+    return;
+  }
+  const kind = job.kind || 'sync';
+  if (kind === 'discard') {
+    logger.done(job.entryId, 'local copy discarded');
+  }
+  else if (kind.startsWith('dry')) {
+    logger.done(job.entryId, 'dry run finished');
+  }
+  else if (job.synced) {
+    logger.done(job.entryId, 'sync finished');
+  }
+  else {
+    logger.fail(job.entryId, 'sync failed — see the sync client log');
+  }
+}
+
+/** the mirror scope of a broadcast's running job, when it is not OURS */
+function externalScopeOf(src) {
+  if (!src?.accountId || (src.rid && src.rid === active?.rid)) {
+    return null;
+  }
+  return {
+    accountId: src.accountId,
+    accountSlug: src.accountSlug,
+    name: src.accountName,
+    kind: src.kind,
+    dir: src.dir,
+    dirs: src.dirs
+  };
+}
+
 /**
  * Wires the background-sync feedback: remembers the prompt host for
  * master-password prompts, listens for the engine's broadcasts and
@@ -175,7 +314,7 @@ export function init({prompt, synced} = {}) {
   promptEl = prompt || null;
   onSynced = typeof synced === 'function' ? synced : null;
   chrome.runtime.onMessage.addListener(onMessage);
-  readStoredRun()
+  const primed = readStoredRun()
     .then(run => {
       if (run && !active) {
         return reconstruct(run);
@@ -183,6 +322,28 @@ export function init({prompt, synced} = {}) {
       return null;
     })
     .catch(() => {});
+  // an engine already mid-run of OTHER origin (the interface, the
+  // scheduler): mirror its live run at once, so a freshly opened or
+  // reloaded client shows the account line without waiting for the next
+  // broadcast — the init snapshot carries the same structured identity
+  primed.then(() => {
+    if (active) {
+      return null;   // our own reconstructed run is pinned already
+    }
+    return chrome.runtime.sendMessage({type: 'sync-ui-init'})
+      .then(data => {
+        if (!data?.running) {
+          return null;   // idle engine — nothing to mirror
+        }
+        const running = (data.items || []).find(item => item?.running) ?? data;
+        const scope = externalScopeOf(running);
+        if (scope) {
+          mirrorExternal(scope);
+        }
+        return null;
+      })
+      .catch(() => {});   // a dead engine means nothing to mirror
+  });
 }
 
 function onMessage(msg) {
@@ -191,8 +352,9 @@ function onMessage(msg) {
   // scheduler) narrates through the same 'sync-log' broadcasts. The
   // logger's persistent status line always carries the newest line, so
   // the dedicated log section prints the last log whatever initiated
-  // the sync. The pinned entry (a tracked run) stays static: its label
-  // names the account that is syncing, its detail is never written.
+  // the sync. A run of OTHER origin gets its pinned entry maintained
+  // through the account-carrying broadcasts below; this page's own runs
+  // are tracked by rid here as before.
   if (msg?.type === 'sync-log') {
     const lines = (msg.lines || []).filter(l =>
       l?.content != null && String(l.content).trim());
@@ -205,48 +367,97 @@ function onMessage(msg) {
     // the kill path (the sync interface's Stop button) broadcasts its
     // goodbye log line before the engine document dies — a kill must
     // fail the tracked entry, not leave it spinning
-    if ((msg.lines || []).some(line => line?.type === 'kill') && active) {
-      const job = active;
-      active = null;
-      clearStoredRun(job.rid);
-      logger.fail(job.rid, 'sync stopped');
+    if ((msg.lines || []).some(line => line?.type === 'kill')) {
+      if (active) {
+        const job = active;
+        active = null;
+        clearStoredRun(job.rid);
+        logger.fail(job.rid, 'sync stopped');
+      }
+      if (external) {
+        settleExternal('sync stopped');
+      }
     }
     return;
   }
-  if (!active) {
-    return;
-  }
-  // clean-completion stamp: the engine hands this to the worker only
-  // when a run ended without failure, before the rid drop
-  if (msg?.type === 'sync-synced' &&
-      msg.accountId === active.id && msg.finishedAt != null) {
-    active.synced = true;
+  // clean-completion stamps: the engine hands this to the worker only
+  // when a run ended without failure, before the rid drop — it decides
+  // done/failed for BOTH the client's own run and the external mirror
+  if (msg?.type === 'sync-synced') {
+    if (active && msg.accountId === active.id && msg.finishedAt != null) {
+      active.synced = true;
+      return;
+    }
+    if (external && msg.finishedAt != null &&
+        (msg.accountId === external.accountId ||
+          (external.slug && msg.accountId === external.slug))) {
+      external.synced = true;
+      return;
+    }
     return;
   }
   // queue state: the engine keeps a running job listed until it
   // settles — the rid dropping means OUR job is done. The microtask
   // lets a same-batch kill line win the race against the drop.
   if (msg?.type === 'sync-jobs') {
-    const job = active;
-    const live = new Set((msg.items || []).map(j => j?.rid));
-    if (job && !live.has(job.rid)) {
-      queueMicrotask(() => {
-        if (active !== job) {
-          return;   // a kill line settled it already
-        }
-        active = null;
-        clearStoredRun(job.rid);
-        if (job.synced) {
-          logger.done(job.rid, 'sync finished');
-          if (onSynced) {
-            onSynced(job.slug);
-          }
-        }
-        else {
-          logger.fail(job.rid, 'sync failed — see the sync client log');
-        }
-      });
+    const items = Array.isArray(msg.items) ? msg.items : [];
+    const runningItem = items.find(item => item?.running) ?? null;
+    // a run of another origin still going keeps its mirror fresh — the
+    // account ALWAYS rides along, whatever submitted the job (our own
+    // tracked run is excluded: its entry exists already)
+    const scope = externalScopeOf(runningItem);
+    if (scope) {
+      mirrorExternal(scope);
     }
+    else if (external && !runningItem) {
+      // the mirrored run left the queue with no successor running:
+      // settle by whatever sync-synced said before the fade
+      settleExternal();
+    }
+    if (active) {
+      const job = active;
+      const live = new Set(items.map(j => j?.rid));
+      if (job && !live.has(job.rid)) {
+        queueMicrotask(() => {
+          if (active !== job) {
+            return;   // a kill line settled it already
+          }
+          active = null;
+          clearStoredRun(job.rid);
+          if (job.synced) {
+            logger.done(job.rid, 'sync finished');
+            if (onSynced) {
+              onSynced(job.slug);
+            }
+          }
+          else {
+            logger.fail(job.rid, 'sync failed — see the sync client log');
+          }
+        });
+      }
+    }
+    return;
+  }
+  // busy flips: an idle engine settles the external mirror (a clean run
+  // stamped its synced flag above; a failed one shows the combo's own
+  // failure wording); a newly busy engine with an account mirrors it —
+  // the account ALWAYS rides along, whatever submitted the job
+  if (msg?.type === 'sync-running') {
+    if (!msg.busy) {
+      settleExternal();
+      return;
+    }
+    if (active && msg.rid && msg.rid === active.rid) {
+      // our own tracked run took the engine over: any lingering mirror
+      // yields (its run ended — the engine runs one session at a time)
+      settleExternal();
+      return;
+    }
+    const scope = externalScopeOf(msg);
+    if (scope) {
+      mirrorExternal(scope);
+    }
+    return;
   }
 }
 

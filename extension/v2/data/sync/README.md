@@ -55,7 +55,12 @@ with the document, by design.
 Jobs are deduped per view, not in the queue: a submitted request carries a
 rid, its own button stays pinned until the engine's 'sync-jobs' broadcast
 drops the rid — other views (and other job kinds in the same view) can
-still submit anything while jobs are pending.
+still submit anything while jobs are pending. The 'sync-jobs' rows and
+the 'sync-running' busy flips carry the RUNNING job's structured identity
+(rid, accountId/slug/name, kind, dir/dirs — `scopeOf` in offscreen.mjs):
+the mail client's logger mirrors it as a pinned `sync · <account>` line,
+so a run of any origin (combo, interface, context menu, scheduler) shows
+the same account + last-log feedback there.
 
 **Queue folding.** Before a request joins the queue it folds into the
 same account's jobs (identity: account id, else slug; dry runs and sync

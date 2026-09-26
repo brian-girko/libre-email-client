@@ -174,10 +174,21 @@ export function pickAccount(accounts, {host, port, user} = {}) {
   return sorted[0] ?? null;
 }
 
-/** stamps lastSyncAt on one account in chrome.storage.local */
+/**
+ * Stamps lastSyncAt on one account in chrome.storage.local. The engine's
+ * sync-synced broadcasts carry epoch-ms numbers ("one format everywhere"),
+ * the stamp's documented shape is the ISO string — normalize here so every
+ * reader (client status, badge tooltip) sees one format.
+ */
 export async function markSynced(id, lastSyncAt = new Date().toISOString()) {
+  const ms = Number(lastSyncAt);
+  const iso = Number.isFinite(ms) && ms > 0
+    ? new Date(ms).toISOString()
+    : (lastSyncAt && Date.parse(lastSyncAt)
+      ? lastSyncAt
+      : new Date().toISOString());
   await chrome.storage.local.set({
-    [LAST_SYNC_PREFIX + id]: lastSyncAt ?? new Date().toISOString()
+    [LAST_SYNC_PREFIX + id]: iso
   });
   return true;
 }

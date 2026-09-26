@@ -395,6 +395,7 @@ const describeJob = job => {
  *  without a drop button (Stop ends a live session, never the ✕) */
 const queueShape = () => queue.map(job => ({
   rid: job.rid, kind: job.kind, dir: job.dir, dirs: job.dirs,
+  ...accountMetaOf(job),
   label: describeJob(job),
   running: job === activeJob
 }));
@@ -412,7 +413,12 @@ function emitJobs() {
 function updateBusy() {
   const busy = draining || queue.length > 0;
   const label = activeLabel ?? (queue.length ? `${queue.length} queued` : null);
-  broadcast({type: 'sync-running', busy, label: busy ? label : null});
+  // the running job's identity travels with the busy state so pages WITHOUT
+  // a tracked job of their own (the sync interface, the scheduler, the
+  // context menu) can still show WHICH account is syncing — the mail
+  // client's logger mirrors it; 'label' stays for the busy status text
+  broadcast({type: 'sync-running', busy, label: busy ? label : null,
+    ...(busy && activeJob ? scopeOf(activeJob) : {})});
 }
 
 /** families the queue cares about: the full-account run of a family covers
@@ -425,6 +431,32 @@ const familyOf = kind => String(kind ?? '').startsWith('dry') ? 'dry' : 'sync';
 /** identity of an account as far as the queue cares */
 const accountKey = a =>
   a?.id ?? a?.slug ?? `${a?.host}:${a?.user}`;
+
+/** structured account identity for broadcast consumers: ids, never the
+ *  human label — the mail client's logger tracks a run of ANY origin by
+ *  these fields (the queue text stays for people, this for code) */
+function accountMetaOf(job) {
+  const a = job?.account || null;
+  return {
+    accountId: a?.id ?? a?.slug ?? null,
+    accountSlug: a?.slug ?? null,
+    accountName: a?.name || a?.id || a?.slug || null
+  };
+}
+
+/** the (account, scope) identity carried by the busy-state broadcasts and
+ *  the init snapshot: null when only queued jobs keep the engine busy */
+function scopeOf(job) {
+  return {
+    rid: job?.rid ?? null,
+    ...accountMetaOf(job),
+    kind: job?.kind ?? null,
+    dir: job?.dir ?? null,
+    dirs: (job?.kind === 'sync-dirs' || job?.kind === 'dry-dirs')
+      ? (job?.dirs ?? null)
+      : null
+  };
+}
 
 /**
  * Queue hygiene before a fresh job joins (never touches the RUNNING job):
@@ -1052,14 +1084,19 @@ async function scheduleDrain() {
 // ---------------------------------------------------------------- requests
 
 function handleInit() {
+  const isRunning = !!(draining || queue.length);
   return {
     ok: true,
     proto: PROTO,
     gen: BOOT_GEN,
     logs: logs.map(({i: seq, ts, type, content, cls}) =>
       ({seq, ts, type, content, cls, gen: BOOT_GEN})),
-    running: !!(draining || queue.length),
+    running: isRunning,
     label: activeLabel,
+    // the live run's structured identity (rid/account/kind/dir), so a
+    // freshly opened panel (or a reloaded mail client reconstructing its
+    // tracker) knows WHAT is syncing without parsing 'label'
+    ...(isRunning ? scopeOf(activeJob) : {}),
     // the pending queue, rid included: pages that track a submitted run
     // (e.g. the mail client's background sync, whose state survives its
     // own reloads in chrome.storage.session) ask whether THEIR rid is
