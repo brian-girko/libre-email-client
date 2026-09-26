@@ -49,6 +49,10 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
 function replaceCids(html, map) {
   let out = html;
   for (const [cid, url] of map) {
@@ -94,14 +98,17 @@ class EmailView extends HTMLElement {
     root.innerHTML = `
       <style>
         :host {
-          display: block;
+          display: flex;
+          flex-direction: column;
           min-width: 0;
+          min-height: 0;
+          max-height: var(--email-view-max-height, 100%);
           background: var(--pane-bg, #ffffff);
           border: 1px solid var(--line, #d9dce1);
           border-radius: var(--radius, 10px);
           overflow: hidden;
           color: var(--fg, #1b1d21);
-          font: calc(14px * var(--font-scale, 1))/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+          font: calc(15px * var(--font-scale, 1))/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
         }
         :host([hidden]) {
           display: none;
@@ -121,17 +128,21 @@ class EmailView extends HTMLElement {
         header {
           display: flex;
           align-items: flex-start;
+          flex: none;
           gap: calc(8px * var(--font-scale, 1));
           padding: calc(10px * var(--font-scale, 1)) calc(12px * var(--font-scale, 1));
           border-bottom: 1px solid var(--line, #d9dce1);
+          background: var(--pane-bg, #ffffff);
         }
         .meta {
           flex: 1;
           min-width: 0;
         }
         .subject {
-          font-size: calc(14px * var(--font-scale, 1));
+          font-size: calc(16px * var(--font-scale, 1));
+          line-height: 1.35;
           font-weight: 600;
+          letter-spacing: -0.01em;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
@@ -141,7 +152,8 @@ class EmailView extends HTMLElement {
           align-items: baseline;
           gap: calc(8px * var(--font-scale, 1));
           color: var(--dim, #8a8f98);
-          font-size: calc(12px * var(--font-scale, 1));
+          font-size: calc(13px * var(--font-scale, 1));
+          line-height: 1.4;
         }
         .from {
           flex: none;
@@ -156,6 +168,8 @@ class EmailView extends HTMLElement {
         }
         .to {
           display: block;
+          font-size: calc(13px * var(--font-scale, 1));
+          line-height: 1.4;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
@@ -218,12 +232,14 @@ class EmailView extends HTMLElement {
         }
         .chips {
           display: flex;
+          flex: none;
           flex-wrap: wrap;
           gap: calc(6px * var(--font-scale, 1));
           padding: calc(8px * var(--font-scale, 1)) calc(12px * var(--font-scale, 1)) 0;
         }
         .chip {
-          font-size: calc(12px * var(--font-scale, 1));
+          font-size: calc(13px * var(--font-scale, 1));
+          line-height: 1.4;
           color: var(--dim, #8a8f98);
           border: 1px solid var(--line, #d9dce1);
           border-radius: var(--radius, 10px);
@@ -234,10 +250,12 @@ class EmailView extends HTMLElement {
           max-width: 100%;
         }
         .status {
+          flex: none;
           padding: calc(20px * var(--font-scale, 1)) calc(12px * var(--font-scale, 1));
           text-align: center;
           color: var(--dim, #8a8f98);
-          font-size: calc(13px * var(--font-scale, 1));
+          font-size: calc(14px * var(--font-scale, 1));
+          line-height: 1.45;
           user-select: none;
         }
         .status.error p {
@@ -246,12 +264,10 @@ class EmailView extends HTMLElement {
         .status p {
           overflow-wrap: anywhere;
         }
-        pre {
-          padding: calc(12px * var(--font-scale, 1));
-          font: calc(12px * var(--font-scale, 1))/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-          white-space: pre-wrap;
-          overflow-wrap: anywhere;
-          color: var(--fg, #1b1d21);
+        .body {
+          flex: 1 1 auto;
+          min-height: 0;
+          overflow: auto;
         }
         iframe {
           display: block;
@@ -434,45 +450,57 @@ class EmailView extends HTMLElement {
       if (this.#displayMode !== 'remote') {
         content = injectCsp(stripMetaRefresh(content), BLOCK_CSP);
       }
-      content = injectZoom(content, this.#fontScale);
-      const iframe = document.createElement('iframe');
-      iframe.setAttribute('sandbox', 'allow-same-origin allow-popups');
-      iframe.setAttribute('title', 'Email body');
-      iframe.addEventListener('load', () => {
-        let doc = null;
-        try {
-          doc = iframe.contentDocument;
-        }
-        catch {}
-        if (!doc) {
-          iframe.style.height = '420px';
-          return;
-        }
-        // open links in new tab
-        const base = doc.createElement('base');
-        base.target = '_blank';
-        doc.head.prepend(base);
-        // resize
-        const measure = () => {
-          iframe.style.height = Math.max(120, doc.documentElement.scrollHeight) + 'px';
-        };
-        measure();
-        if (this.#observer) {
-          this.#observer.disconnect();
-        }
-        this.#observer = new ResizeObserver(measure);
-        this.#observer.observe(doc.documentElement);
-      });
-      iframe.srcdoc = content;
-      this.#body.append(iframe);
+      this.#renderInIframe(injectZoom(content, this.#fontScale));
     }
     else {
-      const pre = document.createElement('pre');
-      pre.textContent = email.text || (html ? '(no plain text version)' : '(empty message)');
-      this.#body.append(pre);
+      const text = email.text || (html ? '(no plain text version)' : '(empty message)');
+      const content = '<style>pre{font:inherit;margin:0;padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}</style>'
+        + '<pre>' + escapeHtml(text) + '</pre>';
+      this.#renderInIframe(injectZoom(injectCsp(content, BLOCK_CSP), this.#fontScale));
     }
     this.#state = 'ready';
     this.#render();
+  }
+
+  #renderInIframe(content) {
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', 'allow-same-origin allow-popups');
+    iframe.setAttribute('title', 'Email body');
+    iframe.addEventListener('load', () => {
+      let doc = null;
+      try {
+        doc = iframe.contentDocument;
+      }
+      catch {}
+      if (!doc) {
+        iframe.style.height = '420px';
+        return;
+      }
+      // open links in new tab
+      const base = doc.createElement('base');
+      base.target = '_blank';
+      doc.head.prepend(base);
+      // apply the card's typography/color to unstyled email bodies
+      const cs = getComputedStyle(this);
+      const style = doc.createElement('style');
+      style.textContent =
+        ':where(html){color-scheme:' + cs.colorScheme + ';}' +
+        ':where(body){color:' + cs.color + ';font-family:' + cs.fontFamily +
+        ';font-size:15px;line-height:1.5;}';
+      doc.head.append(style);
+      // resize
+      const measure = () => {
+        iframe.style.height = Math.max(120, doc.documentElement.scrollHeight) + 'px';
+      };
+      measure();
+      if (this.#observer) {
+        this.#observer.disconnect();
+      }
+      this.#observer = new ResizeObserver(measure);
+      this.#observer.observe(doc.documentElement);
+    });
+    iframe.srcdoc = content;
+    this.#body.append(iframe);
   }
 
   #download(a) {
