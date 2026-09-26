@@ -251,6 +251,7 @@ function queueFlag(id, uids, addFlags, removeFlags, label, doneLabel = label, qu
 }
 
 async function runMoveDirAction(action, id, name, uids, token) {
+  const count = uids.length;
   const spec = MOVE_TARGETS[action];
   if (!spec) {
     return;

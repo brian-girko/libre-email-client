@@ -6,9 +6,11 @@ class LogView extends HTMLElement {
   #entries = [];
   #timestamps = false;
   #maxLines = 500;
+  #followThreshold = 2;
+  #stick = true;
 
   static get observedAttributes() {
-    return ['max-lines', 'timestamps'];
+    return ['max-lines', 'timestamps', 'follow-threshold'];
   }
 
   constructor() {
@@ -32,6 +34,9 @@ class LogView extends HTMLElement {
           padding: 8px 10px;
           font: calc(11px * var(--font-scale, 1))/1.45 ui-monospace, Menlo,
                 Consolas, monospace;
+          /* the class keeps its own scroll anchor (#anchorShift); the
+             browser's would double-compensate with ours */
+          overflow-anchor: none;
         }
         .entry {
           display: grid;
@@ -80,6 +85,15 @@ class LogView extends HTMLElement {
       <div id="out" role="log" aria-live="polite"></div>
     `;
     this.#out = this.#shadow.getElementById('out');
+    // scroll-follow intent: cheap to keep, the flag only ever flips on a
+    // scroll event — every write this class performs lands either at the
+    // bottom (following) or back at the reader's restored position, so the
+    // echoes of our own writes re-derive the same value and cannot cause
+    // ping-pong. Hidden panels (clientHeight 0) keep following: their
+    // arriving logs must be shown after re-open without user scroll input.
+    this.#out.addEventListener('scroll', () => {
+      this.#stick = this.#distanceFromBottom() <= this.#followThreshold;
+    });
     this.#applyAttributes();
   }
 
@@ -150,6 +164,10 @@ class LogView extends HTMLElement {
     const n = Number(this.getAttribute('max-lines'));
     if (Number.isFinite(n) && n >= 1) {
       this.#maxLines = Math.floor(n);
+    }
+    const t = Number(this.getAttribute('follow-threshold'));
+    if (Number.isFinite(t) && t > 0) {
+      this.#followThreshold = t;
     }
   }
 
@@ -225,6 +243,10 @@ class LogView extends HTMLElement {
     return row;
   }
 
+  #distanceFromBottom() {
+    return this.#out.scrollHeight - this.#out.scrollTop - this.#out.clientHeight;
+  }
+
   #scrollFollow(follow) {
     if (follow) {
       this.#out.scrollTop = this.#out.scrollHeight;
@@ -232,37 +254,73 @@ class LogView extends HTMLElement {
   }
 
   #renderNew(added, removed) {
-    // scroll-follow decision must come BEFORE the DOM grows
-    const distanceFromBottom = this.#out.scrollHeight -
-      this.#out.scrollTop - this.#out.clientHeight;
-    const following = distanceFromBottom <= 2;
+    const out = this.#out;
+    // the follow intent is the #stick flag (scroll events maintain it): a
+    // per-render distance read here could go stale between a layout clamp
+    // and the next scroll event and would silently detach a user who never
+    // scrolled — the reported regression. Not-yet-rendered containers
+    // (display:none panel, first append) have no scroll positions at all:
+    // follow them until a real user scroll says otherwise.
+    const following = this.#stick || out.clientHeight === 0;
     // the freshly added tail: the last `added` entries are new rows —
     // also (and especially) at the line cap, where `removed` rows fell
     // off the FRONT while every appended entry still needs its row
     const from = Math.max(0, this.#entries.length - added);
+    // capture the anchor BEFORE the DOM grows: the pre-mutation bottom of
+    // the last existing row (identified by reference, not index — appending
+    // and re-trimming shifts indices around) is what the viewport must keep
+    // under it when the trim drags every kept row upward
+    const anchorRow = out.lastElementChild;
+    const preBottom = anchorRow
+      ? anchorRow.offsetTop + anchorRow.offsetHeight
+      : 0;
     const frag = document.createDocumentFragment();
     for (let i = from; i < this.#entries.length; i++) {
       frag.appendChild(this.#row(this.#entries[i]));
     }
-    this.#out.appendChild(frag);
-    // mirror the buffer trim on the DOM: drop the rows that fell off the top
+    out.appendChild(frag);
+    // mirror the buffer trim on the DOM: rows leaving the FRONT drag every
+    // kept row upward by their combined height — restore the user's
+    // pre-mutation viewport anchor right after, so a mid-history read
+    // (or any cap-trim beside an append) can no longer wipe the position
     for (let i = 0; i < removed; i++) {
-      this.#out.firstElementChild?.remove();
+      out.firstElementChild?.remove();
+    }
+    if (removed > 0) {
+      out.scrollTop += this.#anchorShift(anchorRow, preBottom);
     }
     this.#scrollFollow(following);
   }
 
+  /**
+   * Pixel shift needed to keep the viewport visually unmoved after a
+   * cap-trim: the pre-trim bottom of the anchor row minus its post-trim
+   * bottom. Measured directly on the kept row itself, so it is exact
+   * regardless of row height, padding, borders or wrapping — it degrades
+   * to 0 only when the anchor row itself was trimmed (the whole history
+   * fell off in one flush; there is nothing left to stay anchored to).
+   */
+  #anchorShift(anchorRow, preBottom) {
+    if (!anchorRow || anchorRow.parentNode !== this.#out) {
+      return 0;
+    }
+    const postBottom = anchorRow.offsetTop + anchorRow.offsetHeight;
+    return preBottom - postBottom;
+  }
+
   #renderAll() {
-    const distanceFromBottom = this.#out.scrollHeight -
-      this.#out.scrollTop - this.#out.clientHeight;
-    const following = distanceFromBottom <= 2;
+    // a rebuilt list keeps the four states coherent with the follow intent:
+    // following → snap to tail; detached → keep the reader's absolute
+    // position (a full rebuild w/o rows in view clamps to the new bottom)
+    const following = this.#stick || this.#out.clientHeight === 0;
     const previousTop = this.#out.scrollTop;
     const frag = document.createDocumentFragment();
     for (const entry of this.#entries) {
       frag.appendChild(this.#row(entry));
     }
     this.#out.replaceChildren(frag);
-    this.#out.scrollTop = following ? this.#out.scrollHeight : previousTop;
+    this.#out.scrollTop = following ? this.#out.scrollHeight :
+      Math.min(previousTop, this.#out.scrollHeight - this.#out.clientHeight);
   }
 }
 

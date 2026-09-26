@@ -84,7 +84,13 @@ function guardedFetch(promise, label) {
   return Promise.race([promise, cap]).finally(() => clearTimeout(timer));
 }
 
-const fetchTimedOut = e => String(e?.message || '').includes('FETCH timed out');
+// Engine-abort sniff: a ceiling hit marks a wedge the stack cannot
+// recover from — "FETCH timed out after …" (guardedFetch here) as well as
+// the facade's own caps ("connect/call/close timed out after …", see
+// offscreen/client.mjs, SYNC_CMD_TIMEOUT_MS). ANY such awaited ceiling
+// aborts the run and lets withSession rebuild everything; it must never
+// degrade into a per-op failedOp spiral (each retry would re-wedge).
+const fetchTimedOut = e => String(e?.message || '').includes('timed out after');
 
 /** [1,2,3,4] via 2 → [[1,2],[3,4]] */
 function chunks(list, size) {
@@ -302,6 +308,14 @@ export function createSync(mail, store, {account = null, log = console.log, onPr
     log({type, content, cls});
   let selected = null;
   let last = null;
+
+  // INBOX uids written to disk THIS run — the pull scheduler's commits AND
+  // the post-apply arrivals. This is what the offscreen's post-sync filter
+  // pass filters (clean run or not): "messages received", not "messages
+  // planned" — a pull that never landed has nothing on disk and is
+  // correctly absent; a run that died after landing pulls leaves them here
+  // for the pass. A copy leaves the engine via landedInboxUids().
+  const landedInbox = new Set();
 
   async function select(name, {force = false} = {}) {
     if (selected !== name || force) {
@@ -1302,6 +1316,9 @@ async function rowsFor(name, uidnext) {
       const row = survey.folders.get(op.folder)?.server.get(op.uid);
       await store.writeMessage(op.folder, op.uid, knownFlags(row?.flags ?? []), raw);
       recMsgid.set(`${op.folder}/${op.uid}`, await msgidOf(raw));
+      if (String(op.folder || '').toUpperCase() === 'INBOX') {
+        landedInbox.add(Number(op.uid));
+      }
     };
     /** one narration line per landed chunk: 1 message keeps the old shape */
     const pullLine = (folder, pulled) => {
@@ -1619,6 +1636,9 @@ async function rowsFor(name, uidnext) {
               `post-pull ${F.name}/${uid}`)).raw;
             recMsgid.set(key, await msgidOf(raw));
             await store.writeMessage(F.name, uid, knownFlags(row.flags), raw);
+            if (F.name.toUpperCase() === 'INBOX') {
+              landedInbox.add(uid);
+            }
             folderOf(F.name).added++;
             emitLog('apply', `pulled ${F.name}/${uid} (arrived during the run)`);
           }
@@ -1773,6 +1793,11 @@ async function rowsFor(name, uidnext) {
   return {
     plan,
     run,
-    describePlan
+    describePlan,
+    /** the INBOX uids written to disk this run (pull commits + post-apply
+     *  arrivals) — handed to the caller's post-sync filter pass so the
+     *  RECEIVED messages match their filters even when the run failed; a
+     *  copy, the caller may mutate freely */
+    landedInboxUids: () => new Set(landedInbox)
   };
 }

@@ -9,6 +9,14 @@
 // (core/bridge.mjs, refcounted) and handed over as a ready url — the
 // offscreen engine passes it in with every run.
 //
+// Every await this facade makes rides a hard ceiling (SYNC_CMD_TIMEOUT_MS,
+// default 2 min, 0 disables): a wedged bridge stream never resolves and
+// jams the wasm FIFO for the whole stack, so an uncapped call/connect would
+// hang the caller's session — and the sync queue with it — forever. The
+// ceiling turns the hang into error text the sync engine recognizes
+// ("timed out after …") and aborts on; the teardown close is capped at
+// 10 s so a jammed stack can never hold the session's finally.
+//
 // Usage:
 //   const bridgeUrl = await chrome.runtime.sendMessage({type:'sync-bridge-ensure'});
 //   const mail = createClient({host, port, secure, user, pass, bridgeUrl});
@@ -53,6 +61,30 @@ export function createClient(settings) {
   };
 
   /**
+   * Hard ceiling for one facade await — boot and every framed command. A
+   * wedged bridge stream never resolves (and jams the wasm FIFO behind
+   * it), so the cap converts a permanent hang into error text the sync
+   * engine aborts on ("timed out after …"). SYNC_CMD_TIMEOUT_MS overrides
+   * the default; 0 disables the call and close caps both.
+   */
+  const CEILING = Math.max(0,
+    Number(globalThis.process?.env?.SYNC_CMD_TIMEOUT_MS) || 2 * 60 * 1000);
+  const CLOSE_CAP = CEILING ? Math.min(10 * 1000, CEILING) : 0;
+
+  function withCeiling(label, promise, ms = CEILING) {
+    if (!ms || ms <= 0) {
+      return promise;
+    }
+    let timer;
+    const cap = new Promise((_, reject) => {
+      timer = setTimeout(() =>
+        reject(new Error(`${label} timed out after ${ms / 1000}s`)),
+      ms);
+    });
+    return Promise.race([promise, cap]).finally(() => clearTimeout(timer));
+  }
+
+  /**
    * Boot sequence for one stack: wasm, MailApi, login — over the bridge
    * endpoint given in settings (there is no connectNative here; the
    * service worker boots and keeps the bridge alive for the run).
@@ -84,7 +116,10 @@ export function createClient(settings) {
   }
 
   // Tears the whole stack down (MailApi first, then the sandbox bridge);
-  // only acts when ts is still the live stack.
+  // only acts when ts is still the live stack. api.close() rides the close
+  // cap: after a wedge the wasm FIFO is jammed for good (a hung close
+  // would hold the session's finally forever), so the close is abandoned
+  // after 10 s — the bridge is ALWAYS detached either way.
   async function bringDown(ts) {
     if (pipe !== ts) {
       return;
@@ -95,10 +130,12 @@ export function createClient(settings) {
     const {api, bridge} = ts;
     if (api) {
       try {
-        await api.close();
+        await withCeiling('close', api.close(), CLOSE_CAP);
       }
-      catch {
-        // server may already be gone
+      catch (e) {
+        // the close cap elapsed (jammed FIFO) or the server was already
+        // gone — teardown carries on either way
+        say(`close: ${e?.message || e}`);
       }
     }
     if (bridge) {
@@ -112,6 +149,9 @@ export function createClient(settings) {
   // Runs fn against the live MailApi. First failure on a healthy stack is
   // retried exactly once after a rebuild: a restarted server, or a bridge the
   // sandbox dropped, must degrade into a slow page load, not an error.
+  // The build (wasm session + login — the IMAP dial) and the call itself
+  // both ride the call ceiling, so a dead network or a wedged stream
+  // settles instead of hanging the session.
   async function run(fn) {
     for (let attempt = 0; ; attempt++) {
       if (!pipe) {
@@ -121,7 +161,7 @@ export function createClient(settings) {
         const ts = {bridge: null, api: null};
         pipe = ts;
         try {
-          await buildStack(ts);
+          await withCeiling('connect', buildStack(ts));
         }
         catch (e) {
           pipe = null;
@@ -134,7 +174,7 @@ export function createClient(settings) {
       }
       const ts = pipe;
       try {
-        return await fn(ts.api);
+        return await withCeiling('call', fn(ts.api));
       }
       catch (e) {
         say(`request failed${attempt === 0 ? '; rebuilding once' : ''}: ${e?.message || e}`);

@@ -442,6 +442,41 @@ the wasm FIFO behind it, so a hung fetch aborts the run — the offscreen
 tears the stack down and the next run re-detects the diff (the snapshot
 is only committed after a fully successful apply).
 
+**Aborts on network issues, everywhere.** A wedged stream must always
+END the job, not hang it. Three ceilings guarantee that:
+
+- `sync-bridge-ensure` (the worker round-trip that boots the ws->tls
+  bridge before a run) rides a 30 s cap — a hanging boot settles the job
+  as `no-bridge` instead of stalling the drain loop;
+- every facade call in offscreen/client.mjs — the boot connect AND every
+  framed command (listings, reads, flags, moves, appends, folder
+  creates/deletes) — rides a 2-minute ceiling (`SYNC_CMD_TIMEOUT_MS`
+  overrides; `0` disables), because any of them can hang on the same
+  wedged stream a FETCH can;
+- the teardown close is capped at 10 s — after a wedge the wasm FIFO is
+  jammed for good and `api.close()` would never resolve, so the run's
+  `finally` must not wait on it.
+
+The engine aborts on any ceiling hit (the `timed out after …` message
+text is the shared signature, `fetchTimedOut`): one abort tears the
+stack down once, the snapshot stays uncommitted, and the next run
+re-detects whatever the dead run already landed. A settled failure never
+holds the queue: the drain loop moves on, `sync-close` goes out and the
+offscreen document can go idle again.
+
+**Filters run on failed runs too.** The post-sync filter pass (a
+non-interface job's landed INBOX pulls — the engine's `landedInboxUids()`
+set, `runPostSyncFilters` in offscreen.mjs) fires on CLEAN **and** FAILED
+runs alike: the messages the run actually received — post-apply
+arrivals included — are matched against the job's filters even when the
+sync aborted mid-apply, and every match's keepFmd5 rename is reported via
+the `sync-pending-dirs` dirty report so the scheduler re-arms the resync
+alarm for the server move. The case that made passes run only on clean
+syncs (a network issue silently skipping every filter) is gone. Two
+edges stay obvious: a pull the run never landed has nothing on disk to
+filter (correctly absent from the pass), and the pass touches the local
+mirror only — a wedged bridge never takes part in it.
+
 **Purge gate:** a message that is in the snapshot but gone from the
 Maildir with *no* foreign-FMD5 file anywhere in the handle (the user took
 the file outside the granted directory) classifies as `deleteServer` — a

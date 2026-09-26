@@ -21,9 +21,11 @@
 //                   failures logged and skipped; lastSyncAt stamps only
 //                   when every dir finished clean). A full 'sync' job may
 //                   carry the options-page filter list: after it lands,
-//                   the NEW INBOX messages are filtered on the spot
-//                   (runPostSyncFilters) — interface jobs never carry
-//                   filters, their behavior is unchanged
+//                   the LANDED INBOX messages are filtered on the spot —
+//                   CLEAN OR FAILED RUN ALIKE (runPostSyncFilters; a
+//                   failed run filters the messages it received anyway
+//                   and reports the renamed dirs dirty) — interface jobs
+//                   never carry filters, their behavior is unchanged
 //   sync-job-drop  {rid} → {ok, dropped} — removes ONE pending job from
 //                   the queue (the running one refuses; use sync-stop)
 //   sync-stop                       → the kill path: drops the queued jobs,
@@ -62,6 +64,14 @@
 // dir left holding interlopers (unclaimed keepFmd5 moves, filter-pass
 // dest dirs) — the worker's dirty store marks them and its scheduler
 // re-arms the resync alarm from that report.
+//
+// No session can wedge forever on a network issue: the bridge round-trip
+// at session boot rides a 30 s cap, the facade behind the engine caps
+// EVERY call (connect included; 2 min, SYNC_CMD_TIMEOUT_MS) and tears
+// down under a 10 s close cap — so a dead network or a wedged stream
+// ABORTS the job ('no-bridge' or a settled FAILED session) instead of
+// hanging the drain loop forever; the log stream stays live, the queue
+// keeps draining and the document can go idle again.
 
 'use strict';
 
@@ -596,20 +606,26 @@ function reportDelimiter(account, summary) {
 }
 
 /**
- * The mail client's background syncs carry the options-page filter list
- * in the job (the offscreen has no chrome.storage): once the run landed,
- * the NEW INBOX messages — exactly this run's pulls, "new" regardless of
- * read state, never the unread heuristic — are filtered right here on
- * the store the run just wrote. First match wins per message in the
- * filters' stored order ('of Filter N' numbering); every match is
-  * renamed into its destination Maildir (keepFmd5), the next sync pushes
-  * the server move. Dir-scoped runs carry filters only when the run is
-  * the INBOX itself; other folders sync bare. Interface-submitted jobs
-  * carry no filters: the sync interface keeps its own behavior — its
-  * filter row stays fully manual.
-  * A pass failure logs a warn and never fails the sync itself.
+ * The mail client's syncs carry the options-page filter list in the job
+ * (the offscreen has no chrome.storage). A settled run — CLEAN OR FAILED —
+ * filters the INBOX messages it RECEIVED on the store the run just wrote;
+ * the landed set (engine.landedInboxUids()) is the only source of truth:
+ * the pull scheduler's committed rows PLUS the post-apply arrivals,
+ * "new" regardless of read state, never the unread heuristic. Plan intent
+ * is deliberately NOT consulted — a pull the run failed to land has
+ * nothing on disk to filter, and a run that died mid-apply still filters
+ * everything it managed to receive before dying ({dirty: true} narrates
+ * that). First match wins per message in the filters' stored order
+ * ('of Filter N' numbering); every match is renamed into its destination
+ * Maildir (keepFmd5), the next sync pushes the server move — safe on a
+ * failed run too, since the snapshot stays uncommitted and the renames
+ * are re-detected as pending moves. Dir-scoped runs carry filters only
+ * when the run is the INBOX itself; other folders sync bare. Interface-
+ * submitted jobs carry no filters: the sync interface keeps its own
+ * behavior — its filter row stays fully manual.
+ * A pass failure logs a warn and never fails the sync itself.
  */
-async function runPostSyncFilters(job, plan, store, account) {
+async function runPostSyncFilters(job, store, account, uids, {dirty = false} = {}) {
   const stored = Array.isArray(job.filters) ? job.filters : [];
   const filters = stored.filter(f => f && f.enabled !== false &&
     typeof f.query === 'string' && f.folder);
@@ -620,19 +636,22 @@ async function runPostSyncFilters(job, plan, store, account) {
   if (job.kind !== 'sync' && !dirScopedInbox) {
     return;
   }
-  if (!filters.length) {
+  if (!filters.length || !(uids instanceof Set)) {
     return;
   }
-  const newUids = (plan?.ops ?? [])
-    .filter(op => op?.kind === 'pull' && op.folder === 'INBOX' &&
-      Number.isFinite(Number(op.uid)))
-    .map(op => Number(op.uid));
+  const newUids = [...uids].map(Number).filter(Number.isFinite);
   if (!newUids.length) {
-    engineLog('filter', 'no new INBOX messages — filter pass skipped', 'hint');
+    if (!dirty) {
+      engineLog('filter', 'no new INBOX messages — filter pass skipped', 'hint');
+    }
     return;
   }
   const note = (content, cls = '') => engineLog('filter', content, cls);
   const t0 = Date.now();
+  if (dirty) {
+    engineLog('filter',
+      'the run FAILED — filtering the messages that landed anyway', 'warn');
+  }
   engineLog('filter',
     `— filters · ${account.name || account.id} · INBOX — ` +
     `${newUids.length} new message(s)`, 'system');
@@ -700,11 +719,39 @@ async function reportPendingMoves(store, account) {
   }
 }
 
+// A hanging bridge boot (dead native host, unresponsive worker) is a
+// pre-sync network failure like any other: the round-trip rides a hard
+// cap and the job aborts as 'no-bridge' instead of stalling the drain
+// forever. (Beside it the facade caps itself: 2 min for the boot connect
+// and every framed call — SYNC_CMD_TIMEOUT_MS — and 10 s for the teardown
+// close; see offscreen/client.mjs.)
+const BRIDGE_ENSURE_CAP = 30 * 1000;
+
+/** one capped worker round-trip for a ready ws:// bridge url */
+function bridgeEnsure() {
+  let timer;
+  const cap = new Promise((_, reject) => {
+    timer = setTimeout(() =>
+      reject(new Error(
+        `sync-bridge-ensure timed out after ${BRIDGE_ENSURE_CAP / 1000}s — the job aborts (no bridge)`)),
+    BRIDGE_ENSURE_CAP);
+  });
+  return Promise.race([
+    chrome.runtime.sendMessage({type: 'sync-bridge-ensure'}),
+    cap
+  ]).finally(() => clearTimeout(timer));
+}
+
 /** every job boots its own client + engine and tears them down after */
 async function withSession(job) {
   let mail = null;
   let store = null;
   let refHeld = false;
+  // hoisted above the try: the failing paths (a run that THREW mid-apply)
+  // must still reach the engine's landedInboxUids() and the account list —
+  // "received messages are filtered, error or not"
+  let engine = null;
+  let account = null;
   try {
     // the stored gate preferences ride in the job: the headless defaults
     // follow them until this session ends (the last job's prefs stand)
@@ -728,7 +775,7 @@ async function withSession(job) {
       return {started: false, reason: gate.reason};
     }
     const rootHandle = gate.handle;
-    const account = job.account;
+    account = job.account;
     const only = job.kind.endsWith('-dir') ? job.dir : undefined;
     const dirsNote = (job.kind === 'sync-dirs' || job.kind === 'dry-dirs')
       ? ` · ${describeDirs(job.dirs)}`
@@ -740,14 +787,14 @@ async function withSession(job) {
     engineLog('system', `Sync starts for ${label}`, 'system');
     // the com.add0n.node bridge lives in the service worker (connectNative
     // is not an offscreen capability); acquire one ref for this job and ask
-    // for the ready ws:// url (one ref, dropped in the finally below)
-    const bridgeRes = await chrome.runtime.sendMessage({
-      type: 'sync-bridge-ensure'    // worker maps this to the 'sync' ref
-    }).catch(() => null);
+    // for the ready ws:// url (one ref, dropped in the finally below).
+    // The round-trip rides BRIDGE_ENSURE_CAP: a hanging boot aborts as
+    // 'no-bridge' — the job settles, nothing on the queue wedges.
+    const bridgeRes = await bridgeEnsure().catch(() => null);
     if (!bridgeRes?.ok || !bridgeRes.url) {
       engineLog('warn',
         'bridge FAILED: ' + (bridgeRes?.error ||
-          'the service worker did not provide a ws->tls bridge'),
+          'the service worker did not provide a ws->tls bridge (refused or timed out)'),
         'warn'
       );
       return {started: true, reason: 'no-bridge'};
@@ -789,7 +836,7 @@ async function withSession(job) {
       for (const dir of dirs) {
         engineLog('system', `— ${label} · ${dir} —`, 'system');
         try {
-          const engine = createSync(mail, store, {
+          engine = createSync(mail, store, {
             account: `${account.user}@${account.host}`,
             log: engineLog,
             confirmPurge,
@@ -808,23 +855,37 @@ async function withSession(job) {
             }
           }
           else if (summary.finishedAt && !summary.failed) {
-            // INBOX dirty runs filter like every other non-interface
-            // sync: the shim kind harnesses the full-run filter pass for
-            // just this dir's new pulls (failure logs, never fails the
-            // sync — see runPostSyncFilters)
-            if (dir.toUpperCase() === 'INBOX' &&
-                Array.isArray(job.filters) && job.filters.length) {
-              await runPostSyncFilters({...job, kind: 'sync-dir', dir},
-                plan, store, account);
-            }
+            // clean member dir — the plain filter pass below handles it
           }
           else {
             failed++;
+          }
+          // an INBOX member dir filters like every other non-interface
+          // sync — kind-shimmed to the full-run filter pass over this
+          // run's LANDED pulls; a failed dir is filtered too ({dirty}):
+          // the received messages match their filters even then (failure
+          // logs, never fails the sync — see runPostSyncFilters)
+          if (!dry) {
+            await runPostSyncFilters({...job, kind: 'sync-dir', dir},
+              store, account, engine.landedInboxUids(),
+              {dirty: !(summary.finishedAt && !summary.failed)});
           }
         }
         catch (e) {
           failed++;
           engineLog('warn', `FAILED ${dir}: ` + (e?.stack || e), 'warn');
+          // the dir's landed pulls are filtered nonetheless: a run that
+          // threw mid-apply may have received several — and they must
+          // match the filters anyway. Best-effort here: the pass can
+          // never re-fail this catch.
+          try {
+            await runPostSyncFilters({...job, kind: 'sync-dir', dir},
+              store, account, engine?.landedInboxUids?.(), {dirty: true});
+          }
+          catch (e2) {
+            engineLog('warn',
+              'filter pass FAILED: ' + (e2?.stack || e2), 'warn');
+          }
         }
       }
       // lastSyncAt is account-level: stamp it only when EVERY dir ran
@@ -850,7 +911,7 @@ async function withSession(job) {
       }
     }
     else {
-      const engine = createSync(mail, store, {
+      engine = createSync(mail, store, {
         account: `${account.user}@${account.host}`,
         log: engineLog,
         confirmPurge,
@@ -882,8 +943,13 @@ async function withSession(job) {
           engineLog('sync', 'lastSyncAt handed to the service worker');
         }
         // the mail client's syncs carry the filter list: the new INBOX
-        // messages are filtered right here, before the job settles
-        await runPostSyncFilters(job, plan, store, account);
+        // messages are filtered right here, before the job settles — on a
+        // failed run too ({dirty} narrates): the pass matches exactly the
+        // pulls the run LANDED (post-apply arrivals included), never the
+        // plan's leftovers — "received messages are filtered, error or not"
+        await runPostSyncFilters(job, store, account,
+          engine.landedInboxUids(),
+          {dirty: !(summary.finishedAt && !summary.failed)});
       }
     }
     // the state the store is left in decides the next resync: whatever
@@ -896,6 +962,25 @@ async function withSession(job) {
   }
   catch (e) {
     engineLog('warn', 'FAILED: ' + (e?.stack || e), 'warn');
+    // The job still settles — always. Best-effort last duties before the
+    // teardown: the INBOX messages the dying run LANDED are filtered too
+    // ("received messages are filtered, error or not" — engine may be
+    // null before the run even started, and the pass's own gates keep a
+    // dry/readless/interface job out), and whatever the pass renamed (or
+    // the run otherwise left behind) is reported dirty so the worker's
+    // scheduler re-arms the resync alarm. Nothing here may fail the
+    // settle: both steps are guarded.
+    try {
+      await runPostSyncFilters(job, store, account,
+        engine?.landedInboxUids?.(), {dirty: true});
+      if (store && job.kind !== 'discard') {
+        await reportPendingMoves(store, account);
+      }
+    }
+    catch (e2) {
+      engineLog('warn',
+        'failure cleanup FAILED: ' + (e2?.stack || e2), 'warn');
+    }
     return {started: true, reason: 'failed'};
   }
   finally {
