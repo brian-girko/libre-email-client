@@ -389,7 +389,15 @@ both the server and the snapshot — a replay whose marker-file removal
 failed, or a duplicate of a message the source still holds) are resolved by
 msgid in the final sweep: a copy whose message is already served somewhere
 on the server is purged as stale (this ended an endless warn-and-resync
-loop); a message served NOWHERE stays on disk with the unmatched warning.
+loop); a message served NOWHERE is the sole copy, so its move is completed
+the only way left — the file is APPENDed to the folder it already sits in
+and the marker leaves with the upload (leaving it on disk re-marked the
+dir dirty on every run and looped the resync scheduler forever). Identity
+matching no longer misses size-adopted messages either: a snapshot row
+that carried `msgid: null` (adopted by size, or committed by an older
+build) is matched through its canonical local file's identity, and the
+post-apply commit computes the msgid from the local file instead of
+writing null. Non-mail in a pending-move name stays on disk, warned.
 
 - Facade: `createClient(...).uploadMail(mailbox, raw)` → calls `api.appendMail`.
 - Layered below it in `core/rust-imap-client/api.mjs` (shared MailApi): the

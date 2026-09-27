@@ -557,6 +557,9 @@ async function rowsFor(name, uidnext) {
     const warnings = [];
     const claim = new Set();   // `${folder}/${uid}` consumed by another op
     const claimedInterlopers = new Set();
+    // server uids whose size-adopted local file supplied the identity the
+    // snapshot lacked (msgid: null would blind every later msgid matcher)
+    const adoptedMsgids = new Map();   // `${folder}/${uid}` → msgid
 
     // local-move candidates indexed by the SOURCE folder's fmd5 — built
     // before mining so the heal-aware mining gate can see pending moves
@@ -719,8 +722,22 @@ async function rowsFor(name, uidnext) {
     /** does the message with this msgid already sit on the server in some
      *  folder (the destination included)? — guards double-copies of a move
      *  that was already replayed once. `skip` is the `${folder}/${uid}` key
-     *  of the row under reconciliation. */
-    const msgidServedElsewhere = (msgid, skip) => {
+     *  of the row under reconciliation.
+     *  Snapshot msgids can be null (a size-adopted message, an interrupted
+     *  older run): a server row whose snapshot identity is missing falls
+     *  back to the identity of its canonical LOCAL file — the copy on disk
+     *  is the same message the server serves, so a pending-move file that
+     *  matches it must be purged as stale, not left unmatched forever. */
+    const localIdCache = new Map();   // `${folder}/${uid}` → msgid (this plan)
+    const fileIdAt = async (name, uid) => {
+      const key = `${name}/${uid}`;
+      if (!localIdCache.has(key)) {
+        const entry = folders.get(name)?.local?.entries.get(uid) ?? null;
+        localIdCache.set(key, entry ? await localMsgid(entry) : null);
+      }
+      return localIdCache.get(key);
+    };
+    const msgidServedElsewhere = async (msgid, skip) => {
       if (!msgid) {
         return null;
       }
@@ -732,6 +749,19 @@ async function rowsFor(name, uidnext) {
           }
           if (messagesOf(F)[uid]?.msgid === msgid ||
             (newIds.get(name)?.get(msgid) === uid && row)) {
+            return {folder: name, uid};
+          }
+        }
+      }
+      // second pass: rows without a snapshot msgid (K never learned it) get
+      // one read of their canonical local file — bounded by the cache above
+      for (const [name, F] of folders) {
+        for (const uid of F.server.keys()) {
+          const key = `${name}/${uid}`;
+          if (key === skip || messagesOf(F)[uid]?.msgid) {
+            continue;
+          }
+          if (await fileIdAt(name, uid) === msgid) {
             return {folder: name, uid};
           }
         }
@@ -812,7 +842,7 @@ async function rowsFor(name, uidnext) {
         warnings.push(`${name}: local file in "${dst}" claims uid ${uid} (from "${name}") but its content does not match the server copy — file kept: ${entry.fileName}`);
         return null;
       }
-      const served = msgidServedElsewhere(fileId, `${name}/${uid}`);
+      const served = await msgidServedElsewhere(fileId, `${name}/${uid}`);
       if (served) {
         // the move was already replayed once (the message already sits on
         // the server in another folder): the file is a stale stray; the
@@ -975,6 +1005,14 @@ async function rowsFor(name, uidnext) {
               // message, so ITS flags are the freshest state: a local read/
               // un-read/flag edit must push up, never be rewritten back to
               // the server's row (that would unmark local flag changes)
+              // A snapshot msgid of null here would blind the identity
+              // matchers forever (a pending-move file could never be matched
+              // to this message) — record the local file's identity so the
+              // post-apply commit carries it into the snapshot.
+              const fileId = await localMsgid(entry);
+              if (fileId) {
+                adoptedMsgids.set(`${name}/${uid}`, fileId);
+              }
               const sFlags = diffFlags(row.flags);
               if (!sameFlags(entry.flags, row.flags)) {
                 const lFlags = diffFlags(entry.flags);
@@ -1164,7 +1202,7 @@ async function rowsFor(name, uidnext) {
       if (!fileId) {
         return false;
       }
-      const served = msgidServedElsewhere(fileId, null);
+      const served = await msgidServedElsewhere(fileId, null);
       if (!served) {
         return false;
       }
@@ -1173,6 +1211,60 @@ async function rowsFor(name, uidnext) {
       ops.push({kind: 'purgeLocal', folder, uid: entry.uid, entry});
       await sweepDuplicates(folder, entry);
       warnings.push(`${folder}: foreign file from "${src}" whose message is already on the server in "${served.folder}" — stale pending-move copy dropped: ${entry.fileName}`);
+      return true;
+    }
+
+    /**
+     * An unclaimed interloper whose message is served NOWHERE and whose
+     * source uid is gone from both the server and the snapshot: the move it
+     * marks can never be replayed, and the file is the only copy of the
+     * message anywhere. Leaving it "left unmatched" would warn — and the
+     * post-run pending-move report re-mark the dir dirty — on every run,
+     * forever. So the move is completed the only way left: the file is
+     * uploaded to the folder it already sits in (APPEND; deduplicate by
+     * msgid first), the marker leaves after the upload and the canonical
+     * copy arrives with the post-apply pull. A file that is not mail at
+     * all stays untouched with its warning.
+     * @returns {Promise<boolean>} true when an op was planned
+     */
+    async function appendOrphanInterloper(folder, src, entry) {
+      let raw = null;
+      try {
+        raw = await store.readFile(entry);
+      }
+      catch (e) {
+        warnings.push(`${folder}: foreign file from "${src}" unreadable, left on disk: ${entry.fileName} (${e?.message || e})`);
+        return true;   // worth no resync — a run cannot resolve this either
+      }
+      const v = await validateMail(raw);
+      if (!v.ok) {
+        warnings.push(`${folder}: foreign file from "${src}" is not an email (${v.reason}) — ignored, file kept: ${entry.fileName}`);
+        return true;   // not uploadable; not pending-move work either
+      }
+      const id = await msgidOf(raw);
+      // safety net (the sweep above already checked account-wide): if the
+      // message somehow already sits in this folder, drop the copy instead
+      const F = folders.get(folder);
+      if (id && Object.values(F?.last?.messages ?? {}).some(m => m.msgid === id)) {
+        entry.claimed = true;
+        claimedInterlopers.add(entry);
+        ops.push({kind: 'purgeLocal', folder, uid: entry.uid, entry});
+        await sweepDuplicates(folder, entry);
+        warnings.push(`${folder}: foreign file from "${src}" duplicates a message already in this folder — stale pending-move copy dropped: ${entry.fileName}`);
+        return true;
+      }
+      entry.claimed = true;
+      claimedInterlopers.add(entry);
+      ops.push({
+        kind: 'append',
+        folder,
+        entry,
+        fileName: entry.fileName,
+        flags: diffFlags(entry.flags ?? []),
+        msgid: id,
+        size: raw.byteLength
+      });
+      emitLog('plan', `${folder}: orphan pending-move file from "${src}" (source uid gone) → append`);
       return true;
     }
 
@@ -1197,6 +1289,11 @@ async function rowsFor(name, uidnext) {
         else if (await sweepStaleInterloper(folder, src, entry)) {
           // resolved by identity — no "left unmatched" warning, nothing
           // re-marks the dir dirty for a move that already happened
+        }
+        else if (await appendOrphanInterloper(folder, src, entry)) {
+          // the move can never be replayed (source uid gone everywhere, the
+          // message is served nowhere): the file is uploaded to its folder
+          // so the marker leaves and the dir stops re-marking dirty
         }
         else {
           warnings.push(`${folder}: foreign file from "${src}", left unmatched: ${entry.fileName}`);
@@ -1261,7 +1358,9 @@ async function rowsFor(name, uidnext) {
       generatedAt: new Date().toISOString(),
       ops,
       conflicts,
-      warnings: [...new Set(warnings)]
+      warnings: [...new Set(warnings)],
+      // plan → apply plumbing: the identities size-adoption discovered
+      __adoptedMsgids: adoptedMsgids.size ? adoptedMsgids : null
     };
     const summary = summarize(plan);
     emitLog('plan', `${ops.length} op(s), ${conflicts.length} conflict(s), ${plan.warnings.length} warning(s)`);
@@ -1276,6 +1375,7 @@ async function rowsFor(name, uidnext) {
   async function apply(plan) {
     const survey = plan.__survey;
     selected = null;
+    const adoptedMsgids = plan.__adoptedMsgids ?? null;
     const summary = summarize(plan);
     // executed counts start at zero; summarize() only carries intent
     for (const [key, value] of Object.entries(summary.folders)) {
@@ -1696,8 +1796,24 @@ async function rowsFor(name, uidnext) {
           // own sync reconciles it (never destructively)
           continue;
         }
+        // the identity the snapshot carries: this run's knowledge first,
+        // then the old snapshot, then a size-adoption's local read — and a
+        // last-resort read of the canonical local file, so a `msgid: null`
+        // can never blind the next run's identity matchers (pending-move
+        // files would stay "left unmatched" forever)
+        let msgid = recMsgid.get(key) ?? adoptedMsgids?.get(key) ??
+          F.last?.messages?.[uid]?.msgid ?? null;
+        if (!msgid) {
+          const lentry = F.local?.entries.get(uid) ?? null;
+          if (lentry) {
+            try {
+              msgid = await msgidOf(await store.readFile(lentry));
+            }
+            catch {}
+          }
+        }
         messages[uid] = {
-          msgid: recMsgid.get(key) ?? F.last?.messages?.[uid]?.msgid ?? null,
+          msgid,
           // full flags: standard letters PLUS server keywords ($Filtered, …)
           // — unencodable in filenames, so the snapshot carries them; the
           // classifier only ever diffs the standard-letter subset

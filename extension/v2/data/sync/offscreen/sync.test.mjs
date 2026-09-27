@@ -3,14 +3,25 @@
 // plus the moveServer marker-removal hardening.
 // Run: node data/sync/offscreen/sync.test.mjs
 //
-// The bug this pins down: a keepFmd5 pending-move file whose claimed source
-// uid is gone from the source folder's server AND snapshot (an earlier run
-// already replayed the move on the server but its marker-file removal
-// failed) was never claimed by any classifier path — it warned
-// `foreign file from "INBOX", left unmatched` on EVERY run, and the
-// post-run pending-move report re-marked the holding dirs dirty forever,
-// so the scheduler re-armed resyncs in an infinite loop. The plan() final
-// sweep now resolves such files by msgid and purges the stale copy.
+// The bugs these pin down:
+// 1. a keepFmd5 pending-move file whose claimed source uid is gone from the
+//    source folder's server AND snapshot (an earlier run already replayed
+//    the move on the server but its marker-file removal failed) was never
+//    claimed by any classifier path — it warned
+//    `foreign file from "INBOX", left unmatched` on EVERY run, and the
+//    post-run pending-move report re-marked the holding dirs dirty forever,
+//    so the scheduler re-armed resyncs in an infinite loop. The plan() final
+//    sweep now resolves such files by msgid and purges the stale copy.
+// 2. a message whose snapshot msgid is null (a size-adopted row that never
+//    learned its identity) was invisible to that msgid matcher, so markers
+//    pointing at it stayed unmatched too. Server rows without a snapshot
+//    identity now fall back to their canonical local file's msgid, and the
+//    commit stops writing null identities.
+// 3. a marker whose message is served NOWHERE (source uid gone from server
+//    and snapshot, message nowhere on the server) is the only copy: it was
+//    left on disk with the warning, which re-marked the dir dirty forever.
+//    It is now uploaded to the folder it sits in (append) so the move
+//    completes and the marker becomes resolvable.
 
 import {register} from 'node:module';
 register('./root-loader.mjs', import.meta.url);
@@ -230,10 +241,12 @@ function dirState(uidvalidity, uidnext, rows) {
   assert.ok(!plan.warnings.some(w => w.includes('left unmatched')));
 }
 
-// ---- scenario C: genuine pending move the server lost — kept, warned -------
+// ---- scenario C: marker whose message is served nowhere — uploaded ---------
 // The marker's message is served NOWHERE (source uid expunged, message not
-// on the server in any folder): the file is the only copy — keep it on disk
-// and keep the warning. No purge.
+// on the server in any folder): the file is the only copy. Leaving it keeps
+// the warning AND re-marks the dir dirty on every run, so the move is
+// completed as an APPEND into the folder it already sits in (no purge, no
+// "left unmatched" warning left to loop the resync scheduler).
 {
   const m5 = await idOf('m5');
   const m7 = await idOf('m7');
@@ -268,8 +281,63 @@ function dirState(uidvalidity, uidnext, rows) {
 
   assert.ok(!plan.ops.some(o => o.kind === 'purgeLocal'),
     'genuine pending move is never purged: ' + JSON.stringify(plan.ops.map(describeOp)));
-  assert.ok(plan.warnings.some(w => w.includes('left unmatched')),
-    'unresolvable marker keeps its warning: ' + JSON.stringify(plan.warnings));
+  const appendOp = plan.ops.find(o => o.kind === 'append');
+  assert.ok(appendOp, 'the only-copy marker is uploaded: ' +
+    JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(appendOp.folder, 'Silent.Broken Links',
+    'the marker is uploaded to the folder it sits in');
+  assert.ok(!plan.warnings.some(w => w.includes('left unmatched')),
+    'no "left unmatched" warning: ' + JSON.stringify(plan.warnings));
+}
+
+// ---- scenario E: size-adopted destination message with a null msgid --------
+// The destination holds the moved message (canonical local file + server
+// row) but its snapshot msgid is null — a size-adopted row that never
+// learned its identity. The stale marker must still be purged: server rows
+// without a snapshot identity fall back to their canonical local file.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const m8 = await idOf('m8');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[7, 'm7'], [8, 'm8']])],
+    ['Trash', dirState(3000, 20, [[10, 'm5']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        7: {msgid: m7, flags: []}, 8: {msgid: m8, flags: []}
+      }},
+      'Trash': {uidvalidity: 3000, uidnext: 20, messages: {
+        10: {msgid: null, flags: []}
+      }}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7')),
+      fileEntry('f8', 8, md5hex('INBOX'), rawOf('m8'))
+    ])],
+    ['Trash', listing([
+      fileEntry('f10', 10, md5hex('Trash'), rawOf('m5'))
+    ], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog});
+  const {plan} = await engine.plan();
+
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'the stale marker is purged via the local identity fallback: ' +
+    JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].folder, 'Trash');
+  assert.ok(plan.warnings.some(w => w.includes('stale pending-move copy dropped')),
+    'stale-copy warning present: ' + JSON.stringify(plan.warnings));
+  assert.ok(!plan.warnings.some(w => w.includes('left unmatched')),
+    'no "left unmatched" warning: ' + JSON.stringify(plan.warnings));
 }
 
 // ---- scenario D: moveServer whose marker removal fails must not commit -----
