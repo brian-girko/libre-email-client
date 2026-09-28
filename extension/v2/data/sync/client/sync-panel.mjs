@@ -732,16 +732,14 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
 
   /**
    * The offscreen engine has no chrome.storage: the resolved IMAP config —
-   * including the password — travels IN the request message. Encrypted
-   * passwords are decrypted here, just-in-time, only for the account that is
-   * actually being synced (prompting for the master password via prompt-view
+   * including the password — travels IN the request message. The stored
+   * password is read here, just-in-time, only for the account that is
+   * actually being synced: plain values pass through untouched, encrypted
+   * ones are decrypted (prompting for the master password via prompt-view
    * only ever happens when a run needs a password).
    * @returns the sendable account config or null (with a status line set)
    */
   async function resolveSyncAccount(account) {
-    if (!account.encrypted) {
-      return account;
-    }
     const storage = await chrome.storage.local.get('user.pass.' + account.id)
       .catch(() => ({}));
     const stored = storage['user.pass.' + account.id];
