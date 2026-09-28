@@ -57,7 +57,7 @@
         <label>Server URL
           <input type="text" id="f-ws-url" placeholder="ws://.../token or wss://.../token" disabled>
         </label>
-        <p class="hint">The external server must speak the ws → TCP/TLS bridge protocol. Read FAQs page for a sample server. In this mode, the extension does not require native client to operate.</p>
+        <p class="hint">The remote server must speak the ws → TCP/TLS dial protocol: the client opens a WebSocket and sends <code>{op:'open', host, port, secure}</code> as a text frame; the server replies <code>{op:'ready'}</code> or <code>{op:'error'}</code>, then tunnels the stream as binary frames. In this mode the extension does not require the native client to operate. Prefer <code>wss://</code> for anything off this machine — the token in the URL path is the server's only access control. A ready-to-run sample server ships with the <a href="../welcome/index.html">welcome wizard</a> (Remote Bridge step).</p>
       </fieldset>
       <fieldset>
         <legend>Master password</legend>

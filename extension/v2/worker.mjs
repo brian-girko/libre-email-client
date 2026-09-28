@@ -14,10 +14,14 @@
 //   killed run never returned. The offscreen broadcasts
 //   {type:'sync-running'} on busy-state changes; log lines
 //   ({type:'sync-log'}) never pass through this worker.
-//   bridge hosting → the com.add0n.node ws->tls bridge is refcounted in
-//   core/bridge.mjs; any module acquires a named ref over runtime messages
-//   (bridge-acquire/bridge-release) and the bridge drops when the last ref
-//   goes (after a short idle grace).
+//   bridge hosting → with ws.mode = 'native' the com.add0n.node ws->tls
+//   bridge is refcounted in core/bridge.mjs; any module acquires a named
+//   ref over runtime messages (bridge-acquire/bridge-release) and the
+//   bridge drops when the last ref goes (after a short idle grace).
+//   With ws.mode = 'external' the stored 'ws.url' answers the same
+//   round-trips directly — no native boot, no refs: the remote server
+//   speaks the ws->tls dial protocol and only the url is handed over
+//   (a malformed/missing url surfaces as the regular no-bridge abort).
 //
 // No file access, no storage logic here. Log lines never pass through the
 // worker: they live in the engine's local var, streamed over ports.
@@ -258,15 +262,31 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       })().then(respond).catch(e => respond({ok: false, error: e?.message || String(e)}));
       return true;
     // worker/page capability; offscreen documents get the ready ws:// url
-    // only. Refs are per-module keys; the bridge drops after the LAST
-    // release plus the idle grace — 'sync-bridge-ensure' is the legacy
-    // alias that maps a run to the fixed 'sync' key.
+    // only. Native mode: refs are per-module keys; the bridge drops after
+    // the LAST release plus the idle grace — 'sync-bridge-ensure' is the
+    // legacy alias that maps a run to the fixed 'sync' key. External mode
+    // ('ws.url' in storage): the url answers directly, no boot, no refs,
+    // and the release round-trip stays a harmless no-op. The mode is read
+    // per ask, so an options-page switch applies to the very next run.
     case 'bridge-acquire':
-    case 'sync-bridge-ensure':
-      acquire(msg.type === 'sync-bridge-ensure' ? 'sync' : msg.key)
-        .then(({url}) => respond({ok: true, url}))
+    case 'sync-bridge-ensure': {
+      const refKey = msg.type === 'sync-bridge-ensure' ? 'sync' : msg.key;
+      chrome.storage.local
+        .get({'ws.mode': 'native', 'ws.url': ''})
+        .then(({'ws.mode': wsMode, 'ws.url': wsUrl}) => {
+          if (wsMode === 'external') {
+            const url = String(wsUrl || '').trim();
+            if (/^wss?:\/\//i.test(url)) {
+              return {ok: true, url};
+            }
+            return {ok: false, error: 'no external ws url configured (options → WS/TCP bridge)'};
+          }
+          return acquire(refKey);
+        })
+        .then(respond)
         .catch(e => respond({ok: false, error: e?.message || String(e)}));
       return true;
+    }
     // run over: one ref gone (the legacy alias releases 'sync' too)
     case 'bridge-release':
     case 'sync-bridge-drop':

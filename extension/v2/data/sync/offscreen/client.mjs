@@ -5,8 +5,9 @@
 // above — the offlineimap-style sync engine, UI code — imports only this
 // file and never reaches into core/.
 //
-// No connectNative lives here: the bridge is booted by the service worker
-// (core/bridge.mjs, refcounted) and handed over as a ready url — the
+// No connectNative lives here: the bridge endpoint is handed over by the
+// service worker as a ready url (the built-in connectNative boot, or the
+// stored external server url in 'ws.mode' = 'external') — the
 // offscreen engine passes it in with every run.
 //
 // Every await this facade makes rides a hard ceiling (SYNC_CMD_TIMEOUT_MS,

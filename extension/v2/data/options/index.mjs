@@ -567,7 +567,6 @@ async function loadGlobalPrefs() {
   initialStorageMode = storageOpfsEl.checked ? 'opfs' : MODE_EXTERNAL;
   wsExternalEl.checked = res['ws.mode'] === 'external';
   wsNativeEl.checked = !wsExternalEl.checked;
-  wsNativeEl.checked = !wsExternalEl.checked;
   wsUrlEl.value = res['ws.url'] || '';
   wsDebugEl.checked = !!res['ws.debug'];
   mailDebugEl.checked = !!res['mail.debug'];

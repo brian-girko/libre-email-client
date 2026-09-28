@@ -84,8 +84,11 @@ import {runAllFilters} from '../filters/run.mjs';
 // Everything that needs restricted chrome.* APIs lives elsewhere:
 //   - account configs arrive IN the job (the client page resolves them;
 //     the offscreen has no chrome.storage)
-//   - the ws->tls bridge is booted by the service worker (core/bridge.mjs,
-//     connectNative, refcounted per run) and handed over as a ws:// url
+//   - the ws->tls endpoint is handed over by the service worker: in the
+//     built-in mode it boots the bridge there (core/bridge.mjs,
+//     connectNative, refcounted per run); in external mode ('ws.mode' =
+//     'external', options page) the stored remote server url comes back
+//     as-is — no native client involved. Both arrive as a ws(s):// url
 //   - sync.lastSyncAt stamping happens in the worker on 'sync-synced'
 
 // ---------------------------------------------------------------- log var
@@ -600,7 +603,9 @@ let access = {granted: false, reason: 'undetermined', raw: null, at: null};
 let pingTimer = null;
 
 // while a run is going, reset the service worker's idle timer so its native
-// port (and the bridge behind it) survives to the end of the run
+// port (and the bridge behind it) survives to the end of the run; with the
+// remote external server there is no port to keep, but the worker still
+// needs waking for the end-of-run stamping, so the ping runs in both modes
 function keepBridgeAlive() {
   if (!pingTimer) {
     pingTimer = setInterval(() => {
@@ -817,11 +822,15 @@ async function withSession(job) {
     updateBusy();
     keepBridgeAlive();
     engineLog('system', `Sync starts for ${label}`, 'system');
-    // the com.add0n.node bridge lives in the service worker (connectNative
-    // is not an offscreen capability); acquire one ref for this job and ask
-    // for the ready ws:// url (one ref, dropped in the finally below).
-    // The round-trip rides BRIDGE_ENSURE_CAP: a hanging boot aborts as
-    // 'no-bridge' — the job settles, nothing on the queue wedges.
+    // the ws->tls endpoint is resolved by the service worker: the built-in
+    // bridge boots there (connectNative is not an offscreen capability) and
+    // is refcounted per run, or — external mode ('ws.mode' = 'external') —
+    // the configured remote server url is returned as-is (no refs then;
+    // the release below is a no-op). This side is mode-agnostic: ask for a
+    // ready ws(s):// url, drop the ref in the finally below. The
+    // round-trip rides BRIDGE_ENSURE_CAP: a hanging boot or a
+    // missing/broken url aborts as 'no-bridge' — the job settles, nothing
+    // on the queue wedges.
     const bridgeRes = await bridgeEnsure().catch(() => null);
     if (!bridgeRes?.ok || !bridgeRes.url) {
       engineLog('warn',
