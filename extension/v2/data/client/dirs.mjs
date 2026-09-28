@@ -65,7 +65,45 @@ function parentName(name, dirs) {
 // column. Pure local reads: every folder's summary comes from the maildir
 // filenames themselves, so the sweep answers from disk directly and streams
 // per-folder results through the counter manager.
+// Delta: reconcile only folders whose totals actually moved — the counter
+// feed drives per-row text patches and the title/favicon, so re-emitting
+// unchanged numbers on every sync broadcast is pure churn. `lastCounts`
+// mirrors exactly what was delivered.
 // Cancelled by any reload or account switch (token guard).
+const lastCounts = new Map();   // accountId -> Map(folder -> {unread, total})
+
+function deliverCount(id, page) {
+  if (!page?.name) {
+    return;
+  }
+  let map = lastCounts.get(id);
+  if (!map) {
+    map = new Map();
+    lastCounts.set(id, map);
+  }
+  const prev = map.get(page.name);
+  if (prev && prev.unread === page.unread && prev.total === page.total) {
+    return;   // unchanged since the last delivery: skip the emit entirely
+  }
+  map.set(page.name, {unread: page.unread, total: page.total});
+  counters.reconcile(id, page.name, page);
+}
+
+// Drop the mirror entries for folders that no longer exist — without it a
+// recreated folder that painted the same numbers would be skipped forever.
+function pruneCountCache(id, names) {
+  const map = lastCounts.get(id);
+  if (!map) {
+    return;
+  }
+  const wanted = new Set(Array.isArray(names) ? names : []);
+  for (const name of [...map.keys()]) {
+    if (!wanted.has(name)) {
+      map.delete(name);
+    }
+  }
+}
+
 async function countDirs(api, id, token) {
   try {
     // Consume the returned array even when the progress callback fired: a
@@ -74,15 +112,13 @@ async function countDirs(api, id, token) {
       if (token !== loadToken || accountId !== id || !el || !el.isConnected) {
         return;
       }
-      counters.reconcile(id, name, {unread, total});
+      deliverCount(id, {name, unread, total});
     });
     if (token !== loadToken || accountId !== id || !el || !el.isConnected) {
       return;
     }
     for (const page of Array.isArray(counts) ? counts : []) {
-      if (page?.name) {
-        counters.reconcile(id, page.name, page);
-      }
+      deliverCount(id, page);
     }
   }
   catch (e) {
@@ -129,7 +165,9 @@ async function load(id) {
     if (token !== loadToken) {
       return;
     }
-    counters.prune(id, dirs.map(d => d?.name).filter(Boolean));
+    const names = dirs.map(d => d?.name).filter(Boolean);
+    counters.prune(id, names);
+    pruneCountCache(id, names);
     if (token !== loadToken) {
       return;
     }
@@ -228,16 +266,21 @@ function init(element) {
     // mail client stays open so this offer does not cost the current spot
     chrome.runtime.sendMessage({cmd: 'iface-open', type: 'sync'});
   });
-  // Re-render when sync starts or finishes so the empty-state message
-  // reflects the current sync status (e.g. "Initial sync in progress"
-  // appears when sync begins with no data, and clears when it ends).
+  // A populated tree needs no reload on sync start/finish: its rows
+  // live-update through the counter feed (deliverCount → addCount) while
+  // the list view reconciles itself in place. The EMPTY tree is the one
+  // exception — the "Initial sync in progress" state must appear when the
+  // first sync begins and clear when it lands — so only that path re-runs
+  // the load's state derivation (and a tree with no rows re-reads cheaply).
   let lastSyncRunning = null;
   chrome.runtime.onMessage.addListener(msg => {
     if (msg?.type === 'sync-running') {
       const running = !!msg.busy;
       if (running !== lastSyncRunning) {
         lastSyncRunning = running;
-        load(accountId);
+        if (!el?.dirs?.length) {
+          load(accountId);
+        }
       }
     }
   });
@@ -255,12 +298,27 @@ function init(element) {
   });
 }
 
+// Folder-list equality on the attributes the tree renders. The order is
+// whatever listDirs() serves; a stable list must not re-render the tree.
+function sameFolderList(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+    return false;
+  }
+  return a.every((d, i) =>
+    d?.name === b[i]?.name &&
+    (d?.delimiter ?? null) === (b[i]?.delimiter ?? null) &&
+    JSON.stringify(d?.attrs ?? []) === JSON.stringify(b[i]?.attrs ?? [])
+  );
+}
+
 // In-place tree refresh: re-read the folder list + counts from the
 // handle. Local mutations report through mirrorChanged; sync and
 // filter runs write into the account dir from OTHER pages (the engine
 // document, the sync interface) — index.mjs routes their
-// 'sync-refresh' broadcasts here. No reload: the tree and the counter
-// sweep update in place.
+// 'sync-refresh' broadcasts here. No reload: the tree reconciles in
+// place — `el.dirs` is re-assigned only when the folder set itself
+// changed (folder create/drop), while the per-folder unread/total
+// updates arrive through the counter feed row by row.
 async function refreshTree() {
   if (!accountId || !el?.isConnected) {
     return;
@@ -268,11 +326,15 @@ async function refreshTree() {
   try {
     const api = await getMailApi(accountId);
     const dirs = await api.listDirs();
-    counters.prune(accountId, dirs.map(d => d?.name).filter(Boolean));
+    const names = dirs.map(d => d?.name).filter(Boolean);
+    counters.prune(accountId, names);
+    pruneCountCache(accountId, names);
     if (!el?.isConnected) {
       return;
     }
-    el.dirs = dirs;
+    if (!sameFolderList(el.dirs, dirs)) {
+      el.dirs = dirs;
+    }
     countDirs(api, accountId, loadToken);
   }
   catch {
