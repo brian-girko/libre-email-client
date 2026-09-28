@@ -307,11 +307,23 @@ an >8KB Received/DKIM header stack survives; a leading mbox `From `
 sentinel line is tolerated) and parse as a
 message — a stray `.DS_Store` from a macOS drop therefore never reaches
 the server; it is left on disk and reported `[warn] … is not an email`,
-visible in the plan/dry-run like every other ignored file. Every file in
-`cur/`, `new/` or `tmp/` shows up in exactly one accounted bucket
+visible in the plan/dry-run like every other ignored file. `cur/`, `new/` or `tmp/` shows up in exactly one accounted bucket
 (`entries`/`untracked`/`interlopers`/`excluded`/`stranded`) — a file in
 `tmp/` is never live mail, but it is reported in the plan's warnings so
 nothing can be ignored silently.
+
+**Duplicate-uid files converge in one sync.** A file whose parsed UID is
+already claimed by another file in the same dir (a leftover of a crashed
+upload, an old canonical copy, a second tool writing offlineimap names) is
+never just warned about: the final sweep classifies it exactly like any
+local-born file — the Message-ID decides. An identity the server already
+serves anywhere is purged locally (`duplicate dropped`); a sole copy is
+APPENDed in the same run, and the file leaves with the upload; unreadable
+non-mail is kept with its warning. Every run, the plan either claims the
+file into an op list or declares it unclaimable — there is no
+"renamed and hoped the next scan gets it" state, no invented surrogate
+UIDs, and scoped (`--dir`) runs never classify or purge other folders'
+files.
 
 Server surveys page the UID space with an adaptive stride: dense folders
 page 500 uids per call; an empty window means a gap of expunged uids and
@@ -401,30 +413,28 @@ writing null. Non-mail in a pending-move name stays on disk, warned.
 
 - Facade: `createClient(...).uploadMail(mailbox, raw)` → calls `api.appendMail`.
 - Layered below it in `core/rust-imap-client/api.mjs` (shared MailApi): the
-  wasm core may or may not export APPEND. Add this passthrough next to the
-  other mutation wrappers; when the build lacks it, uploadMail fails with a
-  "no appendMail" error and the sync engine keeps the local file (snapshot
-  stays uncommitted, no server deletes):
+  wasm core exports APPEND (`upload_mail`) in all current builds; the
+  guards below are legacy fallbacks for very old cores. When a build
+  genuinely lacks it, uploadMail fails with a descriptive error and the
+  sync engine keeps the local file (snapshot stays uncommitted, no server
+  deletes):
 
     ```js
-    async appendMail(mailbox, raw) {
+    async appendMail(mailbox, { content, flags = [], internaldate = null } = {}) {
         assertConnected();
-        if (typeof client.append_message !== 'function') {
-            throw new Error('appendMail: mail core build does not support APPEND; rebuild rust-client with append_message export');
+        const dir = typeof mailbox === 'string' && mailbox.trim() ? mailbox : selected;
+        if (!dir) throw new Error('appendMail: folder name required (or openDir() first)');
+        if (typeof client.upload_mail !== 'function') {
+            throw new Error('appendMail: mail core build does not support APPEND; rebuild rust-client with upload_mail export');
         }
-        const t0 = Date.now();
-        try {
-            await clientCall('append_message', [mailbox, toU8(raw), []], {postCheck: false});
-            log(`appendMail(${JSON.stringify(mailbox)}, ${toU8(raw).length}B) (${Date.now() - t0}ms)`);
-        } catch (e) {
-            log(`appendMail(${JSON.stringify(mailbox)}) FAILED: ${e.message}`);
-            throw e;
-        }
+        ...
+        await clientCall('upload_mail', dir, body, flagList, date);
+        ...
     },
     ```
 
   and extend the `MailApi` typedef with
-  `@property {(mailbox: string, raw: Uint8Array) => Promise<void>} appendMail`.
+  `@property {(mailbox: string|null, opts: {content, flags?, internaldate?}) => Promise<boolean>} appendMail`.
 
 Partially applied runs behave sanely: whenever any op failed, the snapshot
 is NOT rewritten, so the next sync only re-detects the missing pulls — no

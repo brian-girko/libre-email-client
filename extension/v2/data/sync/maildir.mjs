@@ -447,10 +447,19 @@ export async function listLocal(maildir, folder) {
       }
       if (out.has(parsed.uid)) {
         // never leave a file invisible: the winner stays the earlier
-        // entry (surrogates use negative keys, so no clash possible)
+        // entry (surrogates use negative keys, so no clash possible).
+        // The loser keeps the FULL parsed identity — any later op on
+        // this stat (flag rename, relocation) must stay field-complete
+        // instead of writing "undefined" parts into the filename.
         excluded.push({
           fileName: name,
           uid: parsed.uid,
+          unique: parsed.unique,
+          fmd5: parsed.fmd5,
+          flags: which === 'new'
+            ? []
+            : [...parsed.flags, ...parsed.keywords.filter(k => STAR_KEYWORDS.has(k))],
+          keywords: parsed.keywords,
           folder,
           reason: 'duplicate-uid',
           file: fh,

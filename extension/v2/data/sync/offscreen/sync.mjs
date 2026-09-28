@@ -719,6 +719,28 @@ async function rowsFor(name, uidnext) {
 
     const messagesOf = (F) => F.last?.messages ?? {};
 
+    /** msgids the server currently serves in one folder: snapshot rows
+     *  carrying an identity plus the this-run mined identities. Covers the
+     *  same-folder duplicate checks (classifier + final sweep); cross-folder
+     *  coverage comes from msgidServedElsewhere inside classifyLocalBorn. */
+    function serverIdsFor(name) {
+      const F = folders.get(name);
+      const serverIds = new Set();
+      if (!F) {
+        return serverIds;
+      }
+      for (const uid of F.server) {
+        const kMsgid = messagesOf(F)[uid]?.msgid;
+        if (kMsgid) {
+          serverIds.add(kMsgid);
+        }
+      }
+      for (const id of newIds.get(name)?.keys() ?? []) {
+        serverIds.add(id);
+      }
+      return serverIds;
+    }
+
     /** does the message with this msgid already sit on the server in some
      *  folder (the destination included)? — guards double-copies of a move
      *  that was already replayed once. `skip` is the `${folder}/${uid}` key
@@ -781,9 +803,11 @@ async function rowsFor(name, uidnext) {
 
     /**
      * Duplicates of a claimed message file: a second file with the same uid
-     * (duplicate-uid excluded) whose content is the SAME message has no
-     * future — plan its removal so it does not warn forever. Different
-     * content stays on disk with a warning.
+     * (duplicate-uid excluded) is classified like any local-born file — the
+     * SAME message has no future (purged), different content is either
+     * served somewhere (purged) or a sole copy (APPENDed), never-mailable
+     * bytes are kept with the classifier's warning. No unclaimed path, no
+     * permanent warning loop.
      * @returns {Promise<boolean>} true when at least one duplicate is planned away
      */
     async function sweepDuplicates(folder, claimedEntry) {
@@ -801,7 +825,10 @@ async function rowsFor(name, uidnext) {
           swept = true;
         }
         else {
-          warnings.push(`${folder}: second file claims uid ${ex.uid} with different content — kept on disk: ${ex.fileName}`);
+          // different content (or unreadable): the identity matcher inside
+          // classifyLocalBorn decides purge vs append vs keep+warn
+          await classifyLocalBorn(folder, ex, messagesOf(folders.get(folder)),
+            serverIdsFor(folder), `second file claims uid ${ex.uid}`);
         }
       }
       return swept;
@@ -1119,17 +1146,8 @@ async function rowsFor(name, uidnext) {
       }
 
       // (C) local-only files born outside the sync cycle (duplicate-uid
-      // files are warned once, in the final sweep below)
-      const serverIds = new Set();
-      for (const uid of F.server) {
-        const kMsgid = messages[uid]?.msgid;
-        if (kMsgid) {
-          serverIds.add(kMsgid);
-        }
-      }
-      for (const id of newIds.get(name)?.keys() ?? []) {
-        serverIds.add(id);
-      }
+      // files join the same classification in the final sweep below)
+      const serverIds = serverIdsFor(name);
       for (const [uid, entry] of F.local?.entries ?? []) {
         if (!F.server.has(uid) && !messages[uid]) {
           if (restricted) {
@@ -1165,7 +1183,8 @@ async function rowsFor(name, uidnext) {
           return;
         }
         const id = await msgidOf(raw);
-        if (id && serverIds.has(id)) {
+        if (id && (serverIds.has(id) ||
+            await msgidServedElsewhere(id, null))) {
           warnings.push(`${name}: dropped file "${entry.fileName}" (${whyQuiet}) duplicates a message already on the server; local copy discarded`);
           entry.claimed = true;
           ops.push({kind: 'purgeLocal', folder: name, uid: entry.uid ?? 0, entry});
@@ -1301,6 +1320,12 @@ async function rowsFor(name, uidnext) {
       }
     }
     for (const F of folders.values()) {
+      // scoped run: only the target dir's own run classifies its diffs —
+      // never purge or claim files in folders the user did not ask about
+      const restricted = only != null && F.name !== only;
+      if (restricted) {
+        continue;
+      }
       for (const entry of F.local?.untracked ?? []) {
         if (entry.claimed) {
           continue;
@@ -1311,66 +1336,18 @@ async function rowsFor(name, uidnext) {
         if (stat.claimed) {
           continue;
         }
-        // Resolve duplicate-uid: compare the loser's identity against the
-        // winner (the entry in F.local.entries with the same uid). Same msgid
-        // → true duplicate, purge the loser. Different msgid → a different
-        // message sharing a uid; rename to a surrogate uid so it becomes
-        // trackable and will be appended on a future sync.
+        // duplicate-uid losers join the very same local-born classification
+        // as every other unclaimed file: an identity the server already
+        // serves → purge; a sole copy → append (the file leaves with the
+        // upload); not mail → kept with a warning. No renames, no invented
+        // uids — the state names live nowhere except server-confirmed uid
+        // files, so nothing can mis-own the namespace of a future scan.
         const winner = F.local?.entries.get(stat.uid) ?? null;
-        let loserId = null;
-        try {
-          loserId = await msgidOf(await store.readFile(stat));
-        }
-        catch {}
-        if (winner && loserId) {
-          let winnerId = null;
-          try {
-            winnerId = await msgidOf(await store.readFile(winner));
-          }
-          catch {}
-          if (loserId === winnerId) {
-            stat.claimed = true;
-            ops.push({kind: 'purgeLocal', folder: F.name, uid: stat.uid, entry: stat});
-            warnings.push(`${F.name}: duplicate-uid file "${stat.fileName}" has the same message as "${winner.fileName}" — duplicate dropped`);
-            continue;
-          }
-        }
-        // different identity (or unreadable): rename to a surrogate uid so
-        // the file becomes trackable and the sync converges
-        if (winner) {
-          // find the lowest surrogate key to avoid collisions
-          let minKey = 0;
-          for (const key of F.local.entries.keys()) {
-            if (key < minKey) {
-              minKey = key;
-            }
-          }
-          const surrogateUid = minKey - 1;
-          try {
-            const newName = await store.renameMessage(F.name, stat, {uid: surrogateUid});
-            stat.claimed = true;
-            // replace the entry in the local map so the classifier sees it
-            // as a trackable local-born file on the next sync
-            F.local.entries.delete(stat.uid);
-            F.local.entries.set(surrogateUid, {
-              ...stat,
-              uid: surrogateUid,
-              fileName: newName,
-              surrogate: true
-            });
-            emitLog('plan', `${F.name}: duplicate-uid file "${stat.fileName}" renamed to surrogate uid ${surrogateUid} (different message) — will append on next sync`);
-          }
-          catch (e) {
-            warnings.push(`${F.name}: ignored "${stat.fileName}" (${stat.reason}: uid ${stat.uid} already tracked by another file); kept on disk`);
-          }
-        }
-        else {
-          // winner is gone (purged earlier this run): the loser becomes the
-          // only file with this uid — promote it to a trackable entry
-          stat.claimed = true;
-          F.local.entries.set(stat.uid, stat);
-          emitLog('plan', `${F.name}: duplicate-uid file "${stat.fileName}" promoted (winner gone) — will classify on next sync`);
-        }
+        await classifyLocalBorn(
+          F.name, stat, messagesOf(F), serverIdsFor(F.name),
+          winner
+            ? `duplicate-uid: uid ${stat.uid} is already tracked by another file`
+            : `duplicate-uid: uid ${stat.uid} is not tracked anywhere`);
       }
       for (const stat of F.local?.stranded ?? []) {
         warnings.push(`${F.name}: file in tmp/ ignored (scratched/dropped too early?): ${stat.fileName}`);

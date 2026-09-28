@@ -97,6 +97,9 @@ function mockStore(snapshot, listings) {
       return listings.get(name);
     },
     async readFile(entry) {
+      if (entry.unreadable) {
+        throw new Error('mock-fs: read failed');
+      }
       return entry.raw;
     },
     async fileSize(entry) {
@@ -375,6 +378,182 @@ function dirState(uidvalidity, uidnext, rows) {
   assert.equal(summary.moveServer, 0, 'the moveServer op was not counted as done');
   assert.equal(store.saved.length, 0, 'snapshot NOT committed');
   assert.ok(true);
+}
+
+// ---- scenario F: duplicate-uid, same message → purge, no rename -----------
+// A leftover duplicate of uid 9 (same Message-ID as the tracked file) must
+// be classified as a stale copy and purged — never renamed to a surrogate
+// uid, never left to warn on every run.
+{
+  const m9 = await idOf('m9');
+  const server = new Map([
+    ['INBOX', dirState(1000, 10, [[9, 'm9']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 10, messages: {
+        9: {msgid: m9, flags: []}
+      }}
+    }
+  };
+  const dupName = makeFilename('INBOX', 9, [], {unique: 'dup1', fmd5: md5hex('INBOX')});
+  const loser = fileEntry(dupName, 9, md5hex('INBOX'), rawOf('m9'));
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f9', 9, md5hex('INBOX'), rawOf('m9'))])]
+  ]);
+  listings.get('INBOX').excluded.push(loser);
+
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog});
+  const {plan} = await engine.plan();
+
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'the same-message duplicate is purged: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].uid, 9);
+  assert.ok(!plan.ops.some(o => o.kind === 'append'),
+    'no append for an already-served message');
+}
+
+// ---- scenario G: duplicate-uid, different message → APPEND this run --------
+// The loser carries DIFFERENT mail under the winner's uid. It must join the
+// ordinary local-born classification and be planned for upload in the SAME
+// sync — no surrogate rename, no "kept on disk" warning loop.
+{
+  const m9 = await idOf('m9');
+  const m20 = await idOf('m20');
+  const server = new Map([
+    ['INBOX', dirState(1000, 10, [[9, 'm9']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 10, messages: {
+        9: {msgid: m9, flags: []}
+      }}
+    }
+  };
+  const dupName = makeFilename('INBOX', 9, [], {unique: 'dup1', fmd5: md5hex('INBOX')});
+  const loser = fileEntry(dupName, 9, md5hex('INBOX'), rawOf('m20'));
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f9', 9, md5hex('INBOX'), rawOf('m9'))])]
+  ]);
+  listings.get('INBOX').excluded.push(loser);
+
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog});
+  const {plan} = await engine.plan();
+
+  assert.deepEqual(plan.ops.map(o => o.kind), ['append'],
+    'the different-message duplicate is uploaded this run: ' +
+    JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].msgid, m20, 'the upload carries the loser message');
+  assert.ok(!plan.warnings.some(w => w.includes('already tracked by another file')),
+    'no permanent duplicate-uid warning: ' + JSON.stringify(plan.warnings));
+}
+
+// ---- scenario H: duplicate-uid whose message lives in ANOTHER folder -------
+// Cross-folder identity: the loser's Message-ID is served in Trash, so the
+// local copy is dropped instead of being APPENDed twice.
+{
+  const m9 = await idOf('m9');
+  const server = new Map([
+    ['INBOX', dirState(1000, 10, [[9, 'm9']])],
+    ['Trash', dirState(3000, 30, [[20, 'm9']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 10, messages: {
+        9: {msgid: m9, flags: []}
+      }},
+      'Trash': {uidvalidity: 3000, uidnext: 30, messages: {
+        20: {msgid: m9, flags: []}
+      }}
+    }
+  };
+  // loser shares the winner's uid in INBOX but its message is m9 — whose
+  // identity is ALSO served in Trash; the winner file serves it in INBOX,
+  // so the loser is a plain duplicate of the served message
+  const dupName = makeFilename('INBOX', 9, [], {unique: 'dup1', fmd5: md5hex('INBOX')});
+  const loser = fileEntry(dupName, 9, md5hex('INBOX'), rawOf('m9'));
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f9', 9, md5hex('INBOX'), rawOf('m9'))])],
+    ['Trash', listing([fileEntry('f20', 20, md5hex('Trash'), rawOf('m9'))])]
+  ]);
+  listings.get('INBOX').excluded.push(loser);
+
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog});
+  const {plan} = await engine.plan();
+
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'same-uid duplicate of a served message is purged, not appended: ' +
+    JSON.stringify(plan.ops.map(describeOp)));
+}
+
+// ---- scenario I: unreadable duplicate-uid loser → kept + warned ------------
+// A loser whose bytes cannot be read must stay on disk with its warning —
+// never a plan op that would fail the run later.
+{
+  const m9 = await idOf('m9');
+  const server = new Map([
+    ['INBOX', dirState(1000, 10, [[9, 'm9']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 10, messages: {
+        9: {msgid: m9, flags: []}
+      }}
+    }
+  };
+  const dupName = makeFilename('INBOX', 9, [], {unique: 'dup1', fmd5: md5hex('INBOX')});
+  const loser = fileEntry(dupName, 9, md5hex('INBOX'), rawOf('m9'));
+  loser.unreadable = true;
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f9', 9, md5hex('INBOX'), rawOf('m9'))])]
+  ]);
+  listings.get('INBOX').excluded.push(loser);
+
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog});
+  const {plan} = await engine.plan();
+
+  assert.deepEqual(plan.ops.map(o => o.kind), [],
+    'no ops for an unreadable loser: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.ok(plan.warnings.some(w => w.includes('unreadable local file left alone')),
+    'the unreadable duplicate is warned about: ' + JSON.stringify(plan.warnings));
+}
+
+// ---- scenario J: scoped run never touches other folders' duplicates -------
+// `only` = INBOX: a duplicate-uid loser in Trash must produce zero ops and
+// zero classification there.
+{
+  const m9 = await idOf('m9');
+  const server = new Map([
+    ['INBOX', dirState(1000, 10, [[9, 'm9']])],
+    ['Trash', dirState(3000, 30, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 10, messages: {
+        9: {msgid: m9, flags: []}
+      }},
+      'Trash': {uidvalidity: 3000, uidnext: 30, messages: {}}
+    }
+  };
+  const dupName = makeFilename('Trash', 9, [], {unique: 'dup1', fmd5: md5hex('Trash')});
+  const loser = fileEntry(dupName, 9, md5hex('Trash'), rawOf('m9'));
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f9', 9, md5hex('INBOX'), rawOf('m9'))])],
+    ['Trash', listing([])]
+  ]);
+  listings.get('Trash').excluded.push(loser);
+
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog, only: 'INBOX'});
+  const {plan} = await engine.plan();
+
+  assert.deepEqual(plan.ops.map(o => o.kind), [],
+    'scoped run plans nothing for the out-of-scope duplicate: ' +
+    JSON.stringify(plan.ops.map(describeOp)));
 }
 
 console.log('sync.test: all scenarios pass');
