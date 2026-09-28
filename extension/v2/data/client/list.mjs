@@ -2,6 +2,7 @@ import './components/list-view.js';
 import {getMailApi} from './mail.mjs';
 import {getPref, setPref} from './prefs.mjs';
 import {enqueue, uidBusy} from './jobs.mjs';
+import {mirrorChanged} from './local-api.mjs';
 import {currentDirs} from './dirs.mjs';
 import {writeFiles} from '/core/native/native-client.mjs';
 import {STAR_COLORS, starFlagOps} from './star-colors.mjs';
@@ -607,6 +608,14 @@ function init(element) {
     // toolbar refresh = re-render the mails view from the disk truth only
     if (accountId && dirName) {
       load(accountId, dirName);
+    }
+  });
+  // local mutations (moves, deletes, flag changes) re-render the open folder
+  // in place once the file renames land — no full reload, selection and
+  // scroll position survive
+  mirrorChanged.subscribe(evt => {
+    if (evt?.accountId === accountId) {
+      syncCurrent();
     }
   });
   el.addEventListener('star', e => {

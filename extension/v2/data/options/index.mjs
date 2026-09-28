@@ -9,6 +9,7 @@ import {
 } from '/tools/crypto.mjs';
 import {reencryptStoredPasswords} from '/tools/passwords.mjs';
 import {detectNativeClient} from '/core/native/native-client.mjs';
+import {loadAccounts} from '../sync/client/accounts.mjs';
 import {
   MODE_EXTERNAL,
   getStorageMode,
@@ -433,7 +434,8 @@ formEl.addEventListener('submit', async e => {
       writes[key('user.pass', selectedId)] = pass;
     }
   }
-  if (draft && draft.id === account.id) {
+  const isNewAccount = !!(draft && draft.id === account.id);
+  if (isNewAccount) {
     account.order = accounts.reduce((max, a) => Math.max(max, a.order), -1) + 1;
     accounts.push(account);
     draft = null;
@@ -446,8 +448,32 @@ formEl.addEventListener('submit', async e => {
     // drop it so the freshly saved password is picked up right away
     await chrome.storage.session.remove(key('user.pass', selectedId));
   }
-  flash();
-  render();
+  if (isNewAccount) {
+    flash('Saved — starting sync…');
+    render();
+    // Auto-sync after adding a new account: load the account (decrypting
+    // the password just-in-time) and submit a sync-request through the
+    // regular chain. A master-password prompt appears here when needed.
+    try {
+      const all = await loadAccounts(promptEl);
+      const newAcc = all.find(a => a.id === selectedId);
+      if (newAcc) {
+        await chrome.runtime.sendMessage({
+          type: 'sync-request',
+          rid: 'auto-' + Date.now().toString(36),
+          kind: 'sync',
+          account: newAcc
+        });
+      }
+    }
+    catch (e) {
+      console.error('[options] auto-sync failed:', e?.message || e);
+    }
+  }
+  else {
+    flash();
+    render();
+  }
 });
 
 addBtn.addEventListener('click', async () => {

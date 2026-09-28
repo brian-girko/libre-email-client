@@ -41,9 +41,17 @@ import '/context.mjs';
 import '/badge.mjs';
 import '/sync-scheduler.mjs';
 
-chrome.action.onClicked.addListener(tab => {
+chrome.action.onClicked.addListener(async tab => {
+  // When storage is ready and autoOpen is on, skip the picker and go
+  // straight to the mail client. External-directory mode still routes
+  // through the picker (the worker cannot verify the handle).
+  const {'picker.autoOpen': autoOpen, 'storage.mode': mode} =
+    await chrome.storage.local.get({'picker.autoOpen': true, 'storage.mode': 'opfs'});
+  const target = (autoOpen !== false && mode !== 'external')
+    ? 'data/client/index.html'
+    : 'data/picker/index.html';
   chrome.tabs.create({
-    url: chrome.runtime.getURL('data/picker/index.html'),
+    url: chrome.runtime.getURL(target),
     openerTabId: tab?.id
   });
 });

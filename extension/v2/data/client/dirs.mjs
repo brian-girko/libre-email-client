@@ -5,6 +5,7 @@ import {getPref, setPref} from './prefs.mjs';
 import {enqueue, accountPendingJobs} from './jobs.mjs';
 import * as counters from './counters.mjs';
 import {listAccounts} from './accounts.mjs';
+import {isSyncRunning} from './sync-events.mjs';
 import {MODE_EXTERNAL, getStorageMode} from '../sync/root-handle.mjs';
 
 let el = null;
@@ -102,8 +103,12 @@ async function load(id) {
   const token = ++loadToken;
   el.loading();
   if (!id) {
+    const running = isSyncRunning();
     if (await hasAccounts()) {
       el.optionsNeeded('Select an account to list its folders.');
+    }
+    else if (running) {
+      el.setupNeeded('Initial sync in progress — please wait for it to complete.');
     }
     else if ((await getStorageMode()) === MODE_EXTERNAL) {
       el.setupNeeded('No account directories on the granted directory yet — run a sync first.');
@@ -154,7 +159,9 @@ async function load(id) {
       notify(initial.name);
     }
     else {
-      el.syncNeeded('This account has no folders yet — run a sync.');
+      el.syncNeeded(isSyncRunning()
+        ? 'Initial sync in progress — please wait for it to complete.'
+        : 'This account has no folders yet — run a sync.');
     }
   }
   catch (e) {
@@ -220,6 +227,19 @@ function init(element) {
     // the sync client is what builds and refreshes the folder tree; the
     // mail client stays open so this offer does not cost the current spot
     chrome.tabs.create({url: chrome.runtime.getURL(SYNC_URL)});
+  });
+  // Re-render when sync starts or finishes so the empty-state message
+  // reflects the current sync status (e.g. "Initial sync in progress"
+  // appears when sync begins with no data, and clears when it ends).
+  let lastSyncRunning = null;
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg?.type === 'sync-running') {
+      const running = !!msg.busy;
+      if (running !== lastSyncRunning) {
+        lastSyncRunning = running;
+        load(accountId);
+      }
+    }
   });
   el.addEventListener('create-dir', e => {
     createDir(e);

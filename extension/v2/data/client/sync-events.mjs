@@ -133,6 +133,19 @@ async function loadPersistence() {
   }
 }
 
+// ---- sync-running state ----------------------------------------------------
+// Tracks whether the engine is currently busy with a sync run. The dirs
+// view consults this to tell the user to wait when there's no data yet.
+
+let syncRunning = false;
+
+// Initial state: the engine might already be busy when this page loads
+chrome.runtime.sendMessage({type: 'sync-ui-init'}).then(data => {
+  if (data?.running) {
+    syncRunning = true;
+  }
+}).catch(() => {});
+
 // ---- wiring -----------------------------------------------------------------
 
 // Live clocks: every sync run (a background one submitted here, or one
@@ -142,6 +155,10 @@ async function loadPersistence() {
 // null-finishedAt discard path resets the stamp on the server side only:
 // the local copy is gone, nothing to show a clock for.
 chrome.runtime.onMessage.addListener(msg => {
+  if (msg?.type === 'sync-running') {
+    syncRunning = !!msg.busy;
+    return;
+  }
   if (msg?.type !== 'sync-synced' || msg.finishedAt == null) {
     return;
   }
@@ -165,4 +182,8 @@ function init() {
   });
 }
 
-export {init};
+function isSyncRunning() {
+  return syncRunning;
+}
+
+export {init, isSyncRunning};
