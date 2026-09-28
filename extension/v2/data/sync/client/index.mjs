@@ -25,3 +25,14 @@ initSyncPanel(
   document.getElementById('prompt'),
   account ? {account} : {}
 ).open();
+
+// Interface management: respond to the worker's exists check and
+// send a focus message so the worker can focus/redirect this tab.
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (msg?.cmd === 'exists' && msg.type === 'sync') {
+    respond({ok: true});
+    chrome.runtime.sendMessage({cmd: 'focus', type: 'sync'});
+    return false;
+  }
+  return false;
+});

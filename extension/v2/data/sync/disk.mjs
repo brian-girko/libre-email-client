@@ -21,7 +21,7 @@ import {
 } from './root-handle.mjs';
 
 function backToPicker() {
-  location.replace(chrome.runtime.getURL('data/picker/index.html'));
+  chrome.runtime.sendMessage({cmd: 'iface-open', type: 'picker', redirect: true});
 }
 
 // Offscreen-safe variant of boot(): same checks, no navigation (an

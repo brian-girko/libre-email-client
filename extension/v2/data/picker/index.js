@@ -43,7 +43,7 @@ async function autoOpen() {
 }
 
 function openClient() {
-  location.replace(chrome.runtime.getURL('data/client/index.html'));
+  chrome.runtime.sendMessage({cmd: 'iface-open', type: 'client', redirect: true});
 }
 
 function setStatus(text, ok) {
@@ -196,11 +196,11 @@ forgetBtn.addEventListener('click', () => {
 });
 
 openSyncBtn.addEventListener('click', () => {
-  location.replace(chrome.runtime.getURL('data/sync/client/index.html'));
+  chrome.runtime.sendMessage({cmd: 'iface-open', type: 'sync', redirect: true});
 });
 
 openClientBtn.addEventListener('click', () => {
-  location.replace(chrome.runtime.getURL('data/client/index.html'));
+  chrome.runtime.sendMessage({cmd: 'iface-open', type: 'client', redirect: true});
 });
 
 openExplorerBtn.addEventListener('click', () => {
@@ -209,6 +209,17 @@ openExplorerBtn.addEventListener('click', () => {
 
 openOptionsBtn.addEventListener('click', () => {
   location.replace(chrome.runtime.getURL('data/options/index.html#global'));
+});
+
+// Interface management: respond to the worker's exists check and
+// send a focus message so the worker can focus/redirect this tab.
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (msg?.cmd === 'exists' && msg.type === 'picker') {
+    respond({ok: true});
+    chrome.runtime.sendMessage({cmd: 'focus', type: 'picker'});
+    return false;
+  }
+  return false;
 });
 
 boot();

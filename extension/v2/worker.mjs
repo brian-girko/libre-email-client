@@ -41,19 +41,72 @@ import '/context.mjs';
 import '/badge.mjs';
 import '/sync-scheduler.mjs';
 
+// ---- interface management --------------------------------------------------
+//
+// The worker is the single coordinator for opening the three main
+// interfaces (picker, client, sync). Pages request an interface by
+// sending {cmd: 'iface-open', type, redirect?}. The worker broadcasts
+// {cmd: 'exists', type} — if a page of that type is open, it responds
+// {ok: true} and sends {cmd: 'focus'}; the worker then focuses the
+// existing tab (or closes it and redirects the source tab when
+// redirect is true). If no page responds, the worker opens a new tab
+// (or redirects the source tab).
+
+const IFACE_URLS = {
+  picker: 'data/picker/index.html',
+  client: 'data/client/index.html',
+  sync: 'data/sync/client/index.html'
+};
+
+// Pending redirects: type -> {sourceTabId, url}. Set when an iface-open
+// with redirect: true is received and the target interface is already
+// open. Consumed when the target page sends {cmd: 'focus'}.
+const pendingRedirects = new Map();
+
+function openInterface(type, {redirect = false, sourceTabId = null} = {}) {
+  const url = IFACE_URLS[type];
+  if (!url) {
+    return;
+  }
+  const fullUrl = chrome.runtime.getURL(url);
+  // A redirect becomes effective at focus time: the target page's
+  // {cmd: 'focus'} closes its own tab and redirects the source tab.
+  // Register the pending redirect BEFORE the broadcast so the focus
+  // message can never race the exists response.
+  if (redirect && sourceTabId != null) {
+    pendingRedirects.set(type, {sourceTabId, url: fullUrl});
+  }
+  chrome.runtime.sendMessage({cmd: 'exists', type})
+    .then(res => {
+      if (!res?.ok) {
+        pendingRedirects.delete(type);
+        if (redirect && sourceTabId != null) {
+          chrome.tabs.update(sourceTabId, {url: fullUrl});
+        }
+        else {
+          chrome.tabs.create({url: fullUrl});
+        }
+      }
+    })
+    .catch(() => {
+      pendingRedirects.delete(type);
+      if (redirect && sourceTabId != null) {
+        chrome.tabs.update(sourceTabId, {url: fullUrl});
+      }
+      else {
+        chrome.tabs.create({url: fullUrl});
+      }
+    });
+}
+
 chrome.action.onClicked.addListener(async tab => {
   // When storage is ready and autoOpen is on, skip the picker and go
   // straight to the mail client. External-directory mode still routes
   // through the picker (the worker cannot verify the handle).
   const {'picker.autoOpen': autoOpen, 'storage.mode': mode} =
     await chrome.storage.local.get({'picker.autoOpen': true, 'storage.mode': 'opfs'});
-  const target = (autoOpen !== false && mode !== 'external')
-    ? 'data/client/index.html'
-    : 'data/picker/index.html';
-  chrome.tabs.create({
-    url: chrome.runtime.getURL(target),
-    openerTabId: tab?.id
-  });
+  const target = (autoOpen !== false && mode !== 'external') ? 'client' : 'picker';
+  openInterface(target);
 });
 
 // ---------------------------------------------------------------- offscreen
@@ -70,6 +123,35 @@ chrome.action.onClicked.addListener(async tab => {
 //   'sync-synced' {accountId, finishedAt}  — finishedAt set: stamp it;
 //     null (the discard path): remove the stamp so the next run re-pulls
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  // interface management is keyed on msg.cmd (the interface type rides
+  // msg.type) — handle it before the msg.type switch below
+  if (msg?.cmd === 'iface-open') {
+    openInterface(msg.type, {
+      redirect: !!msg.redirect,
+      sourceTabId: sender.tab?.id ?? null
+    });
+    respond({ok: true});
+    return false;
+  }
+  // a page confirmed it is alive (responded to exists): focus its tab,
+  // or close it and redirect the source tab when a redirect is pending.
+  // The page names its own interface in msg.type — the worker cannot
+  // read sender.tab.url (no 'tabs' permission).
+  if (msg?.cmd === 'focus') {
+    if (sender.tab && msg.type) {
+      const pending = pendingRedirects.get(msg.type);
+      if (pending) {
+        pendingRedirects.delete(msg.type);
+        chrome.tabs.remove(sender.tab.id);
+        chrome.tabs.update(pending.sourceTabId, {url: pending.url});
+      }
+      else {
+        chrome.tabs.update(sender.tab.id, {active: true});
+      }
+    }
+    return false;
+  }
+
   switch (msg?.type) {
     // a sync job: make sure the shared offscreen doc exists, then hand the
     // job over as 'sync-job' (its response settles the page's own). Opening

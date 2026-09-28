@@ -226,7 +226,7 @@ function init(element) {
   el.addEventListener('open-sync', () => {
     // the sync client is what builds and refreshes the folder tree; the
     // mail client stays open so this offer does not cost the current spot
-    chrome.tabs.create({url: chrome.runtime.getURL(SYNC_URL)});
+    chrome.runtime.sendMessage({cmd: 'iface-open', type: 'sync'});
   });
   // Re-render when sync starts or finishes so the empty-state message
   // reflects the current sync status (e.g. "Initial sync in progress"

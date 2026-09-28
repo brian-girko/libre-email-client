@@ -104,7 +104,7 @@ loadAccounts(document.getElementById('prompt')).catch(e => {
 
 // the third segment: open the sync interface, sync nothing
 syncOpenBtn.addEventListener('click', () => {
-  chrome.tabs.create({url: chrome.runtime.getURL('/data/sync/client/index.html')});
+  chrome.runtime.sendMessage({cmd: 'iface-open', type: 'sync'});
 });
 
 syncDirBtn.addEventListener('click', () => {
@@ -251,12 +251,18 @@ function currentDirName() {
 // broadcast asks every open client instance to update. This one refreshes
 // the selected account's folder tree and reconciles its open folder in
 // place — no reload, search-safe (list.mjs' sync no-ops during search).
-chrome.runtime.onMessage.addListener(msg => {
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (msg?.cmd === 'exists' && msg.type === 'client') {
+    respond({ok: true});
+    chrome.runtime.sendMessage({cmd: 'focus', type: 'client'});
+    return false;
+  }
   if (msg?.type !== 'sync-refresh' || msg.slug !== selectedAccount) {
-    return;
+    return false;
   }
   refreshDirs();
   syncCurrent();
+  return false;
 });
 
 // document.title: "<dir> [<n> unread] :: <extension name>". Unread comes
