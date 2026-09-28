@@ -41,51 +41,12 @@
     <p id="bridge-status"></p>
     <div id="sample-code" hidden>
       <h2>Sample NodeJS Bridge</h2>
-      <p>Save as <code>bridge.js</code>, run <code>npm install ws</code>, then <code>node bridge.js</code>:</p>
-      <pre><code>const { WebSocketServer } = require('ws');
-const net = require('net');
-const tls = require('tls');
-
-const PORT = 8080;
-const wss = new WebSocketServer({ port: PORT });
-
-console.log('Bridge running on ws://localhost:' + PORT);
-
-wss.on('connection', (ws) =&gt; {
-  let upstream = null;
-
-  ws.on('message', (data, isBinary) =&gt; {
-    if (!isBinary) {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.op === 'open') {
-          const { host, port, secure, allowSelfSigned } = msg;
-          const opts = { host, port };
-          if (allowSelfSigned) opts.rejectUnauthorized = false;
-
-          upstream = secure !== false ? tls.connect(opts) : net.connect(opts);
-
-          upstream.on('connect', () =&gt; {
-            ws.send(JSON.stringify({ op: 'ready', host, port, secure: secure !== false }));
-          });
-          upstream.on('data', (d) =&gt; ws.send(d));
-          upstream.on('error', (e) =&gt; {
-            ws.send(JSON.stringify({ op: 'error', message: e.message }));
-          });
-        }
-      } catch (e) {
-        ws.send(JSON.stringify({ op: 'error', message: e.message }));
-      }
-    } else if (upstream) {
-      upstream.write(data);
-    }
-  });
-
-  ws.on('close', () =&gt; {
-    if (upstream) upstream.destroy();
-  });
-});</code></pre>
-      <input type="button" data-cmd="download-bridge" value="Download bridge.js">
+      <p>The bridge ships inside this extension as <code>core/ws-to-tls/ws-to-tls.js</code> &mdash; a zero-dependency Node script (Node 16+; uses only the <code>net</code>/<code>tls</code>/<code>crypto</code> built-ins).</p>
+      <p>Download it (button below), then run:</p>
+      <pre><code>node ws-to-tls.js --ws-port 8080</code></pre>
+      <p>It prints its URL, e.g. <code>ws://127.0.0.1:8080/&lt;random-token&gt;</code> &mdash; paste that exact URL into the extension's options page. The token in the URL path is the server's only access control.</p>
+      <input type="button" data-cmd="download-bridge" value="Download ws-to-tls.js">
+      <input type="button" data-cmd="copy-bridge" value="Copy to clipboard">
     </div>
     <div class="notes">
       <h2>Notes</h2>

@@ -241,16 +241,61 @@ function showSampleBridge() {
   div.hidden = !div.hidden;
 }
 
-// Download sample bridge
-function downloadSampleBridge() {
-  const code = document.querySelector('#sample-code pre code').textContent;
-  const blob = new Blob([code], {type: 'text/javascript'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'bridge.js';
-  a.click();
-  URL.revokeObjectURL(url);
+// The real bridge script (core/ws-to-tls/ws-to-tls.js) — fetched from the
+// extension's own resources, cached after the first load. Same pattern as
+// core/native/ws-bridge-client.mjs.
+let bridgeScriptPromise = null;
+function loadBridgeScript() {
+  if (!bridgeScriptPromise) {
+    bridgeScriptPromise = fetch(chrome.runtime.getURL('core/ws-to-tls/ws-to-tls.js'))
+      .then(res => {
+        if (!res.ok) {
+          throw new Error('failed to load core/ws-to-tls/ws-to-tls.js: ' + res.status);
+        }
+        return res.text();
+      });
+  }
+  return bridgeScriptPromise;
+}
+
+// Download the real bridge script
+async function downloadSampleBridge() {
+  const status = document.getElementById('bridge-status');
+  try {
+    const code = await loadBridgeScript();
+    const blob = new Blob([code], {type: 'text/javascript'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ws-to-tls.js';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  catch (e) {
+    status.className = 'error';
+    status.textContent = 'Cannot load the bridge script: ' + e.message;
+  }
+}
+
+// Copy the real bridge script to the clipboard
+async function copySampleBridge() {
+  const status = document.getElementById('bridge-status');
+  const btn = document.querySelector('[data-cmd="copy-bridge"]');
+  try {
+    const code = await loadBridgeScript();
+    await navigator.clipboard.writeText(code);
+    status.className = 'success';
+    status.textContent = 'Bridge script copied to clipboard.';
+    if (btn) {
+      const old = btn.value;
+      btn.value = 'Copied!';
+      setTimeout(() => { btn.value = old; }, 1500);
+    }
+  }
+  catch (e) {
+    status.className = 'error';
+    status.textContent = 'Cannot copy the bridge script: ' + e.message;
+  }
 }
 
 // Native client download
@@ -466,6 +511,9 @@ document.addEventListener('click', async ({target}) => {
   }
   else if (cmd === 'download-bridge') {
     downloadSampleBridge();
+  }
+  else if (cmd === 'copy-bridge') {
+    copySampleBridge();
   }
   else if (cmd === 'download') {
     downloadNativeClient();
