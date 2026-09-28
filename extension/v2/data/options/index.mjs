@@ -270,7 +270,7 @@ function render() {
   renderFilterAccounts();
 }
 
-async function loadAccounts() {
+async function refreshAccounts() {
   const res = await chrome.storage.local.get('accounts');
   accounts = Array.isArray(res.accounts) ? res.accounts : [];
 }
@@ -1454,7 +1454,7 @@ clearMasterBtn.addEventListener('click', async () => {
   await updateMasterState();
   await refreshBadgeStatus();
   await loadFiltersPrefs();
-  await loadAccounts();
+  await refreshAccounts();
   if (accounts.length === 0) {
     draft = emptyAccount(0, true);
     await select(draft.id);

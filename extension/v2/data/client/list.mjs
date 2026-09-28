@@ -348,6 +348,11 @@ async function clearSearch() {
   await load(accountId, dirName);
 }
 
+// The ThreadSummary rows the view currently shows. Every load()/sync() that
+// re-renders the folder updates it; page>0 syncs anchor to it so the rows
+// the user reads stay put while pages shift underneath.
+let lastRows = [];
+
 // Threads grouped locally per folder read (threads.mjs), so paging is a pure
 // slice of that list: one page holds `pageSize` conversations.
 // refresh: re-reads the folder from the disk truth (no caching anywhere).
@@ -393,6 +398,7 @@ async function load(id, name, {refresh = false} = {}) {
     }
     const rows = threads.slice(page * pageSize, (page + 1) * pageSize);
     counters.reconcile(accountId, name, folderTotals(threads));
+    lastRows = rows;
     el.build(rows);
     el.setPager({page, pageSize, total: threads.length});
   }
@@ -404,11 +410,15 @@ async function load(id, name, {refresh = false} = {}) {
   }
 }
 
-// Background sync: re-read the open folder and reconcile the list in place
-// (add new conversations, drop gone ones) instead of reloading the view.
-// Called after a worker filter/badge pass moved or delivered mail. Selection,
-// expansion and the scroll position are preserved; the loading state is never
-// shown. A no-op when the open folder changed or search results are shown.
+// Background sync: reconcile the open folder with the maildir IN PLACE —
+// remove the rows of deleted mail, add the new ones, patch read/unread and
+// other flag state on the surviving rows — instead of reloading the view.
+// The read itself is a delta (`api.listThreadsDelta()`): a filenename sweep
+// diffed against the folder's cached rows, so a run that moved nothing
+// costs nothing — no re-read of headers, no render, no counter churn.
+// The delta read keeps the same validation the old openDir() call served:
+// a folder whose mirror is gone raises 'no such mailbox' (err.code 'mirror'),
+// so a deleted folder shows the status note instead of a silently empty list.
 async function sync(id, name) {
   if (!id || !name || id !== accountId || name !== dirName || search) {
     return;
@@ -419,20 +429,17 @@ async function sync(id, name) {
     if (token !== loadToken) {
       return;
     }
-    await api.openDir(name);
-    if (token !== loadToken) {
-      return;
-    }
-    const threads = await api.listThreads();
-    if (token !== loadToken) {
-      return;
+    const {threads, changed} = await api.listThreadsDelta();
+    if (token !== loadToken || !changed) {
+      return;   // nothing on disk moved — the view stays exactly as it is
     }
     totalPages = Math.max(1, Math.ceil(threads.length / pageSize));
     if (page >= totalPages) {
       page = totalPages - 1;
     }
-    const rows = threads.slice(page * pageSize, (page + 1) * pageSize);
+    const rows = visibleThreads(threads);
     counters.reconcile(accountId, name, folderTotals(threads));
+    lastRows = rows;
     el.sync(rows);
     el.setPager({page, pageSize, total: threads.length});
   }
@@ -445,6 +452,27 @@ async function sync(id, name) {
     console.warn('folder sync failed', e);
     el.status('Sync failed: ' + (e?.message || String(e)), true);
   }
+}
+
+// Threads the current page shows after an in-place reconcile:
+//   - page 0 is the live inbox: new mail lands where the sort ranks it and
+//     the page overflow slides off the bottom (pager total grows);
+//   - deeper pages stay anchored to the thread currently at the top of the
+//     view (its group, wherever the reshuffle ranked it) — no rows are
+//     re-derived underneath a reading user; a page emptied by deletions
+//     falls back to the plain slice.
+function visibleThreads(threads) {
+  if (page <= 0 || lastRows.length === 0) {
+    return threads.slice(page * pageSize, (page + 1) * pageSize);
+  }
+  const key = Number(lastRows[0].uids?.[0]);
+  if (Number.isInteger(key) && key > 0) {
+    const index = threads.findIndex(t => Number(t.uids[0]) === key);
+    if (index >= 0) {
+      return threads.slice(index, index + pageSize);
+    }
+  }
+  return threads.slice(page * pageSize, (page + 1) * pageSize);
 }
 
 // Light refresh of the currently open folder, without a folder change: the

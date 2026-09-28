@@ -8,6 +8,10 @@
 //   listDirs/count lists  → account-tree walk (MaildirStore.listFolders)
 //   threads/bodies/search → per-message header parse (headers.mjs); bodies
 //                           parse fully with postal-mime only on demand
+//   listThreadsDelta()    → the post-sync in-place reconcile's read: a uid
+//                           +flag sweep over the filenames diffed against a
+//                           per-folder cache of the last full read — only
+//                           new mail parses headers; unchanged rows recycle
 //   setFlags/delete/move  → file renames (renameFile/moveBetweenFolders);
 //                           delete = \Deleted flag rename, the sync engine
 //                           replays the server effect from those names
@@ -210,6 +214,10 @@ async function buildApi(accountId) {
   const store = new MaildirStore(root, accountId);
   await store.open();
   let selected = null;
+  // single-slot delta cache for listThreadsDelta(): the folder's last read
+  // rows (uid → folderRows row shape, meta included). Lives per memoized api;
+  // a re-granted handle builds a fresh instance, so invalidation comes free.
+  let dirCache = null;
 
   const api = {
     // the old MailApi remnants (compatibility for stragglers)
@@ -273,8 +281,114 @@ async function buildApi(accountId) {
 
     async listThreads() {
       if (!selected) throw new Error('openDir() first');
-      const rows = (await folderRows(store, accountId, selected)).rows;
-      return groupThreads(await withMeta(rows));
+      const {rows} = await folderRows(store, accountId, selected);
+      const threads = groupThreads(await withMeta(rows));
+      // seed the delta cache from the full read: the rows are fresh,
+      // meta-parsed folderRows shape — the next delta only diffs
+      const uidvalidity = Number(await store.readUidValidity(selected)) || 0;
+      dirCache = {
+        folder: selected,
+        uidvalidity,
+        rows: new Map(rows.map(row => [row.uid, row])),
+      };
+      return threads;
+    },
+
+    /**
+     * Delta-aware variant of listThreads() for the post-sync in-place
+     * reconcile: one cheap listing sweep (uid + flags come from the
+     * filenames — no content reads), then a per-uid diff against the
+     * single-slot cache of the last full read. Unchanged messages reuse
+     * the cached row objects — no header re-parse; a message's headers
+     * cannot change under one uid (flag truth is the filename). Returns
+     * {changed, threads, added, removed, flagged} so callers can skip the
+     * DOM entirely when the sweep matched the cache exactly. A folder
+     * change, uidvalidity change or a cold cache falls back to the full
+     * read (which also re-seeds the cache).
+     */
+    async listThreadsDelta() {
+      if (!selected) throw new Error('openDir() first');
+      const local = await store.listLocal(selected);
+      const uidvalidity = Number(await store.readUidValidity(selected)) || 0;
+      const cache = dirCache;
+      const freshSheet = !local || cache?.folder !== selected ||
+        (uidvalidity && cache?.uidvalidity && uidvalidity !== cache.uidvalidity);
+      if (freshSheet) {
+        // missing mirror: the folder is not a Maildir on disk — the same
+        // 'no such mailbox' openDir() raises (err.code 'mirror') so the
+        // page shows the tree's replacement flow, never a silent clear
+        if (!local) {
+          const err = new Error('no such mailbox: ' + selected);
+          err.code = 'mirror';
+          throw err;
+        }
+        const rows = await deltaRows(local, selected);
+        dirCache = {
+          folder: selected,
+          uidvalidity,
+          rows: new Map(rows.map(row => [row.uid, row])),
+        };
+        return {changed: true, threads: groupThreads(rows), added: [], removed: [], flagged: []};
+      }
+      // the live uid+flag truth from the filenames; \Deleted rows leave the
+      // view (folderRows() keeps them out), interlopers join by uid as
+      // usual. No content reads.
+      const live = new Map();   // uid → flags on disk right now
+      for (const [uid, entry] of local.entries) {
+        if (!entry.flags.includes('\\Deleted')) {
+          live.set(uid, [...(entry.flags ?? [])]);
+        }
+      }
+      for (const interloper of local.interlopers ?? []) {
+        live.set(interloper.uid, [...(interloper.flags ?? [])]);
+      }
+      let removedUids = [];
+      const added = [];
+      const touched = [];
+      for (const [uid, flags] of live) {
+        const row = cache.rows.get(uid);
+        if (!row) {
+          added.push(uid);
+        }
+        else if (!sameSet(flags, row.flags)) {
+          row.flags = flags;   // identity kept; subject/from/date hold
+          touched.push(uid);
+        }
+      }
+      removedUids = [...cache.rows.keys()].filter(uid => !live.has(uid));
+      for (const uid of removedUids) {
+        cache.rows.delete(uid);
+      }
+      if (!added.length && !removedUids.length && !touched.length) {
+        return {changed: false, threads: null, added: [], removed: [], flagged: []};
+      }
+      // new arrivals: build rows, parse their headers only. Interlopers join
+      // regardless of \Deleted — folderRows() serves them the same way.
+      if (added.length) {
+        const byUid = new Map([...local.entries, ...local.interlopers]);
+        const fresh = [];
+        for (const uid of added) {
+          const entry = byUid.get(uid);
+          if (!entry) {
+            continue;   // raced away between sweep and read — next call retruths
+          }
+          const row = skeletonRow(entry, selected);
+          row.flags = live.get(uid);   // sameSet-reconciled copy
+          fresh.push(row);
+        }
+        await withMeta(fresh);
+        for (const row of fresh) {
+          cache.rows.set(row.uid, row);
+        }
+      }
+      const rows = [...cache.rows.values()].sort((a, b) => b.uid - a.uid);
+      return {
+        changed: true,
+        threads: groupThreads(rows),
+        added,
+        removed: removedUids,
+        flagged: touched,
+      };
     },
 
     async readFile(uid) {
@@ -492,6 +606,43 @@ function sameSet(a, b) {
   }
   const s = new Set(b);
   return a.every(f => s.has(f));
+}
+
+// One empty folderRows-shaped row built from a listLocal entry; meta fills
+// in later (withMeta), flags arrive from the filename.
+function skeletonRow(entry, folder) {
+  return {
+    entry,
+    folder,
+    uid: entry.uid,
+    flags: [...(entry.flags ?? [])],
+    subject: null,
+    from: null,
+    date: null,
+    messageId: null,
+    references: null,
+    inReplyTo: null,
+  };
+}
+
+// Seed rows for the delta cache from one listLocal() result, same
+// shape/semantics as folderRows(): \Deleted gone from the entries,
+// interlopers in (they never trip the \Deleted gate there), meta parsed,
+// newest first.
+async function deltaRows(local, folder) {
+  const rows = [];
+  for (const entry of local.entries.values()) {
+    if (entry.flags.includes('\\Deleted')) {
+      continue;
+    }
+    rows.push(skeletonRow(entry, folder));
+  }
+  for (const interloper of local.interlopers ?? []) {
+    rows.push(skeletonRow(interloper, folder));
+  }
+  rows.sort((a, b) => b.uid - a.uid);
+  await withMeta(rows);
+  return rows;
 }
 
 // remove the Maildir triple + .uidvalidity of one folder (leaf deletions only)

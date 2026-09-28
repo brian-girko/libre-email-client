@@ -24,9 +24,11 @@ function handleMirrorChanged(evt) {
   if (accountId !== selected.accountId || isSearching()) {
     return;
   }
-  // The sync rebuilds every row, which would detach the star color picker's
-  // host element and drop the open popover; the optimistic applyFlags already
-  // shows the right state, the next mirror event reconciles normally.
+  // The in-place sync reconciles rows by key: only rows whose visible
+  // content changed are rebuilt, and a star-color change reaches exactly
+  // the starred row — its host element can still be rebuilt, which would
+  // detach the picker's popover. The optimistic applyFlags already shows
+  // the right state; the next mirror event reconciles normally.
   if (starPickerOpen()) {
     return;
   }

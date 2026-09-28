@@ -958,6 +958,9 @@ class ListView extends HTMLElement {
     return out;
   }
 
+  // Full build: initial folder load, page change, folder switch, the
+  // toolbar refresh. The post-sync path (sync below) reconciles instead of
+  // rebuilding.
   build(rows) {
     this.#rows = this.#flatten(rows);
     this.#selected = new Set();
@@ -972,12 +975,15 @@ class ListView extends HTMLElement {
     this.#applyFilter(this.#filter.value);
   }
 
-  // Reconcile the list with a fresh server snapshot without resetting the
-  // view: new conversations appear, vanished ones are dropped, survivors are
-  // re-rendered. Selection (the user's, when no filter query is active),
-  // expansion and the scroll position survive; no loading state is shown.
+  // Reconcile the list in place with a fresh folder snapshot — the sync /
+  // delta path never rebuilds the view: rows whose data did not change keep
+  // their DOM nodes (untouched threads are not even visited), flag updates
+  // patch the affected row nodes, new rows are inserted at their visible
+  // position, vanished ones leave the grid node by node. Selection/paging
+  // (the user's, when no filter query is active), expansion and the scroll
+  // position survive; no loading state is shown.
   sync(rows) {
-    const next = Array.isArray(rows) ? rows : [];
+    const next = Array.isArray(rows) ? this.#flatten(rows) : [];
     const oldUids = new Set();
     for (const thread of this.#rows) {
       for (const uid of thread.uids) {
@@ -994,17 +1000,19 @@ class ListView extends HTMLElement {
     this.#selected = new Set([...this.#selected].filter(uid => present.has(Number(uid))));
     const keys = new Set(next.map(thread => thread.uids[0]));
     this.#expanded = new Set([...this.#expanded].filter(key => keys.has(key)));
-    this.#rows = this.#flatten(next);
+    this.#rows = next;
     this.#mode = 'ready';
     this.#message = '';
     const scrollTop = this.scrollTop;
-    // With an active selection filter, checked == matches must stay true, so
-    // re-derive the selection from the query; otherwise keep it and render.
+    // With an active selection filter, checked == matches must stay true:
+    // #applyFilter re-derives the selection from the query over the fresh
+    // rows (and re-renders — a rare, user-filtered view; the reconcile path
+    // above carries every other change in place).
     if (this.#filterQuery) {
       this.#applyFilter(this.#filterQuery);
     }
     else {
-      this.#rerenderKeepingFocus();
+      this.#syncDom();
     }
     this.scrollTop = scrollTop;
     if (gone.length) {
@@ -1014,6 +1022,141 @@ class ListView extends HTMLElement {
         composed: true
       }));
     }
+  }
+
+  // Keyed DOM reconciliation for the sync path: bring the grid's children
+  // in line with #sortedRows() (+ expanded sub rows). Untouched rows keep
+  // their DOM nodes (and the star pickers they host) — no recreation when
+  // nothing changed, moves are plain insertBefore of existing nodes, and
+  // only genuinely changed rows rebuild. #render() keeps the degenerate
+  // outcomes: empty set, unread-only with no unread, or a non-ready grid.
+  #syncDom() {
+    if (this.#mode !== 'ready') {
+      this.#render();
+      return;
+    }
+    if (!this.#rows.length || (this.#unreadOnly && !this.#rows.some(thread => thread.unread > 0))) {
+      this.#render();
+      return;
+    }
+    // ready with rows: the grid paints itself (sync may land right after
+    // #render's empty state hid nothing but showed the status text)
+    this.#status.hidden = true;
+    const desired = [];
+    for (const thread of this.#sortedRows()) {
+      desired.push({thread, item: null});
+      if (this.#expanded.has(thread.uids[0])) {
+        const messages = this.#unreadOnly
+          ? thread.messages.filter(item => !hasFlag(item.flags, '\\Seen'))
+          : thread.messages;
+        for (const item of messages) {
+          desired.push({thread, item});
+        }
+      }
+    }
+    this.#syncDomRows(desired);
+  }
+
+  #syncDomRows(desired) {
+    // the currently rendered rows, keyed the way the builders key them:
+    // thread rows by data-key (uids[0]), message rows by data-uid
+    const have = new Map();
+    for (const node of this.#grid.children) {
+      have.set(node.classList.contains('thread')
+        ? 't' + node.dataset.key
+        : 'm' + node.dataset.uid, node);
+    }
+    const active = this.shadowRoot.activeElement?.closest?.('.row');
+    const activeKey = active
+      ? (active.classList.contains('thread')
+        ? 't' + active.dataset.key
+        : 'm' + active.dataset.uid)
+      : null;
+    // leftover nodes that no desired row claims
+    const spare = new Map(have);
+    let cursor = this.#grid.firstChild;
+    for (const d of desired) {
+      const key = d.item ? 'm' + d.item.uid : 't' + d.thread.uids[0];
+      let node = spare.get(key) ?? null;
+      if (node) {
+        spare.delete(key);
+      }
+      let consumed = false;
+      if (!node) {
+        node = d.item ? this.#msgRow(d.thread, d.item) : this.#threadRow(d.thread);
+      }
+      else if (!this.#rowIsCurrent(d, node)) {
+        // visible content changed: rebuild just this row. When the row sits
+        // on the insertion cursor itself, replaceWith already put the new
+        // node at the walked position — consume it and move on.
+        const rebuilt = d.item ? this.#msgRow(d.thread, d.item) : this.#threadRow(d.thread);
+        const wasCursor = node === cursor;
+        node.replaceWith(rebuilt);
+        node = rebuilt;
+        if (wasCursor) {
+          consumed = true;
+        }
+      }
+      if (consumed || node === cursor) {
+        cursor = node ? node.nextSibling : null;
+      }
+      else {
+        this.#grid.insertBefore(node, cursor);
+      }
+    }
+    for (const node of spare.values()) {
+      node.remove();
+    }
+    // focus restore: the #rerenderKeepingFocus contract without the rerender
+    if (activeKey) {
+      const again = activeKey.startsWith('t')
+        ? this.#grid.querySelector('.row.thread[data-key="' + activeKey.slice(1) + '"]')
+        : this.#grid.querySelector('.row.sub[data-uid="' + activeKey.slice(1) + '"]');
+      again?.focus({preventScroll: true});
+    }
+    this.#updateActions();
+  }
+
+  // True when the node already renders exactly the row data: text, state
+  // classes, star color, selection bits — everything #threadRow/#msgRow
+  // would rebuild.
+  #rowIsCurrent(d, node) {
+    return d.item
+      ? this.#msgRowCurrent(d.item, node)
+      : this.#threadRowCurrent(d.thread, node);
+  }
+
+  #threadRowCurrent(thread, node) {
+    const unread = thread.unread > 0;
+    const checked = this.#threadChecked(thread);
+    const expanded = this.#expanded.has(thread.uids[0]);
+    const star = node.querySelector('.star');
+    const tcount = node.querySelector('.tcount');
+    return String(node.dataset.uids ?? '') === thread.uids.join(',')
+      && node.classList.contains('unread') === unread
+      && node.classList.contains('checked') === checked
+      && node.classList.contains('expanded') === expanded
+      && (star ? star.color === threadStarColor(thread.messages) : true)
+      && (!tcount || tcount.textContent === thread.unread + '/' + thread.count)
+      && node.querySelector('.sender')?.textContent === senderName(thread.from)
+      && node.querySelector('.title')?.textContent === (thread.subject || '(no subject)')
+      && node.querySelector('.date')?.textContent === formatDate(thread.date)
+      && node.getAttribute('aria-selected') === String(checked);
+  }
+
+  #msgRowCurrent(item, node) {
+    const unread = !hasFlag(item.flags, '\\Seen');
+    const checked = this.#selected.has(Number(item.uid));
+    const failed = this.#failures.has(Number(item.uid));
+    const star = node.querySelector('.star');
+    return node.classList.contains('unread') === unread
+      && node.classList.contains('checked') === checked
+      && node.classList.contains('failed') === failed
+      && (star ? star.color === starColorOf(item.flags) : true)
+      && node.querySelector('.sender')?.textContent === senderName(item.from)
+      && node.querySelector('.title')?.textContent === (item.subject || '(no subject)')
+      && node.querySelector('.date')?.textContent === formatDate(item.date)
+      && node.getAttribute('aria-selected') === String(checked);
   }
 
   // Active sort mode ("" = natural newest-first). Setting it syncs the

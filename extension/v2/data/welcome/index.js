@@ -98,6 +98,8 @@ async function prefillAccount() {
     const res = await chrome.storage.local.get([
       'imap.host.' + primary.id,
       'imap.port.' + primary.id,
+      'imap.secure.' + primary.id,
+      'imap.allowSelfSigned.' + primary.id,
       'user.name.' + primary.id,
       'user.pass.' + primary.id
     ]);
@@ -105,6 +107,16 @@ async function prefillAccount() {
     document.getElementById('f-label').value = primary.label || '';
     document.getElementById('f-host').value = res['imap.host.' + primary.id] || '';
     document.getElementById('f-port').value = res['imap.port.' + primary.id] || '';
+
+    // Same fallback as the options page: an account whose TLS flag was never
+    // stored keeps the checkbox default (TLS on) instead of showing unchecked.
+    const secureEl = document.getElementById('f-secure');
+    const selfSignedEl = document.getElementById('f-allow-self-signed');
+    secureEl.checked = res['imap.secure.' + primary.id] === undefined
+      ? secureEl.defaultChecked
+      : !!res['imap.secure.' + primary.id];
+    selfSignedEl.checked = !!res['imap.allowSelfSigned.' + primary.id];
+    updateSecureDependentFields();
     document.getElementById('f-name').value = res['user.name.' + primary.id] || '';
 
     // An encrypted password can't be shown as plain text — leave the field
@@ -328,6 +340,20 @@ function validateForm() {
   return true;
 }
 
+// Parent/child like the options page: accepting self-signed certificates only
+// makes sense on a TLS connection, so unchecking TLS disables and clears the
+// second checkbox.
+function updateSecureDependentFields() {
+  const secure = document.getElementById('f-secure');
+  const selfSigned = document.getElementById('f-allow-self-signed');
+  selfSigned.disabled = !secure.checked;
+  if (!secure.checked) {
+    selfSigned.checked = false;
+  }
+}
+
+document.getElementById('f-secure').addEventListener('change', updateSecureDependentFields);
+
 // Reads the master password verifier. The storage key is the literal string
 // 'master.hash', so it has to be read by that name — destructuring it into a
 // differently-named variable comes back undefined.
@@ -361,6 +387,8 @@ async function saveAccount() {
     accounts: list,
     ['imap.host.' + id]: host,
     ['imap.port.' + id]: port,
+    ['imap.secure.' + id]: document.getElementById('f-secure').checked,
+    ['imap.allowSelfSigned.' + id]: document.getElementById('f-allow-self-signed').checked,
     ['user.name.' + id]: name
   };
 

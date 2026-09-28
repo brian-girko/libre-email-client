@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Welcome :: Libre Email Client</title>
+  <title>Welcome Page :: Libre Email Client</title>
+  <link rel="icon" type="image/svg" href="images/favicon.svg">
   <link rel="stylesheet" type="text/css" href="index.css">
 </head>
 <body data-step="1" data-mode="">
@@ -137,6 +138,12 @@ wss.on('connection', (ws) =&gt; {
       </label>
       <label>Port
         <input type="number" id="f-port" placeholder="993" min="1" max="65535">
+      </label>
+      <label class="check">
+        <input type="checkbox" id="f-secure" checked> Use TLS/SSL (secure connection)
+      </label>
+      <label class="check">
+        <input type="checkbox" id="f-allow-self-signed"> Allow self-signed certificates
       </label>
       <label>Name
         <input type="text" id="f-name" placeholder="user@example.com" autocomplete="off">

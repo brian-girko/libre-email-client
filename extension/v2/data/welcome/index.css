@@ -161,6 +161,12 @@ li {
   display: block;
   padding: 8px 0;
 }
+.form label.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
 .form input[type="text"],
 .form input[type="number"],
 .form input[type="password"] {
