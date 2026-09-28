@@ -1165,7 +1165,7 @@ async function rowsFor(name, uidnext) {
           return;
         }
         const id = await msgidOf(raw);
-        if (id && (serverIds.has(id) || Object.values(messages).some(m => m.msgid === id))) {
+        if (id && serverIds.has(id)) {
           warnings.push(`${name}: dropped file "${entry.fileName}" (${whyQuiet}) duplicates a message already on the server; local copy discarded`);
           entry.claimed = true;
           ops.push({kind: 'purgeLocal', folder: name, uid: entry.uid ?? 0, entry});
@@ -1311,7 +1311,66 @@ async function rowsFor(name, uidnext) {
         if (stat.claimed) {
           continue;
         }
-        warnings.push(`${F.name}: ignored "${stat.fileName}" (${stat.reason}: uid ${stat.uid} already tracked by another file); kept on disk`);
+        // Resolve duplicate-uid: compare the loser's identity against the
+        // winner (the entry in F.local.entries with the same uid). Same msgid
+        // → true duplicate, purge the loser. Different msgid → a different
+        // message sharing a uid; rename to a surrogate uid so it becomes
+        // trackable and will be appended on a future sync.
+        const winner = F.local?.entries.get(stat.uid) ?? null;
+        let loserId = null;
+        try {
+          loserId = await msgidOf(await store.readFile(stat));
+        }
+        catch {}
+        if (winner && loserId) {
+          let winnerId = null;
+          try {
+            winnerId = await msgidOf(await store.readFile(winner));
+          }
+          catch {}
+          if (loserId === winnerId) {
+            stat.claimed = true;
+            ops.push({kind: 'purgeLocal', folder: F.name, uid: stat.uid, entry: stat});
+            warnings.push(`${F.name}: duplicate-uid file "${stat.fileName}" has the same message as "${winner.fileName}" — duplicate dropped`);
+            continue;
+          }
+        }
+        // different identity (or unreadable): rename to a surrogate uid so
+        // the file becomes trackable and the sync converges
+        if (winner) {
+          // find the lowest surrogate key to avoid collisions
+          let minKey = 0;
+          for (const key of F.local.entries.keys()) {
+            if (key < minKey) {
+              minKey = key;
+            }
+          }
+          const surrogateUid = minKey - 1;
+          try {
+            const newName = await store.renameMessage(F.name, stat, {uid: surrogateUid});
+            stat.claimed = true;
+            // replace the entry in the local map so the classifier sees it
+            // as a trackable local-born file on the next sync
+            F.local.entries.delete(stat.uid);
+            F.local.entries.set(surrogateUid, {
+              ...stat,
+              uid: surrogateUid,
+              fileName: newName,
+              surrogate: true
+            });
+            emitLog('plan', `${F.name}: duplicate-uid file "${stat.fileName}" renamed to surrogate uid ${surrogateUid} (different message) — will append on next sync`);
+          }
+          catch (e) {
+            warnings.push(`${F.name}: ignored "${stat.fileName}" (${stat.reason}: uid ${stat.uid} already tracked by another file); kept on disk`);
+          }
+        }
+        else {
+          // winner is gone (purged earlier this run): the loser becomes the
+          // only file with this uid — promote it to a trackable entry
+          stat.claimed = true;
+          F.local.entries.set(stat.uid, stat);
+          emitLog('plan', `${F.name}: duplicate-uid file "${stat.fileName}" promoted (winner gone) — will classify on next sync`);
+        }
       }
       for (const stat of F.local?.stranded ?? []) {
         warnings.push(`${F.name}: file in tmp/ ignored (scratched/dropped too early?): ${stat.fileName}`);
