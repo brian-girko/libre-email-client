@@ -3,6 +3,13 @@
 
 const args = new URLSearchParams(location.search);
 
+// Why the worker opened this page (icon click with setup incomplete):
+// 'no-account' — no account configured yet; 'no-native' — connection runs
+// over the local native client and it is not usable. Drives the jump below
+// to the first step that needs the user's attention.
+const reason = args.get('reason') || '';
+document.body.dataset.reason = reason;
+
 // OS detection
 let os = 'windows';
 if (/Mac/i.test(navigator.platform)) {
@@ -115,6 +122,21 @@ async function prefillAccount() {
   }
 }
 
+// One-shot native client probe (version cmd over the native messaging
+// host). Resolves a boolean and never throws.
+async function nativeInstalled() {
+  try {
+    const {runtime: savedRuntime} = await chrome.storage.local.get({runtime: 'com.add0n.node'});
+    const response = await new Promise(resolve => {
+      chrome.runtime.sendNativeMessage(savedRuntime, {cmd: 'version'}, r => resolve(r));
+    });
+    return !!(response && (response.version || response));
+  }
+  catch {
+    return false;
+  }
+}
+
 // Native client detection on step 2b entry
 async function checkNativeOnEntry() {
   const statusEl = document.getElementById('native-status');
@@ -130,17 +152,7 @@ async function checkNativeOnEntry() {
   nextBtn.disabled = true;
 
   // Detect native client
-  let installed = false;
-  try {
-    const {runtime: savedRuntime} = await chrome.storage.local.get({runtime: 'com.add0n.node'});
-    const response = await new Promise(resolve => {
-      chrome.runtime.sendNativeMessage(savedRuntime, {cmd: 'version'}, r => resolve(r));
-    });
-    installed = !!(response && (response.version || response));
-  }
-  catch {
-    installed = false;
-  }
+  const installed = await nativeInstalled();
 
   if (installed) {
     // Native client is available — show ready message
@@ -445,6 +457,50 @@ runtime.addEventListener('change', () => chrome.storage.local.set({
 
 chrome.storage.local.get({runtime: 'com.add0n.node'}, prefs => {
   runtime.value = prefs.runtime;
+});
+
+// Setup-gate routing: the worker opens this page with ?reason= when the
+// icon click cannot go to the mail client. Jump straight to the step that
+// needs the user's attention — the back button always leads to the start.
+(async () => {
+  if (reason === 'no-native') {
+    // native client mode without a usable native client: install steps
+    document.body.dataset.mode = 'local';
+    showStep('2b');
+  }
+  else if (reason === 'no-account') {
+    const {'ws.mode': wsMode, 'ws.url': wsUrl} = await chrome.storage.local.get({
+      'ws.mode': '',
+      'ws.url': ''
+    });
+    if (wsMode === 'external' && wsUrl) {
+      // the remote bridge is saved — only the account setup is missing
+      document.body.dataset.mode = 'remote';
+      showStep('3');
+    }
+    else if (wsMode === 'external') {
+      // remote chosen, but the bridge is not saved yet
+      document.body.dataset.mode = 'remote';
+      showStep('2a');
+    }
+    else if (await nativeInstalled()) {
+      // native client usable — only the account setup is missing
+      document.body.dataset.mode = 'local';
+      showStep('3');
+    }
+    // otherwise nothing is configured yet: the wizard starts at step 1
+  }
+})();
+
+// Interface management: respond to the worker's exists check and
+// send a focus message so the worker can focus this tab.
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (msg?.cmd === 'exists' && msg.type === 'welcome') {
+    respond({ok: true});
+    chrome.runtime.sendMessage({cmd: 'focus', type: 'welcome'});
+    return false;
+  }
+  return false;
 });
 
 // URL message parameter

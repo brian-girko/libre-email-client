@@ -1,7 +1,7 @@
 // worker.mjs — MV3 module service worker (module SW).
 //
 // Jobs:
-//   action click → picker page (unchanged)
+//   action click → welcome (when setup is incomplete), else picker/client
 //   offscreen acquisition → the sync engine and the badge counter both run
 //   in the one shared offscreen document (/offscreen/index.html, hosted by
 //   manager.mjs there); the doc imports each module on its first routed
@@ -26,6 +26,7 @@
 
 import {acquire, release} from '/core/bridge.mjs';
 import {ensure, closeNow, activeGen} from '/core/offscreen.mjs';
+import {detectNativeClient} from '/core/native/native-client.mjs';
 import {markSynced, clearSynced, loadGatePrefs} from '/data/sync/client/accounts.mjs';
 import {loadFilters} from '/data/sync/filters/route.mjs';
 import {dlog} from '/core/debug-log.mjs';
@@ -55,7 +56,8 @@ import '/sync-scheduler.mjs';
 const IFACE_URLS = {
   picker: 'data/picker/index.html',
   client: 'data/client/index.html',
-  sync: 'data/sync/client/index.html'
+  sync: 'data/sync/client/index.html',
+  welcome: 'data/welcome/index.html'
 };
 
 // Pending redirects: type -> {sourceTabId, url}. Set when an iface-open
@@ -63,12 +65,20 @@ const IFACE_URLS = {
 // open. Consumed when the target page sends {cmd: 'focus'}.
 const pendingRedirects = new Map();
 
-function openInterface(type, {redirect = false, sourceTabId = null} = {}) {
+function openInterface(type, {redirect = false, sourceTabId = null, query = null} = {}) {
   const url = IFACE_URLS[type];
   if (!url) {
     return;
   }
-  const fullUrl = chrome.runtime.getURL(url);
+  let fullUrl = chrome.runtime.getURL(url);
+  // Optional URL params, appended to every open path (new tab or tab
+  // redirect) so the target page can learn why it was opened.
+  if (query) {
+    const qs = new URLSearchParams(query).toString();
+    if (qs) {
+      fullUrl += '?' + qs;
+    }
+  }
   // A redirect becomes effective at focus time: the target page's
   // {cmd: 'focus'} closes its own tab and redirects the source tab.
   // Register the pending redirect BEFORE the broadcast so the focus
@@ -100,11 +110,39 @@ function openInterface(type, {redirect = false, sourceTabId = null} = {}) {
 }
 
 chrome.action.onClicked.addListener(async tab => {
+  // Setup gate: with no configured account the user has to walk the welcome
+  // wizard; in native-client mode (no remote ws 'ws.url' configured) that
+  // gate only opens when the local native client is actually installed — a
+  // working native client goes straight through, like remote mode does.
+  const {
+    accounts,
+    'ws.mode': wsMode,
+    'picker.autoOpen': autoOpen,
+    'storage.mode': mode
+  } = await chrome.storage.local.get({
+    'accounts': [],
+    'ws.mode': 'native',
+    'picker.autoOpen': true,
+    'storage.mode': 'opfs'
+  });
+  const ready = Array.isArray(accounts) && accounts.length > 0;
+
+  console.log(ready, accounts, wsMode);
+
+  // The reason rides on the welcome page URL (?reason=…) so the wizard
+  // can head straight at the step that needs the user's attention.
+  if (!ready) {
+    openInterface('welcome', {query: {reason: 'no-account'}});
+    return;
+  }
+  if (wsMode !== 'external' &&
+      !(await detectNativeClient()).installed) {
+    openInterface('welcome', {query: {reason: 'no-native'}});
+    return;
+  }
   // When storage is ready and autoOpen is on, skip the picker and go
   // straight to the mail client. External-directory mode still routes
   // through the picker (the worker cannot verify the handle).
-  const {'picker.autoOpen': autoOpen, 'storage.mode': mode} =
-    await chrome.storage.local.get({'picker.autoOpen': true, 'storage.mode': 'opfs'});
   const target = (autoOpen !== false && mode !== 'external') ? 'client' : 'picker';
   openInterface(target);
 });
