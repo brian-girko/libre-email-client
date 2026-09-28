@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Welcome :: Libre Email Client</title>
+  <link rel="stylesheet" type="text/css" href="index.css">
+</head>
+<body data-step="1" data-mode="">
+  <div id="progress">
+    <span class="dot active"></span>
+    <span class="dot"></span>
+    <span class="dot"></span>
+  </div>
+
+  <!-- Step 1: Mode Choice -->
+  <section id="step-1" class="step">
+    <h1>Welcome</h1>
+    <p>Choose how you want to connect to your email server.</p>
+    <div class="choices">
+      <div class="card" data-mode="remote">
+        <h2>Remote Bridge</h2>
+        <p>No installation needed. Ideal for shared/network setups or when you cannot install native apps.</p>
+      </div>
+      <div class="card" data-mode="local">
+        <h2>Local Native Client</h2>
+        <p>Install on this computer. Required for local file operations like Spam/Archive/Trash overrides.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Step 2a: Remote Bridge -->
+  <section id="step-2a" class="step" hidden>
+    <h1>Remote WS/TS Bridge</h1>
+    <p>The bridge connects the extension to your IMAP server over WebSocket.</p>
+    <div class="actions">
+      <input type="button" data-cmd="check-bridge" value="Check Bridge">
+      <input type="button" data-cmd="sample-bridge" value="Sample NodeJS Bridge">
+    </div>
+    <p id="bridge-status"></p>
+    <div id="sample-code" hidden>
+      <h2>Sample NodeJS Bridge</h2>
+      <p>Save as <code>bridge.js</code>, run <code>npm install ws</code>, then <code>node bridge.js</code>:</p>
+      <pre><code>const { WebSocketServer } = require('ws');
+const net = require('net');
+const tls = require('tls');
+
+const PORT = 8080;
+const wss = new WebSocketServer({ port: PORT });
+
+console.log('Bridge running on ws://localhost:' + PORT);
+
+wss.on('connection', (ws) =&gt; {
+  let upstream = null;
+
+  ws.on('message', (data, isBinary) =&gt; {
+    if (!isBinary) {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.op === 'open') {
+          const { host, port, secure, allowSelfSigned } = msg;
+          const opts = { host, port };
+          if (allowSelfSigned) opts.rejectUnauthorized = false;
+
+          upstream = secure !== false ? tls.connect(opts) : net.connect(opts);
+
+          upstream.on('connect', () =&gt; {
+            ws.send(JSON.stringify({ op: 'ready', host, port, secure: secure !== false }));
+          });
+          upstream.on('data', (d) =&gt; ws.send(d));
+          upstream.on('error', (e) =&gt; {
+            ws.send(JSON.stringify({ op: 'error', message: e.message }));
+          });
+        }
+      } catch (e) {
+        ws.send(JSON.stringify({ op: 'error', message: e.message }));
+      }
+    } else if (upstream) {
+      upstream.write(data);
+    }
+  });
+
+  ws.on('close', () =&gt; {
+    if (upstream) upstream.destroy();
+  });
+});</code></pre>
+      <input type="button" data-cmd="download-bridge" value="Download bridge.js">
+    </div>
+    <div class="notes">
+      <h2>Notes</h2>
+      <ul>
+        <li>The bridge can be written in any language &mdash; the protocol is simple: receive <code>{op:'open', host, port, secure}</code> as a text frame, reply with <code>{op:'ready'}</code> or <code>{op:'error'}</code>, then tunnel binary frames.</li>
+        <li>Useful when multiple users on a network share one bridge.</li>
+        <li>Useful when you cannot install native apps on the user's computer.</li>
+        <li>Configure the bridge URL in the extension's <a href="#" data-cmd="options">options page</a>.</li>
+      </ul>
+    </div>
+    <div class="nav">
+      <input type="button" data-cmd="back" value="Back">
+      <input type="button" data-cmd="next" value="Next">
+    </div>
+  </section>
+
+  <!-- Step 2b: Local Native Client -->
+  <section id="step-2b" class="step" hidden>
+    <h1>Local Native Client</h1>
+    <p id="native-status">Checking native client...</p>
+    <ul id="install-steps" hidden>
+      <li>Select the runtime <select id="runtime">
+        <option value="com.add0n.node">NodeJS (com.add0n.node)</option>
+        <option value="org.webextension.bun">BunJS (org.webextension.bun)</option>
+      </select></li>
+      <li>Click <a href="#" data-cmd="download">here</a> to download the package</li>
+      <li>Extract the downloaded package</li>
+      <li class="linux">Run <code>./install.sh</code> in the extracted directory</li>
+      <li class="windows">Double-click <code>install.bat</code></li>
+    </ul>
+    <div class="actions">
+      <input type="button" data-cmd="check" value="Check Connection" hidden>
+    </div>
+    <div class="nav">
+      <input type="button" data-cmd="back" value="Back">
+      <input type="button" data-cmd="next" value="Next">
+    </div>
+  </section>
+
+  <!-- Step 3: Account Details -->
+  <section id="step-3" class="step" hidden>
+    <h1>Account Setup</h1>
+    <p>Enter your email account details below.</p>
+    <div class="form">
+      <label>Label
+        <input type="text" id="f-label" placeholder="Work, Gmail, ...">
+      </label>
+      <label>Host
+        <input type="text" id="f-host" placeholder="imap.example.com">
+      </label>
+      <label>Port
+        <input type="number" id="f-port" placeholder="993" min="1" max="65535">
+      </label>
+      <label>Name
+        <input type="text" id="f-name" placeholder="user@example.com" autocomplete="off">
+      </label>
+      <label>Password
+        <input type="password" id="f-pass" placeholder="Optional" autocomplete="new-password">
+      </label>
+      <p id="pass-note"></p>
+    </div>
+    <div class="master-section" hidden>
+      <h2>Master Password</h2>
+      <p>No master password is set. Enter one below to store the account password encrypted.</p>
+      <label>Set Master Password
+        <input type="password" id="f-master" placeholder="Optional" autocomplete="new-password">
+      </label>
+      <p class="hint">Optional. When set, the account password is stored encrypted with it.</p>
+    </div>
+    <p id="form-error" class="error"></p>
+    <div class="nav">
+      <input type="button" data-cmd="back" value="Back">
+      <input type="button" data-cmd="finish" value="Finish" disabled>
+    </div>
+  </section>
+
+  <script src="index.js"></script>
+</body>
+</html>

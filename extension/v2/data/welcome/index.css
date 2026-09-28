@@ -1,0 +1,248 @@
+:root {
+  --clr: light-dark(#4d5156, #bdc6cf);
+  --bg: light-dark(#fff, #202124);
+  --link: light-dark(#0374ff, #9ac8ff);
+  --bg-alt: light-dark(#ffeee2, #3a3a3a);
+  --error: light-dark(#ff3131, #ff9696);
+  color-scheme: light dark;
+}
+
+body {
+  font-size: 14px;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, "Noto Sans", sans-serif;
+  line-height: 1.5em;
+  color: var(--clr);
+  background-color: var(--bg);
+  width: min(70rem, 100vw);
+  margin-inline: auto;
+}
+h1 {
+  color: var(--clr);
+  background-color: var(--bg-alt);
+  padding: 20px 10px;
+  margin: 0;
+  font-size: 20px;
+  font-weight: normal;
+  text-align: center;
+}
+h2 {
+  font-size: 16px;
+  margin: 20px 0 10px;
+}
+p {
+  padding: 10px;
+  margin: 0 0 10px;
+}
+a,
+a:visited {
+  color: var(--link);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+code {
+  background-color: rgba(0, 0, 0, 0.07);
+  padding: 3px 5px;
+  border-radius: 3px;
+}
+pre {
+  background-color: rgba(0, 0, 0, 0.07);
+  padding: 15px;
+  overflow-x: auto;
+  border-radius: 5px;
+  font-size: 90%;
+  line-height: 1.4;
+}
+pre code {
+  background: none;
+  padding: 0;
+}
+input[type="button"] {
+  padding: 12px 20px;
+  color: var(--clr);
+  background-color: var(--bg-alt);
+  border: none;
+  font-size: 100%;
+  outline: none;
+  cursor: pointer;
+  margin: 5px;
+}
+input[type="button"]:hover {
+  opacity: 0.8;
+}
+input[type="button"]:active {
+  opacity: 0.5;
+}
+input[type="button"]:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+select {
+  padding: 5px 10px;
+  font-size: 100%;
+}
+ul,
+ol {
+  padding-left: 20px;
+}
+li {
+  padding: 3px 0;
+}
+
+/* Progress indicator */
+#progress {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  padding: 20px 0;
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: var(--bg-alt);
+  opacity: 0.3;
+}
+.dot.active {
+  opacity: 1;
+}
+
+/* Choice cards */
+.choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+  padding: 20px 0;
+}
+.card {
+  border: 2px solid var(--bg-alt);
+  border-radius: 8px;
+  padding: 20px;
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+.card:hover {
+  border-color: var(--link);
+  background-color: var(--bg-alt);
+}
+.card h2 {
+  margin-top: 0;
+}
+
+/* Navigation */
+.nav {
+  display: flex;
+  justify-content: space-between;
+  padding: 20px 0;
+}
+
+/* Actions */
+.actions {
+  padding: 10px 0;
+}
+
+/* Notes */
+.notes {
+  margin-top: 20px;
+  padding: 15px;
+  background-color: var(--bg-alt);
+  border-radius: 8px;
+}
+.notes ul {
+  margin: 5px 0;
+}
+
+/* Form */
+.form {
+  padding: 10px 0;
+}
+.form label {
+  display: block;
+  padding: 8px 0;
+}
+.form input[type="text"],
+.form input[type="number"],
+.form input[type="password"] {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  margin-top: 4px;
+  border: 1px solid var(--bg-alt);
+  border-radius: 4px;
+  background-color: var(--bg);
+  color: var(--clr);
+  font-size: 100%;
+  box-sizing: border-box;
+}
+.form input:focus {
+  outline: 2px solid var(--link);
+  outline-offset: -1px;
+}
+
+/* Error text */
+.error {
+  color: var(--error);
+  font-weight: bold;
+  padding: 10px;
+}
+
+/* Note text */
+.note {
+  color: var(--clr);
+  font-size: 90%;
+  padding: 5px 10px;
+}
+
+/* Master password section */
+.master-section {
+  margin-top: 20px;
+  padding: 15px;
+  background-color: var(--bg-alt);
+  border-radius: 8px;
+}
+
+/* Hint text */
+.hint {
+  font-size: 90%;
+  padding: 5px 10px;
+  opacity: 0.7;
+}
+
+/* Success text */
+.success {
+  color: #27a043;
+  font-weight: bold;
+}
+
+/* OS-specific hiding */
+body[data-os=windows] .linux {
+  display: none;
+}
+body[data-os=linux] .windows {
+  display: none;
+}
+
+/* Bridge status */
+#bridge-status {
+  padding: 10px;
+  font-weight: bold;
+}
+#bridge-status.success {
+  color: #27a043;
+}
+#bridge-status.error {
+  color: var(--error);
+}
+
+/* Native status */
+#native-status {
+  padding: 10px;
+  font-weight: bold;
+}
+#native-status.success {
+  color: #27a043;
+}
+#native-status.error {
+  color: var(--error);
+}
