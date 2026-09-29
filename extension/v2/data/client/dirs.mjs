@@ -1,6 +1,5 @@
 import './components/directory-view.js';
 import {getMailApi, dropMailApi} from './mail.mjs';
-import {mirrorChanged} from './local-api.mjs';
 import {getPref, setPref} from './prefs.mjs';
 import {enqueue, accountPendingJobs} from './jobs.mjs';
 import * as counters from './counters.mjs';
@@ -290,12 +289,6 @@ function init(element) {
   el.addEventListener('delete-dir', e => {
     deleteDir(e);
   });
-  mirrorChanged.subscribe(evt => {
-    if (evt?.accountId !== accountId) {
-      return;
-    }
-    refreshTree();
-  });
 }
 
 // Folder-list equality on the attributes the tree renders. The order is
@@ -312,13 +305,12 @@ function sameFolderList(a, b) {
 }
 
 // In-place tree refresh: re-read the folder list + counts from the
-// handle. Local mutations report through mirrorChanged; sync and
-// filter runs write into the account dir from OTHER pages (the engine
-// document, the sync interface) — index.mjs routes their
-// 'sync-refresh' broadcasts here. No reload: the tree reconciles in
-// place — `el.dirs` is re-assigned only when the folder set itself
-// changed (folder create/drop), while the per-folder unread/total
-// updates arrive through the counter feed row by row.
+// granted root. Driven by the fs-event router (data/client/fs-events.mjs)
+// on structural events — a folder of the current account was created or
+// removed. No reload: the tree reconciles in place — `el.dirs` is
+// re-assigned only when the folder set itself changed (folder
+// create/drop), while the per-folder unread/total updates arrive through
+// the counter feed row by row.
 async function refreshTree() {
   if (!accountId || !el?.isConnected) {
     return;
@@ -335,6 +327,24 @@ async function refreshTree() {
     if (!sameFolderList(el.dirs, dirs)) {
       el.dirs = dirs;
     }
+    countDirs(api, accountId, loadToken);
+  }
+  catch {
+    /* transient read failure: the next event retries */
+  }
+}
+
+// The LIGHT half of the fs-event routing: folder names unchanged, only the
+// per-folder unread/total moved (a message arrived, left or was renamed in
+// {new,cur} of the current account). Re-runs the counter sweep alone — it
+// streams per-folder results and deliverCount reconciles only the folders
+// whose numbers actually moved; the tree rows never rebuild.
+async function refreshCounts() {
+  if (!accountId || !el?.isConnected) {
+    return;
+  }
+  try {
+    const api = await getMailApi(accountId);
     countDirs(api, accountId, loadToken);
   }
   catch {
@@ -470,4 +480,4 @@ async function deleteDir(e) {
   });
 }
 
-export {init, load, currentDirs, refreshTree as refresh};
+export {init, load, currentDirs, refreshTree as refresh, refreshCounts};

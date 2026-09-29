@@ -2,7 +2,6 @@ import './components/list-view.js';
 import {getMailApi} from './mail.mjs';
 import {getPref, setPref} from './prefs.mjs';
 import {enqueue, uidBusy} from './jobs.mjs';
-import {mirrorChanged} from './local-api.mjs';
 import {currentDirs} from './dirs.mjs';
 import {writeFiles} from '/core/native/native-client.mjs';
 import {STAR_COLORS, starFlagOps} from './star-colors.mjs';
@@ -228,10 +227,10 @@ async function runTrashAction(id, name, uids, token, trashDir) {
 }
 
 // Flag change (mark-read/unread, star): the style toggles immediately and is
-// reconciled by the folder re-render that follows the op's post-rename
-// mirror-changed event. No counter prediction: the tree badges + title
-// update when the reconcile runs. Quiet jobs render no bar line (auto
-// mark-read on open).
+// reconciled by the folder re-render that follows the op's fs-event (the
+// router's debounced mails-view delta). No counter prediction: the tree
+// badges + title update when the reconcile runs. Quiet jobs render no bar
+// line (auto mark-read on open).
 function queueFlag(id, uids, addFlags, removeFlags, label, doneLabel = label, quiet = false) {
   if (!id || !Array.isArray(uids) || !uids.length) {
     return;
@@ -638,14 +637,10 @@ function init(element) {
       load(accountId, dirName);
     }
   });
-  // local mutations (moves, deletes, flag changes) re-render the open folder
-  // in place once the file renames land — no full reload, selection and
+  // local mutations (moves, deletes, flag changes) reconcile the open
+  // folder in place through the fs-event router (data/client/fs-events.mjs
+  // → filters.mjs reconcileOpenFolder) — no full reload, selection and
   // scroll position survive
-  mirrorChanged.subscribe(evt => {
-    if (evt?.accountId === accountId) {
-      syncCurrent();
-    }
-  });
   el.addEventListener('star', e => {
     const detail = e.detail;
     if (!detail) {

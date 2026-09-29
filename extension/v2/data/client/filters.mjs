@@ -1,38 +1,24 @@
 'use strict';
 
-// Local-only client's list reconcile bridge. There are no worker filter or
-// badge passes anymore; this module is one thin piece:
-//   - the mirror-driven in-place list sync: every local mutation reports
-//     exactly which folders changed, and the open folder reconciles in
-//     place when one of them is the one the user is reading.
+// The open folder's guarded in-place reconcile — the callable the fs-event
+// router (data/client/fs-events.mjs) invokes as its mails-view(delta) op.
+// The guards live here because they are view-state, not classification:
+//   - not while search results are shown (runSearch owns the list view),
+//   - not while the star picker's popover is open (the in-place sync
+//     reconciles rows by key and a star-color change reaches exactly the
+//     starred row — rebuilding its host element would detach the popover;
+//     the optimistic applyFlags already shows the right state, the next
+//     reconcile lands normally).
 
 import {isSearching, sync} from './list.mjs';
-import {mirrorChanged} from './local-api.mjs';
 import {starPickerOpen} from './components/star-toggle.js';
 
 let selected = null; // {accountId, name} of the open folder
 
 // ---- folder sync decisions --------------------------------------------------
 
-// Trigger the in-place reconcile for the open folder after a mutation that
-// touched it. Not while search results are shown.
-function handleMirrorChanged(evt) {
-  const {accountId, dirs} = evt ?? {};
-  if (!selected || !Array.isArray(dirs) || !dirs.length) {
-    return;
-  }
-  if (accountId !== selected.accountId || isSearching()) {
-    return;
-  }
-  // The in-place sync reconciles rows by key: only rows whose visible
-  // content changed are rebuilt, and a star-color change reaches exactly
-  // the starred row — its host element can still be rebuilt, which would
-  // detach the picker's popover. The optimistic applyFlags already shows
-  // the right state; the next mirror event reconciles normally.
-  if (starPickerOpen()) {
-    return;
-  }
-  if (!dirs.includes(selected.name)) {
+function reconcileOpenFolder() {
+  if (!selected || isSearching() || starPickerOpen()) {
     return;
   }
   sync(selected.accountId, selected.name);
@@ -47,7 +33,6 @@ function initFilters() {
       selected = {accountId: detail.accountId, name: detail.name};
     }
   });
-  mirrorChanged.subscribe(handleMirrorChanged);
 }
 
-export {initFilters};
+export {initFilters, reconcileOpenFolder};

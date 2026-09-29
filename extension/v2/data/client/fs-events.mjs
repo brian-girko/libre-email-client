@@ -1,10 +1,11 @@
 'use strict';
 
-// fs-events.mjs — the client's fs-event stream listener. core/fs.mjs
-// broadcasts one {type:'fs-event', origin, operation, src, dest} after
-// every file/dir mutation anywhere in the extension; this module decides
-// whether an event concerns the CURRENTLY SELECTED account and, if so,
-// which view components would need to refresh:
+// fs-events.mjs — the client's fs-event stream router. core/fs.mjs emits
+// one {type:'fs-event', origin, operation, src, dest} after every file/dir
+// mutation — broadcast over the runtime bus AND echoed to same-context
+// onFsEvent() subscribers (sendMessage never delivers to the sender, the
+// echo is how the client sees its own edits). This module is the ONE place
+// that turns those events into view refreshes:
 //
 //   dir-view          the folder tree — ONLY when the account's directory
 //                     structure itself changed (a Maildir folder created
@@ -27,16 +28,18 @@
 // probes), tmp/ scratch and the tmp/new/cur triple mkdirs that accompany
 // a folder's first message (their real event is the move that follows).
 //
-// The client's own edits never arrive here (sendMessage does not deliver
-// to the sender) — self-edits refresh through the mirrorChanged feed.
-//
-// PRINT-ONLY for now: the listener logs "would call: …" instead of
-// calling anything. Wiring it up means mapping the calls onto
-// dirs.refresh() / list.syncCurrent() / a preview re-read — and likely
-// retiring the parallel 'sync-refresh' handler in index.mjs, which this
-// module's routing is shaped after (same account check, same two calls).
+// The view callables arrive injected from index.mjs (dirs.refresh,
+// dirs.refreshCounts, filters.reconcileOpenFolder, preview.refresh) — this
+// module stays decoupled from the views it drives. Calls are COALESCED:
+// a sync lands hundreds of events, the views need one reconcile per burst
+// — 150 ms trailing edge, forced at 1 s so a long run still refreshes
+// progressively. classifyEvent() itself is pure and unit-tested.
 
 import {folderFor, parseFilename} from '../sync/maildir.mjs';
+import {onFsEvent} from '/core/fs.mjs';
+
+const DELAY_MS = 150;     // trailing edge: one reconcile per event burst
+const MAX_WAIT_MS = 1000; // forced fire mid-burst (progressive sync updates)
 
 /**
  * Classifies one fs-event against the client's current account and open
@@ -47,12 +50,17 @@ import {folderFor, parseFilename} from '../sync/maildir.mjs';
  *   selected account id (== the maildir slug) and open dir (server folder
  *   name spelling, as the tree serves it), both nullable
  * @returns {{match: 'mine'|'other'|'unselected', slug: string|null,
- *   dirs: string[], calls: string[], note: string|null}} dirs = affected
- *   server folder names; calls = the components that would refresh, in
- *   call order; note = why nothing would be called (null when calls exist)
+ *   dirs: string[], calls: string[], actions: object[], note: string|null}}
+ *   dirs = affected server folder names; actions = machine-readable view
+ *   ops (the router's input); calls = the same ops as printable strings
+ *   (dir-view → dirs.refresh, dir-view(counts) → dirs.refreshCounts,
+ *   mails-view(delta) → filters.reconcileOpenFolder, mail-view(uid N) →
+ *   preview.refresh); note = why nothing would be called (null otherwise)
  */
 export function classifyEvent(msg, {account = null, dir = null} = {}) {
-  const verdict = {match: 'mine', slug: null, dirs: [], calls: [], note: null};
+  const verdict = {
+    match: 'mine', slug: null, dirs: [], calls: [], actions: [], note: null
+  };
   if (msg?.type !== 'fs-event') {
     verdict.match = 'other';
     verdict.note = 'not an fs-event';
@@ -150,17 +158,21 @@ export function classifyEvent(msg, {account = null, dir = null} = {}) {
   }
 
   if (dirView) {
+    verdict.actions.push({component: 'dir-view'});
     verdict.calls.push('dir-view');
   }
   if (mailsDelta) {
+    verdict.actions.push({component: 'mails-view', dir});
     verdict.calls.push(`mails-view(delta ${dir})`);
   }
   // the tree's counter sweep rides a light call of its own — the
   // structural dir-view above already re-runs it, so no double entry
   if (!dirView && countDirs.size) {
+    verdict.actions.push({component: 'dir-view', kind: 'counts', dirs: [...countDirs]});
     verdict.calls.push(`dir-view(counts ${[...countDirs].join(', ')})`);
   }
   if (mailUid != null) {
+    verdict.actions.push({component: 'mail-view', uid: mailUid});
     verdict.calls.push(`mail-view(uid ${mailUid})`);
   }
   if (!verdict.calls.length) {
@@ -178,35 +190,92 @@ function toSegs(path) {
   return String(path ?? '').split('/').filter(Boolean);
 }
 
+// ---- the router ------------------------------------------------------------
+
+let calls = null;   // {dirView, dirCounts, mailsDelta, mailView} — injected
+let ctx = () => ({});   // {account, dir} getters, evaluated per event
+
+const timers = {};
+let pendingUids = new Set();
+
+function schedule(key, fn) {
+  if (!timers[key]) {
+    timers[key] = setTimeout(() => {
+      timers[key] = null;
+      fn();
+    }, DELAY_MS);
+    if (key !== 'dirView') {
+      // a long burst (a whole sync run) must not starve the views forever:
+      // force the first scheduled reconcile through after MAX_WAIT_MS
+      timers[key + ':force'] = setTimeout(() => {
+        if (timers[key]) {
+          clearTimeout(timers[key]);
+          timers[key] = null;
+          fn();
+        }
+        clearTimeout(timers[key + ':force']);
+        timers[key + ':force'] = null;
+      }, MAX_WAIT_MS);
+    }
+  }
+}
+
+function route(msg) {
+  const verdict = classifyEvent(msg, ctx());
+  const route_ = msg.dest != null ? `${msg.src} → ${msg.dest}` : String(msg.src ?? '');
+  const who = verdict.match === 'mine' ? 'mine'
+    : verdict.match === 'unselected' ? 'no account selected'
+    : `other account (${verdict.slug ?? '?'})`;
+  console.log(`[fs-event] ${msg.origin ?? '?'} · ${msg.operation} · ${route_} · ${who}` +
+    (verdict.calls.length
+      ? ` · would call: ${verdict.calls.join(', ')}`
+      : ` · none (${verdict.note})`));
+  if (verdict.match !== 'mine' || !calls) {
+    return;
+  }
+  for (const action of verdict.actions) {
+    if (action.component === 'dir-view' && !action.kind) {
+      schedule('dirView', () => calls.dirView?.());
+    }
+    else if (action.component === 'mails-view') {
+      schedule('mails', () => calls.mailsDelta?.());
+    }
+    else if (action.component === 'dir-view') {
+      schedule('counts', () => calls.dirCounts?.());
+    }
+    else if (action.component === 'mail-view') {
+      pendingUids.add(action.uid);
+      schedule('mail', () => {
+        for (const uid of pendingUids) {
+          calls.mailView?.(uid);
+        }
+        pendingUids = new Set();
+      });
+    }
+  }
+}
+
 /**
- * Installs the listener. account/dir are GETTER functions so the verdict
- * always reflects the selection at event time (index.mjs mirrors them
- * from the dir-selected event).
- * @param {{account?: Function, dir?: Function}} getters
+ * Installs the router. account/dir are GETTER functions evaluated per
+ * event (index.mjs mirrors them from the dir-selected event); the calls
+ * object carries the view callables — any entry may be absent, that view
+ * simply never refreshes from events.
+ * @param {{account?: Function, dir?: Function, calls?: {
+ *   dirView?: Function, dirCounts?: Function, mailsDelta?: Function,
+ *   mailView?: Function}}} wiring
  */
-export function init({account, dir} = {}) {
+export function init({account, dir, calls: injected} = {}) {
+  calls = injected ?? null;
+  ctx = () => ({
+    account: typeof account === 'function' ? account() : (account ?? null),
+    dir: typeof dir === 'function' ? dir() : (dir ?? null)
+  });
+  // same-context events (the client's own edits) + the runtime bus
+  // (engine, sync panel, other client windows) — one router for both
+  onFsEvent(route);
   chrome.runtime.onMessage.addListener(msg => {
-    if (msg?.type !== 'fs-event') {
-      return;
+    if (msg?.type === 'fs-event') {
+      route(msg);
     }
-    let ctx;
-    try {
-      ctx = {
-        account: typeof account === 'function' ? account() : (account ?? null),
-        dir: typeof dir === 'function' ? dir() : (dir ?? null)
-      };
-    }
-    catch {
-      ctx = {};
-    }
-    const verdict = classifyEvent(msg, ctx);
-    const route = msg.dest != null ? `${msg.src} → ${msg.dest}` : String(msg.src ?? '');
-    const who = verdict.match === 'mine' ? 'mine'
-      : verdict.match === 'unselected' ? 'no account selected'
-      : `other account (${verdict.slug ?? '?'})`;
-    console.log(`[fs-event] ${msg.origin ?? '?'} · ${msg.operation} · ${route} · ${who}` +
-      (verdict.calls.length
-        ? ` · would call: ${verdict.calls.join(', ')}`
-        : ` · none (${verdict.note})`));
   });
 }

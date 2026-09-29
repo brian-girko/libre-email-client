@@ -3,15 +3,15 @@ import '../components/combo-view.js';
 import './components/logger-view.js';
 import {initTheme} from './theme.mjs';
 import {initFontScale} from './font-scale.mjs';
-import {init as initDirs, load as loadDirs, refresh as refreshDirs} from './dirs.mjs';
+import {init as initDirs, load as loadDirs, refresh as refreshDirs,
+  refreshCounts} from './dirs.mjs';
 import {loadAccounts} from '../sync/client/accounts.mjs';
-import {init as initList, load as loadList, runSearch, clearSearch, isSearching,
-  syncCurrent} from './list.mjs';
-import {init as initPreview} from './preview.mjs';
+import {init as initList, load as loadList, runSearch, clearSearch, isSearching} from './list.mjs';
+import {init as initPreview, refresh as refreshPreview} from './preview.mjs';
 import {init as initAccounts} from './accounts.mjs';
 import {init as initResize} from './resize.mjs';
 import {init as initShortcuts} from './shortcuts.mjs';
-import {initFilters} from './filters.mjs';
+import {initFilters, reconcileOpenFolder} from './filters.mjs';
 import {init as initSyncEvents} from './sync-events.mjs';
 import {subscribe as subscribeLog, setStatus as setLogStatus} from './logger.mjs';
 import {init as initSyncRun, requestSync} from './sync-run.mjs';
@@ -70,24 +70,18 @@ applyPopupSize();
 // one pinned logger line, no interface): "Dir" scopes the run to the selected
 // folder of the selected account, "Account" syncs the whole account, and
 // "Open" just opens the sync client (data/sync/client/index.html) on a new
-// tab without syncing. The selected-account mirror lives further down; the
-// synced callback only reads it from callbacks, long after this module
-// finished evaluating.
+// tab without syncing. The selected-account mirror lives further down
+// (the fs-event router reads it from its getters, long after this module
+// finished evaluating).
 
 const syncDirBtn = document.getElementById('sync-dir');
 const syncAccountBtn = document.getElementById('sync-account');
 const syncOpenBtn = document.getElementById('sync-open');
 
 initSyncRun({
-  prompt: document.getElementById('prompt'),
-  synced: slug => {
-    if (slug === selectedAccount) {
-      // a clean run of the open account: reconcile the open folder in
-      // place (list.mjs' sync — no reload; counters drive the tree
-      // badges, title and favicon from there)
-      syncCurrent();
-    }
-  }
+  prompt: document.getElementById('prompt')
+  // no 'synced' callback: the run's writes land as fs-events and the
+  // router below reconciles the views — one change feed for everything
 });
 
 // first open of the client: if any stored password is encrypted and the
@@ -246,37 +240,41 @@ function currentDirName() {
   return selectedDir;
 }
 
-// the fs-event stream (core/fs.mjs): every mutation broadcast anywhere in
-// the extension is classified against the current account and open dir —
-// print-only for now (fs-events.mjs decides which view components would
-// refresh; wiring those calls is the next step)
-initFsEvents({account: currentAccountId, dir: currentDirName});
+// the fs-event stream (core/fs.mjs) is THE change feed: every mutation —
+// the client's own edits via the same-context echo, every other context's
+// via the runtime bus — is classified against the current account and open
+// dir, then routed (coalesced) onto the views:
+//   dir-view            → dirs.refresh        (folder set changed)
+//   dir-view(counts)    → dirs.refreshCounts  (unread/total moved)
+//   mails-view(delta)   → filters.reconcileOpenFolder (guarded in-place sync)
+//   mail-view(uid N)    → preview.refresh     (open message's file changed)
+initFsEvents({
+  account: currentAccountId,
+  dir: currentDirName,
+  calls: {
+    dirView: refreshDirs,
+    dirCounts: refreshCounts,
+    mailsDelta: reconcileOpenFolder,
+    mailView: uid => refreshPreview(currentAccountId(), uid)
+  }
+});
 
-// sync and filter runs write into the account dir from other pages (the
-// offscreen engine — background syncs and their post-sync INBOX filter
-// pass — and the sync interface's filter row): their 'sync-refresh'
-// broadcast asks every open client instance to update. This one refreshes
-// the selected account's folder tree and reconciles its open folder in
-// place — no reload, search-safe (list.mjs' sync no-ops during search).
+// The old 'sync-refresh' handler is retired: sync and filter runs write
+// through the fs gateway, whose fs-event stream is routed below — deltas
+// per changed dir, not per completed run.
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg?.cmd === 'exists' && msg.type === 'client') {
     respond({ok: true});
     chrome.runtime.sendMessage({cmd: 'focus', type: 'client'});
-    return false;
   }
-  if (msg?.type !== 'sync-refresh' || msg.slug !== selectedAccount) {
-    return false;
-  }
-  refreshDirs();
-  syncCurrent();
   return false;
 });
 
 // document.title: "<dir> [<n> unread] :: <extension name>". Unread comes
 // from the counter store's mirror-confirmed base, re-rendered on every
-// mirror-changed sync, so actions land in the title once their resync brings
-// the local copy up to date; with no folder (or unknown counters) the title
-// falls back to the base.
+// counter reconcile (the fs-event router's dir-view(counts) sweep feeds
+// it), so actions land in the title once their reconcile runs; with no
+// folder (or unknown counters) the title falls back to the base.
 // Same subscription drives the tab badge: the favicon is red when the
 // selected account's INBOX has unread mail and gray otherwise.
 const BASE_TITLE = document.title;

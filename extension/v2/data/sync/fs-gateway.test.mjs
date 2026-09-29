@@ -166,6 +166,7 @@ globalThis.chrome = {
 
 const {prepare} = await import('/core/fs.mjs');
 const {MaildirStore} = await import('/data/sync/maildir.mjs');
+const {onFsEvent} = await import('/core/fs.mjs');
 
 const root = new MockDir(null, 'usb-drive');
 const fs = await prepare('test', {handle: root, fresh: true});
@@ -336,7 +337,7 @@ const ev = (operation, src, dest) =>
 const c = (msg, ctx = CTX) => classifyEvent(msg, ctx);
 
 assert.deepEqual(c(ev('create', 'other/INBOX/cur/x')),
-  {match: 'other', slug: 'other', dirs: [], calls: [], note: 'other account'});
+  {match: 'other', slug: 'other', dirs: [], calls: [], actions: [], note: 'other account'});
 ok('other-account events match nothing');
 
 assert.deepEqual(c(ev('change', 'acc/.sync-state.json')).calls, []);
@@ -390,5 +391,25 @@ const noDir = c(ev('create', `acc/INBOX/cur/${name(7)}`), {account: 'acc', dir: 
 assert.deepEqual(noDir.calls, ['dir-view(counts INBOX)']);
 assert.equal(c(ev('create', 'acc/INBOX'), {account: null, dir: null}).match, 'unselected');
 ok('no open dir still counts; no account selected degrades cleanly');
+
+// ---- 7. machine-readable actions + the same-context echo --------------------
+
+const withActions = c(ev('move', `acc/INBOX/cur/${name(5, ',I=2,S')}`, `acc/Work/cur/${name(5)}`));
+assert.deepEqual(withActions.actions, [
+  {component: 'mails-view', dir: 'INBOX'},
+  {component: 'dir-view', kind: 'counts', dirs: ['INBOX', 'Work']},
+  {component: 'mail-view', uid: 5}
+]);
+ok('actions carry the machine-readable view ops alongside the print strings');
+
+const echoed = [];
+const unecho = onFsEvent(msg => echoed.push(msg));
+await fs.writer.write('echo-probe.txt', 'x');
+assert.deepEqual(echoed, [{type: 'fs-event', origin: 'test', operation: 'create',
+  src: 'echo-probe.txt', dest: null}]);
+unecho();
+await fs.writer.remove('echo-probe.txt', {quiet: true});
+assert.equal(echoed.length, 1);
+ok('gateway echoes same-context events to onFsEvent (unsubscribe works)');
 
 console.log(`fs-gateway.test: all ${n} checks pass`);

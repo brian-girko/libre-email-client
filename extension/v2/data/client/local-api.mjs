@@ -21,9 +21,10 @@
 // data/sync/maildir.mjs): a local change is visible the moment the file
 // rename happens, exactly like the old mirror semantics.
 //
-// Events: mirrorChanged.subscribe(fn) fires {accountId, dirs, syncedAt} after
-// every local mutation (only local edits produce events; there is no engine
-// feed anymore).
+// Events: none. Every mutation is a file operation through the fs gateway
+// (core/fs.mjs), whose fs-event stream — broadcast plus the same-context
+// echo — is the ONE change feed the client's views refresh from
+// (data/client/fs-events.mjs routes it).
 
 import {prepare, joinPath} from '/core/fs.mjs';
 import {
@@ -37,29 +38,6 @@ import postalMime from '/core/parser/postal-mime.mjs';
 
 const HEADER_BYTES = 65536;
 const MAX_META_MESSAGES = 2000; // header-parse cap for one folder read
-
-// ---- mirror change subscription ----------------------------------------------
-
-const listeners = new Set(); // fn({accountId, dirs, syncedAt})
-
-function notifyLocalChange(accountId, dirs) {
-  const evt = {type: 'mirror-changed', accountId, dirs, syncedAt: null};
-  for (const fn of [...listeners]) {
-    try {
-      fn(evt);
-    }
-    catch {
-      /* a broken listener must not break the mirror feed */
-    }
-  }
-}
-
-const mirrorChanged = {
-  subscribe(fn) {
-    listeners.add(fn);
-    return () => listeners.delete(fn);
-  },
-};
 
 // ---- resync reports (worker bookkeeping) -------------------------------------
 //
@@ -461,7 +439,6 @@ async function buildApi(accountId) {
         touchedUids.push(row.uid);
       }
       if (touched) {
-        notifyLocalChange(accountId, [selected]);
         reportEdit({
           accountId,
           uids: touchedUids,
@@ -490,7 +467,6 @@ async function buildApi(accountId) {
         // one server MOVE (never a delete + append)
         await store.moveMessage(selected, row.entry, mailbox, row.uid, {keepFmd5: true});
       }
-      notifyLocalChange(accountId, [selected, mailbox]);
       reportEdit({
         accountId,
         uids: candidates.map(r => r.uid),
@@ -512,7 +488,6 @@ async function buildApi(accountId) {
         const flags = [...row.flags.filter(f => f !== '\\Deleted'), '\\Deleted'];
         await store.renameMessage(selected, row.entry, {flags});
       }
-      notifyLocalChange(accountId, [selected]);
       reportEdit({
         accountId,
         uids: candidates.map(r => r.uid),
@@ -537,7 +512,6 @@ async function buildApi(accountId) {
           purged++;
         }
       }
-      notifyLocalChange(accountId, [selected]);
       reportEdit({
         accountId,
         uids: candidates.map(r => r.uid),
@@ -551,7 +525,6 @@ async function buildApi(accountId) {
         throw new Error('createDir: folder name required');
       }
       await store.folder(name.trim(), {create: true});
-      notifyLocalChange(accountId, [name.trim()]);
       reportEdit({accountId, srcDir: name.trim()});
     },
 
@@ -560,7 +533,6 @@ async function buildApi(accountId) {
         throw new Error('deleteDir: folder name required');
       }
       await removeFolderDir(store, name);
-      notifyLocalChange(accountId, [name]);
       reportEdit({accountId, srcDir: name});
     },
 
@@ -883,4 +855,3 @@ async function bodyFields(store, accountId, row) {
 
 // ---- exports kept for the UI modules --------------------------------------------
 
-export {notifyLocalChange, mirrorChanged};

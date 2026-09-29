@@ -140,4 +140,32 @@ function init(element, listView, dirsView) {
   });
 }
 
-export {init};
+// Re-read one open card — the fs-event router's mail-view call: the
+// message's file was renamed away (a flag rewrite or folder move from
+// another context) or deleted under the open preview. readFile() re-lists
+// the folder per attempt, so the rename is survived; a gone message fails
+// the card ("body not available locally"). A closed card is a no-op.
+async function refresh(accountId, uid) {
+  if (accountId == null || uid == null) {
+    return;
+  }
+  const card = cardFor(uid);
+  if (!card) {
+    return;
+  }
+  try {
+    const api = await getMailApi(accountId);
+    const raw = await api.readFile(uid);
+    if (cardFor(uid) !== card) {
+      return;   // the card closed while the read ran
+    }
+    card.raw = raw;
+  }
+  catch (e) {
+    if (cardFor(uid) === card) {
+      card.fail(e?.message || String(e));
+    }
+  }
+}
+
+export {init, refresh};

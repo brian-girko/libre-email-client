@@ -79,10 +79,33 @@ async function dirAt(root, segs, {create = false} = {}) {
 
 // ------------------------------------------------------------------ events
 
+// Same-context subscribers: sendMessage does NOT deliver to the sender, so
+// a page that mutates through this gateway would never see its own events
+// — the local echo closes that gap (the client's fs-events router relies on
+// it to treat self-edits and external changes identically).
+const localListeners = new Set();
+
+/**
+ * Subscribes to fs-events emitted by THIS context (synchronous, before the
+ * runtime broadcast). @returns {Function} unsubscribe
+ */
+export function onFsEvent(fn) {
+  localListeners.add(fn);
+  return () => localListeners.delete(fn);
+}
+
 function emitFsEvent(origin, operation, src, dest) {
+  const msg = {type: 'fs-event', origin, operation, src, dest: dest ?? null};
+  for (const fn of [...localListeners]) {
+    try {
+      fn(msg);
+    }
+    catch {
+      /* a broken listener must not break the operation's event */
+    }
+  }
   try {
-    chrome.runtime.sendMessage({type: 'fs-event', origin, operation, src, dest: dest ?? null})
-      .catch(() => {});
+    chrome.runtime.sendMessage(msg).catch(() => {});
   }
   catch {
     /* extension context gone (reload/close) — the operation itself still ran */
