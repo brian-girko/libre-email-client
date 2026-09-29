@@ -379,8 +379,8 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
    * Maildirs — the constructor's '/' default is only right for
    * '/'-delimiter servers.
    */
-  async function openStore(root, slug, accountId) {
-    const store = new MaildirStore(root, slug);
+  async function openStore(fs, slug, accountId) {
+    const store = new MaildirStore(fs, slug);
     await store.open();
     const res = await chrome.storage.local.get('sync.delimiter.' + accountId)
       .catch(() => ({}));
@@ -393,11 +393,11 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
 
   async function refreshDirs() {
     const acc = findAccount(syncView.pickedAccount());
-    const root = await getRootHandle().catch(() => null);
+    const fs = await getRootHandle().catch(() => null);
     let names = [];
-    if (acc && root) {
+    if (acc && fs) {
       try {
-        const store = await openStore(root, acc.slug, acc.id);
+        const store = await openStore(fs, acc.slug, acc.id);
         names = (await store.listFolders()).sort((a, b) => a.localeCompare(b));
       }
       catch (e) {
@@ -804,14 +804,14 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       }
       chosen = [filter];
     }
-    const root = await getRootHandle().catch(() => null);
-    if (!root) {
+    const fs = await getRootHandle().catch(() => null);
+    if (!fs) {
       syncView.setStatus('no granted directory — run the picker first');
       return;
     }
     let store = null;
     try {
-      store = await openStore(root, picked.slug, picked.id);
+      store = await openStore(fs, picked.slug, picked.id);
     }
     catch (e) {
       syncView.setStatus('cannot open the local mirror: ' + (e?.message || e));

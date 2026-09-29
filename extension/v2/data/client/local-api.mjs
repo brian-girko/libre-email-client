@@ -25,7 +25,7 @@
 // every local mutation (only local edits produce events; there is no engine
 // feed anymore).
 
-import {boot} from '../sync/disk.mjs';
+import {prepare, joinPath} from '/core/fs.mjs';
 import {
   MaildirStore,
   dirNameFor,
@@ -132,12 +132,13 @@ async function folderRows(store, account, folder) {
 }
 
 // Fill the header-derived fields of the rows. Cap: gigantic folders degrade
-// gracefully (rows without metadata still list and open fine).
-async function withMeta(rows) {
+// gracefully (rows without metadata still list and open fine). The header
+// slices ride the fs gateway (core/fs.mjs) like every other read.
+async function withMeta(rows, store) {
   const slice = rows.slice(0, MAX_META_MESSAGES);
   await Promise.all(slice.map(async row => {
     try {
-      const file = await row.entry.file.getFile();
+      const file = await store.fs.reader.read(row.entry.path);
       const bytes = new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer());
       Object.assign(row, messageMeta(bytes));
     }
@@ -188,7 +189,10 @@ async function readMessage(store, accountId, folder, uid) {
 const apis = new Map(); // accountId -> Promise<api>
 
 export function getRootHandle() {
-  return boot(); // resolves the granted root or redirects to the picker
+  // the client context's fs gateway (core/fs.mjs): resolves the granted
+  // root or bounces to the picker; the facade's .reader/.writer are the
+  // only ways this page touches files
+  return prepare('client');
 }
 
 export async function getLocalApi(accountId) {
@@ -210,8 +214,8 @@ export function dropLocalApi(accountId) {
 }
 
 async function buildApi(accountId) {
-  const root = await getRootHandle();
-  const store = new MaildirStore(root, accountId);
+  const fs = await getRootHandle();
+  const store = new MaildirStore(fs, accountId);
   await store.open();
   let selected = null;
   // single-slot delta cache for listThreadsDelta(): the folder's last read
@@ -273,16 +277,16 @@ async function buildApi(accountId) {
       if (fromUid != null) {
         const lo = Number(fromUid);
         const hi = toUid != null ? Number(toUid) : lo;
-        return summarize(await withMeta(rows.filter(r => r.uid >= lo && r.uid <= hi)));
+        return summarize(await withMeta(rows.filter(r => r.uid >= lo && r.uid <= hi), store));
       }
       const start = page * pageSize;
-      return summarize(await withMeta(rows.slice(start, start + pageSize)));
+      return summarize(await withMeta(rows.slice(start, start + pageSize), store));
     },
 
     async listThreads() {
       if (!selected) throw new Error('openDir() first');
       const {rows} = await folderRows(store, accountId, selected);
-      const threads = groupThreads(await withMeta(rows));
+      const threads = groupThreads(await withMeta(rows, store));
       // seed the delta cache from the full read: the rows are fresh,
       // meta-parsed folderRows shape — the next delta only diffs
       const uidvalidity = Number(await store.readUidValidity(selected)) || 0;
@@ -322,7 +326,7 @@ async function buildApi(accountId) {
           err.code = 'mirror';
           throw err;
         }
-        const rows = await deltaRows(local, selected);
+        const rows = await deltaRows(local, selected, store);
         dirCache = {
           folder: selected,
           uidvalidity,
@@ -376,7 +380,7 @@ async function buildApi(accountId) {
           row.flags = live.get(uid);   // sameSet-reconciled copy
           fresh.push(row);
         }
-        await withMeta(fresh);
+        await withMeta(fresh, store);
         for (const row of fresh) {
           cache.rows.set(row.uid, row);
         }
@@ -573,7 +577,7 @@ async function buildApi(accountId) {
     /** last full-sync stamp of the account's .sync-state.json, ms or null */
     async lastSynced() {
       try {
-        const snap = await loadSnapshot(store.account);
+        const snap = await loadSnapshot(store.fs, store.account);
         const t = Date.parse(snap?.lastSyncAt);
         return Number.isNaN(t) ? null : t;
       }
@@ -629,7 +633,7 @@ function skeletonRow(entry, folder) {
 // shape/semantics as folderRows(): \Deleted gone from the entries,
 // interlopers in (they never trip the \Deleted gate there), meta parsed,
 // newest first.
-async function deltaRows(local, folder) {
+async function deltaRows(local, folder, store) {
   const rows = [];
   for (const entry of local.entries.values()) {
     if (entry.flags.includes('\\Deleted')) {
@@ -641,7 +645,7 @@ async function deltaRows(local, folder) {
     rows.push(skeletonRow(interloper, folder));
   }
   rows.sort((a, b) => b.uid - a.uid);
-  await withMeta(rows);
+  await withMeta(rows, store);
   return rows;
 }
 
@@ -649,7 +653,7 @@ async function deltaRows(local, folder) {
 async function removeFolderDir(store, folder) {
   const direction = dirNameFor(folder);
   try {
-    await store.account.removeEntry(direction, {recursive: true});
+    await store.fs.writer.remove(joinPath(store.account, direction), {recursive: true});
   }
   catch {
     /* gone already */
@@ -678,7 +682,7 @@ async function searchFolders(store, accountId, onlyDir, query, onPage) {
       }
       catch {}
     }
-    for (const row of await withMeta(rows)) {
+    for (const row of await withMeta(rows, store)) {
       if (row.flags.includes('\\Deleted')) {
         continue;
       }
@@ -704,7 +708,7 @@ async function listThreadsFromRows(store, accountId, rows) {
   }
   const out = [];
   for (const [folder, list] of byFolder) {
-    const threads = groupThreads(await withMeta(list));
+    const threads = groupThreads(await withMeta(list, store));
     for (const t of threads) {
       out.push({...t, dir: folder});
     }

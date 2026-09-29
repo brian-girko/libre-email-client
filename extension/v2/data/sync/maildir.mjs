@@ -1,5 +1,8 @@
-// maildir.mjs — the local Maildir store, built directly on the granted
-// FileSystemDirectoryHandle. Layout is flat: one directory per server
+// maildir.mjs — the local Maildir store, built on the fs gateway
+// (core/fs.mjs — the one module that touches the granted storage root; the
+// facade arrives prepared by the host context, so a page and the offscreen
+// share this code but each emits its own origin on every fs-event).
+// Layout is flat: one directory per server
 // folder, directly inside the account dir, with the server's hierarchy
 // delimiter spelled '.' (offlineimap's MaildirPlusPlus naming; chars that
 // would collide are escaped):
@@ -303,61 +306,62 @@ export function parseFilename(name) {
 }
 
 // ------------------------------------------------------------------ dirs
+//
+// All paths are root-relative (core/fs.mjs convention): the "maildir"
+// object below carries PATHS, not handles — {dir, tmp, new, cur} as
+// strings inside the account dir.
 
-async function getDir(parent, name, create) {
+/** the account dir path, created when asked; null when absent */
+export async function accountDir(fs, slug, {create = false} = {}) {
+  const path = String(slug ?? '');
+  if (!path) {
+    throw new Error('accountDir: the account slug is required');
+  }
+  if (create) {
+    await fs.writer.mkdir(path);
+    return path;
+  }
+  return (await fs.reader.exists(path)) ? path : null;
+}
+
+/** existing Maildir triple → its {dir,tmp,new,cur} paths or null */
+export async function maildirOf(fs, dirPath) {
+  const triple = {
+    dir: dirPath,
+    tmp: dirPath + '/tmp',
+    new: dirPath + '/new',
+    cur: dirPath + '/cur'
+  };
+  const found = await Promise.all([
+    fs.reader.exists(triple.tmp),
+    fs.reader.exists(triple.new),
+    fs.reader.exists(triple.cur)
+  ]);
+  return found.every(Boolean) ? triple : null;
+}
+
+/** the {dir,tmp,new,cur} paths for a server folder; optionally created */
+export async function folderDir(fs, accountPath, folder, {create = false, delimiter = '/'} = {}) {
+  const dir = accountPath + '/' + dirNameFor(folder, delimiter);
+  if (create) {
+    await fs.writer.mkdir(dir);
+    const triple = {
+      dir,
+      tmp: dir + '/tmp',
+      new: dir + '/new',
+      cur: dir + '/cur'
+    };
+    await fs.writer.mkdir(triple.tmp);
+    await fs.writer.mkdir(triple.new);
+    await fs.writer.mkdir(triple.cur);
+    return triple;
+  }
+  return maildirOf(fs, dir);
+}
+
+export async function readUidValidity(fs, maildir) {
   try {
-    return await parent.getDirectoryHandle(name, {create: !!create});
-  }
-  catch (e) {
-    if (e?.name === 'NotFoundError' || e?.name === 'TypeMismatchError') {
-      return null;
-    }
-    throw e;
-  }
-}
-
-export async function accountDir(root, slug, {create = false} = {}) {
-  return getDir(root, slug, create);
-}
-
-/** existing directory handle → its {dir,tmp,new,cur} or null */
-export async function maildirOf(dir) {
-  const tmp = await getDir(dir, 'tmp', false);
-  const nw = await getDir(dir, 'new', false);
-  const cur = await getDir(dir, 'cur', false);
-  return tmp && nw && cur ? {dir, tmp, new: nw, cur} : null;
-}
-
-/** walks a flat dir name (no nesting — one getDirectoryHandle call) */
-async function dirAt(account, name, create) {
-  try {
-    return await account.getDirectoryHandle(name, {create: !!create});
-  }
-  catch (e) {
-    if (e?.name === 'NotFoundError' || e?.name === 'TypeMismatchError') {
-      return null;
-    }
-    throw e;
-  }
-}
-
-/** the {dir,tmp,new,cur} handles for a server folder; optionally created */
-export async function folderDir(account, folder, {create = false, delimiter = '/'} = {}) {
-  const dir = await dirAt(account, dirNameFor(folder, delimiter), create);
-  if (!dir && !create) {
-    return null;
-  }
-  const tmp = await getDir(dir, 'tmp', create);
-  const nw = await getDir(dir, 'new', create);
-  const cur = await getDir(dir, 'cur', create);
-  return tmp && nw && cur ? {dir, tmp, new: nw, cur} : null;
-}
-
-export async function readUidValidity(maildir) {
-  try {
-    const fh = await maildir.dir.getFileHandle('.uidvalidity');
-    const text = await (await fh.getFile()).text();
-    const n = Number(text.trim());
+    const n = Number((await fs.reader.readText(maildir.dir + '/.uidvalidity')).trim());
     return Number.isInteger(n) && n > 0 ? n : null;
   }
   catch {
@@ -365,19 +369,13 @@ export async function readUidValidity(maildir) {
   }
 }
 
-export async function writeUidValidity(maildir, uidvalidity) {
-  const fh = await maildir.dir.getFileHandle('.uidvalidity', {create: true});
-  const w = await fh.createWritable();
-  await w.write(String(uidvalidity));
-  await w.close();
+export async function writeUidValidity(fs, maildir, uidvalidity) {
+  await fs.writer.write(maildir.dir + '/.uidvalidity', String(uidvalidity));
 }
 
-export async function clearUidValidity(account, folder, delimiter = '/') {
+export async function clearUidValidity(fs, accountPath, folder, delimiter = '/') {
   try {
-    const dir = await dirAt(account, dirNameFor(folder, delimiter), false);
-    if (dir) {
-      await (await dir.getFileHandle('.uidvalidity')).remove();
-    }
+    await fs.writer.remove(accountPath + '/' + dirNameFor(folder, delimiter) + '/.uidvalidity');
   }
   catch {}
 }
@@ -402,45 +400,61 @@ export async function clearUidValidity(account, folder, delimiter = '/') {
  *   untracked files with the reason (`duplicate-uid`); stranded: files
  *   seen in tmp/ only
  */
-export async function listLocal(maildir, folder) {
+export async function listLocal(fs, maildir, folder) {
   const out = new Map();
   const excluded = [];
   const stranded = [];
   let surrogate = 0;
-  for (const dirEntry of [['new', maildir.new], ['cur', maildir.cur], ['tmp', maildir.tmp]]) {
-    const which = dirEntry[0];
-    const dir = dirEntry[1];
-    // tmp/ is scratch: no tracking, only visibility
-    if (which === 'tmp') {
-      for await (const [name, fh] of dir.entries()) {
-        if (fh.kind !== 'file' || name.startsWith('.')) {
+  for (const which of ['new', 'cur', 'tmp']) {
+    const dirPath = maildir[which];
+    let names;
+    try {
+      names = await fs.reader.list(dirPath);
+    }
+    catch (e) {
+      if (e?.name === 'NotFoundError' || e?.name === 'TypeMismatchError') {
+        continue;
+      }
+      throw e;
+    }
+    for (const {name, kind} of names) {
+      // tmp/ is scratch: no tracking, only visibility
+      if (which === 'tmp') {
+        if (kind !== 'file' || name.startsWith('.')) {
           continue;
         }
         stranded.push({
           fileName: name,
           folder,
           reason: 'in-tmp',
-          file: fh,
+          path: dirPath + '/' + name,
           maildir,
           dir: which
         });
+        continue;
       }
-      continue;
-    }
-    for await (const [name, fh] of dir.entries()) {
       const parsed = parseFilename(name);
+      const entry = {
+        fileName: name,
+        path: dirPath + '/' + name,
+        maildir,
+        fmd5: parsed?.fmd5 ?? null,
+        // star-color keywords are filename-encodable (a..e) — they join the
+        // flags so every consumer (rows, threads, sync classifier) sees one
+        // coherent flag list; foreign single-letter keywords stay in
+        // `keywords` (snapshot-only, never diffed against files)
+        flags: which === 'new'
+          ? []
+          : [...(parsed?.flags ?? []), ...(parsed?.keywords ?? []).filter(k => STAR_KEYWORDS.has(k))],
+        keywords: parsed?.keywords ?? [],
+        dir: which,
+        folder
+      };
       if (!parsed) {
         out.set(-1 - surrogate++, {
-          fileName: name,
-          file: fh,
-          maildir,
+          ...entry,
           uid: null,
-          fmd5: null,
-          flags: [],
-          keywords: [],
-          dir: which,
           unique: null,
-          folder,
           surrogate: true
         });
         continue;
@@ -452,39 +466,17 @@ export async function listLocal(maildir, folder) {
         // this stat (flag rename, relocation) must stay field-complete
         // instead of writing "undefined" parts into the filename.
         excluded.push({
-          fileName: name,
+          ...entry,
           uid: parsed.uid,
           unique: parsed.unique,
-          fmd5: parsed.fmd5,
-          flags: which === 'new'
-            ? []
-            : [...parsed.flags, ...parsed.keywords.filter(k => STAR_KEYWORDS.has(k))],
-          keywords: parsed.keywords,
-          folder,
-          reason: 'duplicate-uid',
-          file: fh,
-          maildir,
-          dir: which
+          reason: 'duplicate-uid'
         });
         continue;
       }
       out.set(parsed.uid, {
-        fileName: name,
-        file: fh,
-        maildir,
+        ...entry,
         uid: parsed.uid,
-        fmd5: parsed.fmd5,
-        // star-color keywords are filename-encodable (a..e) — they join the
-        // flags so every consumer (rows, threads, sync classifier) sees one
-        // coherent flag list; foreign single-letter keywords stay in
-        // `keywords` (snapshot-only, never diffed against files)
-        flags: which === 'new'
-          ? []
-          : [...parsed.flags, ...parsed.keywords.filter(k => STAR_KEYWORDS.has(k))],
-        keywords: parsed.keywords,
-        dir: which,
-        unique: parsed.unique,
-        folder
+        unique: parsed.unique
       });
     }
   }
@@ -501,7 +493,7 @@ export async function listLocal(maildir, folder) {
  * @param {Uint8Array|Blob} raw RFC822 bytes
  * @returns {Promise<{fileName:string}>}
  */
-export async function writeMessage(maildir, folder, uid, flags, raw) {
+export async function writeMessage(fs, maildir, folder, uid, flags, raw) {
   const now = Date.now();
   const unique = uniquePart(now);
   const fmd5 = md5hex(folder);
@@ -509,34 +501,36 @@ export async function writeMessage(maildir, folder, uid, flags, raw) {
   const bare = !letters;
   const name = makeFilename(folder, uid, flags, {unique, fmd5});
   const tmpName = `${name}.tmp-${now}-${seq}`;
-  const fh = await maildir.tmp.getFileHandle(tmpName, {create: true});
-  const w = await fh.createWritable();
+  const tmpPath = maildir.tmp + '/' + tmpName;
   try {
-    await w.write(raw instanceof Blob ? raw : new Blob([raw]));
-    await w.close();
+    // the scratch write is quiet: the ONE user-visible event is the move
+    // into new//cur/ below (a tmp/ leftover never reaches the bus)
+    await fs.writer.write(tmpPath, raw instanceof Blob ? raw : new Blob([raw]), {quiet: true});
   }
   catch (e) {
     try {
-      await fh.remove();
+      await fs.writer.remove(tmpPath, {quiet: true});
     }
     catch {}
     throw e;
   }
   const finalName = bare ? name.replace(/,I=2,$/, '') : name;
-  const dest = bare ? maildir.new : maildir.cur;
-  await fh.move(dest, finalName);
+  const destPath = (bare ? maildir.new : maildir.cur) + '/' + finalName;
+  await fs.writer.move(tmpPath, destPath);
   return {fileName: finalName};
 }
 
 /**
  * Renames a message within one Maildir — how flag changes and a corrected
  * UID are recorded. cur/ messages stay in cur/ even at zero letters.
- * @param {FileSystemFileHandle} file
- * @param {object} entry listLocal() entry ({file, fileName, uid, flags, dir, unique, folder})
+ * @param {object} fs an fs gateway facade
+ * @param {object} maildir folderDir() paths of the CURRENT folder
+ * @param {object} entry listLocal() entry ({path, fileName, uid, flags, dir,
+ *   unique, folder, ...})
  * @param {{uid?: number, flags?: string[], unique?: string}} patch
  * @returns {Promise<string>} new filename
  */
-export async function renameFile(file, entry, patch, maildir) {
+export async function renameFile(fs, maildir, entry, patch) {
   const flags = patch.flags ?? entry.flags;
   const uid = patch.uid ?? entry.uid;
   const unique = patch.unique ?? entry.unique;
@@ -548,9 +542,9 @@ export async function renameFile(file, entry, patch, maildir) {
   const name = toCur
     ? `${unique},U=${uid},FMD5=${fmd5},I=2,${flagsToLetters(flags)}`
     : `${unique},U=${uid},FMD5=${fmd5}`;
-  const destDir = toCur ? maildir.cur : maildir.new;
   if (name !== entry.fileName) {
-    await file.move(destDir, name);
+    const destPath = (toCur ? maildir.cur : maildir.new) + '/' + name;
+    await fs.writer.move(entry.path, destPath);
   }
   return name;
 }
@@ -571,22 +565,37 @@ export async function renameFile(file, entry, patch, maildir) {
  * @param {{keepFmd5?: boolean}} [options] keep the source FMD5 marker
  * @returns {Promise<string>} new filename
  */
-export async function moveBetweenFolders(file, entry, dstMaildir, dstFolder, uid, {keepFmd5 = false} = {}) {
+/**
+ * Moves a message file into another folder's Maildir. By default the file
+ * is stamped with the destination folder's FMD5 and the uid the server
+ * assigned over there (server-directed relocation). With {keepFmd5: true}
+ * the source file's own FMD5 survives the rename instead: the file then
+ * sits in the destination as an interloper — offlineimap's marker for a
+ * locally moved message that has not been confirmed server-side yet and
+ * must replay as a server MOVE at the next sync.
+ * @param {object} fs an fs gateway facade
+ * @param {object} entry source listLocal() entry (carries its own path)
+ * @param {object} dstMaildir folderDir() paths of the destination
+ * @param {string} dstFolder destination server folder name
+ * @param {number} uid the message's UID in the destination
+ * @param {{keepFmd5?: boolean}} [options] keep the source FMD5 marker
+ * @returns {Promise<string>} new filename
+ */
+export async function moveBetweenFolders(fs, entry, dstMaildir, dstFolder, uid, {keepFmd5 = false} = {}) {
   const letters = flagsToLetters(entry.flags);
   const fmd5 = keepFmd5 ? (entry.fmd5 ?? md5hex(dstFolder)) : md5hex(dstFolder);
   const name = letters
     ? `${entry.unique},U=${uid},FMD5=${fmd5},I=2,${letters}`
     : `${entry.unique},U=${uid},FMD5=${fmd5}`;
-  const dest = letters ? dstMaildir.cur : dstMaildir.new;
-  await file.move(dest, name);
+  const destPath = (letters ? dstMaildir.cur : dstMaildir.new) + '/' + name;
+  await fs.writer.move(entry.path, destPath);
   return name;
 }
 
 /** deletes one message file; a missing file is not an error */
-export async function removeMessage(file) {
+export async function removeMessage(fs, entry) {
   try {
-    await file.remove();
-    return true;
+    return await fs.writer.remove(entry.path);
   }
   catch {
     return false;
@@ -598,15 +607,27 @@ export async function removeMessage(file) {
  * the .uidvalidity file survive; callers decide whether that marker stays.
  * @returns {Promise<number>} files removed
  */
-export async function wipeFolder(maildir) {
+export async function wipeFolder(fs, maildir) {
   let n = 0;
-  for (const dir of [maildir.tmp, maildir.new, maildir.cur]) {
-    for await (const [, fh] of dir.entries()) {
-      if (fh.kind === 'file') {
-        if (await removeMessage(fh)) {
+  for (const which of ['tmp', 'new', 'cur']) {
+    const dirPath = maildir[which];
+    let names;
+    try {
+      names = await fs.reader.list(dirPath);
+    }
+    catch {
+      continue;
+    }
+    for (const {name, kind} of names) {
+      if (kind !== 'file') {
+        continue;
+      }
+      try {
+        if (await fs.writer.remove(dirPath + '/' + name)) {
           n++;
         }
       }
+      catch {}
     }
   }
   return n;
@@ -616,38 +637,38 @@ export async function wipeFolder(maildir) {
 
 /**
  * The one object the sync engine talks to — account-rooted convenience over
- * the low-level helpers above.
+ * the low-level helpers above. Everything runs through the fs gateway
+ * facade the host context prepared (core/fs.mjs): `account` is the
+ * account dir's ROOT-RELATIVE PATH (the gateway never hands out handles),
+ * and every mutation emits an fs-event carrying the host's origin.
  */
 const PREFS_FILE = '.sync-prefs.json';
 
-/**
- * The one object the sync engine talks to — account-rooted convenience over
- * the low-level helpers above.
- */
 export class MaildirStore {
-  constructor(root, slug) {
-    this.root = root;
+  constructor(fs, slug) {
+    this.fs = fs;          // {reader, writer} — the prepare() facade
     this.slug = slug;
-    this.account = null;
-    this.delimiter = '/';   // server delimiter; the engine refreshes per survey
+    this.account = slug;   // account dir path, root-relative (open() confirms it)
+    this.delimiter = '/';  // server delimiter; the engine refreshes per survey
   }
 
   async open() {
-    this.account = await accountDir(this.root, this.slug, {create: true});
-    if (!this.account) {
+    const dir = await accountDir(this.fs, this.slug, {create: true});
+    if (!dir) {
       throw new Error(`cannot open account directory "${this.slug}"`);
     }
-    return this.account;
+    this.account = dir;
+    return dir;
   }
 
   /** last-known-good server view; the sync engine's "K" */
   async loadState() {
-    return loadSnapshot(this.account);
+    return loadSnapshot(this.fs, this.account);
   }
 
   /** complete rewrite of .sync-state.json (saveSnapshot stamps lastSyncAt) */
   async saveState(snapshot) {
-    return saveSnapshot(this.account, snapshot);
+    return saveSnapshot(this.fs, this.account, snapshot);
   }
 
   /**
@@ -657,8 +678,7 @@ export class MaildirStore {
    */
   async loadPrefs() {
     try {
-      const fh = await this.account.getFileHandle(PREFS_FILE);
-      const prefs = JSON.parse(await (await fh.getFile()).text());
+      const prefs = JSON.parse(await this.fs.reader.readText(this.account + '/' + PREFS_FILE));
       return prefs && typeof prefs === 'object' ? prefs : {};
     }
     catch {
@@ -668,16 +688,13 @@ export class MaildirStore {
 
   /** merges + persists preferences; called after every answered decision */
   async savePrefs(prefs) {
-    const fh = await this.account.getFileHandle(PREFS_FILE, {create: true});
-    const w = await fh.createWritable();
-    await w.write(JSON.stringify(prefs ?? {}, null, 1));
-    await w.close();
+    await this.fs.writer.write(this.account + '/' + PREFS_FILE, JSON.stringify(prefs ?? {}, null, 1));
     return prefs;
   }
 
-  /** {dir,tmp,new,cur} handles, created on demand */
+  /** {dir,tmp,new,cur} paths, created on demand */
   async folder(folder, {create = true} = {}) {
-    return folderDir(this.account, folder, {create, delimiter: this.delimiter});
+    return folderDir(this.fs, this.account, folder, {create, delimiter: this.delimiter});
   }
 
   /**
@@ -686,15 +703,15 @@ export class MaildirStore {
    *  - interlopers: files whose FMD5 names another folder (candidate moves)
    *  - untracked:   files with no FMD5 at all (some other tool's mail)
    *  - excluded:    kept on disk but untracked, with the reason
-   * @returns {null | {entries: Map<number,Meta>, untracked: Meta[],
-   *            interlopers: Meta[], excluded: Meta[]}}
+   * @returns {Promise<null | {entries: Map<number,Meta>, untracked: Meta[],
+   *            interlopers: Meta[], excluded: Meta[]}>}
    */
   async listLocal(folder) {
     const maildir = await this.folder(folder, {create: false});
     if (!maildir) {
       return null;
     }
-    const {messages, excluded, stranded} = await listLocal(maildir, folder);
+    const {messages, excluded, stranded} = await listLocal(this.fs, maildir, folder);
     const own = md5hex(folder);
     const entries = new Map();
     const untracked = [];
@@ -720,9 +737,12 @@ export class MaildirStore {
    */
   async listFolders() {
     const out = [];
-    for await (const [name, handle] of this.account.entries()) {
-      if (handle.kind === 'directory' && (await maildirOf(handle))) {
-        out.push(folderFor(name, this.delimiter));
+    for (const entry of await this.fs.reader.list(this.account)) {
+      if (entry.kind !== 'directory') {
+        continue;
+      }
+      if (await maildirOf(this.fs, this.account + '/' + entry.name)) {
+        out.push(folderFor(entry.name, this.delimiter));
       }
     }
     return out;
@@ -731,7 +751,7 @@ export class MaildirStore {
   /** delivers raw bytes; the message lands in new/ or cur/ by flags */
   async writeMessage(folder, uid, flags, raw) {
     const maildir = await this.folder(folder, {create: true});
-    return writeMessage(maildir, folder, uid, flags, raw);
+    return writeMessage(this.fs, maildir, folder, uid, flags, raw);
   }
 
   /**
@@ -741,7 +761,7 @@ export class MaildirStore {
    */
   async renameMessage(folder, entry, patch = {}) {
     const maildir = entry.maildir ?? (await this.folder(folder, {create: true}));
-    return renameFile(entry.file, entry, patch, maildir);
+    return renameFile(this.fs, maildir, entry, patch);
   }
 
   /**
@@ -754,97 +774,84 @@ export class MaildirStore {
    */
   async moveMessage(srcFolder, entry, dstFolder, uid, {keepFmd5 = false} = {}) {
     const dst = await this.folder(dstFolder, {create: true});
-    return moveBetweenFolders(entry.file, entry, dst, dstFolder, uid ?? entry.uid, {keepFmd5});
+    return moveBetweenFolders(this.fs, entry, dst, dstFolder, uid ?? entry.uid, {keepFmd5});
   }
 
   /** removes one local file; missing files succeed silently */
   async removeMessage(entry) {
-    return removeMessage(entry.file);
+    return removeMessage(this.fs, entry);
   }
 
   /**
    * Removes one local Maildir entirely (the sync engine's `dropLocal` op):
    * message files, the .uidvalidity marker, tmp/new/cur and the dir itself.
-   * `removeEntry(name, {recursive: true})` on the PARENT (the account dir)
-   * is the spec-backed path; builds lacking the recursive flag fall back to
-   * a manual sweep. A dir that is not there is a successful no-op.
+   * `removeEntry(name, {recursive: true})` on the PARENT (the spec-backed
+   * path) rides the gateway's remove(); a manual bottom-up sweep is the
+   * fallback for builds lacking the recursive flag. A dir that is not
+   * there is a successful no-op.
    * @param {string} folder server folder name
    * @returns {Promise<{removed: boolean, files: number}>} files = mail files
    *   the sweep actually deleted (informational, best effort)
    */
   async removeFolder(folder) {
-    const name = dirNameFor(folder, this.delimiter);
-    let dir = null;
-    try {
-      dir = await dirAt(this.account, name, false);
-    }
-    catch (e) {
-      if (e?.name === 'NotFoundError' || e?.name === 'TypeMismatchError') {
-        return {removed: false, files: 0};
-      }
-      throw e;
-    }
-    if (!dir) {
+    const dirPath = this.account + '/' + dirNameFor(folder, this.delimiter);
+    if (!await this.fs.reader.exists(dirPath)) {
       return {removed: false, files: 0};
     }
-    const maildir = await maildirOf(dir);
+    const maildir = await maildirOf(this.fs, dirPath);
     let files = 0;
     if (maildir) {
-      files += await wipeFolder(maildir);
+      files += await wipeFolder(this.fs, maildir);
     }
     try {
-      await this.account.removeEntry(name, {recursive: true});
-      return {removed: true, files};
+      if (await this.fs.writer.remove(dirPath, {recursive: true})) {
+        return {removed: true, files};
+      }
     }
     catch {}
     // fallback for builds without the recursive flag: strip the children
-    // bottom-up, then try again non-recursively
+    // bottom-up, then try again — plain first, recursive as a last resort
     if (maildir) {
-      files += await wipeFolder(maildir); // second pass catches stragglers
-      for (const sub of [maildir.tmp, maildir.new, maildir.cur]) {
-        for await (const [childName, child] of sub.entries()) {
-          if (child.kind === 'file') {
-            try {
-              await child.remove();
-            }
-            catch {}
-          }
-          else {
-            try {
-              await sub.removeEntry(childName, {recursive: true});
-            }
-            catch {}
-          }
-        }
-        try {
-          await dir.removeEntry(sub === maildir.tmp ? 'tmp' : sub === maildir.new ? 'new' : 'cur');
-        }
-        catch {}
-      }
+      files += await wipeFolder(this.fs, maildir); // second pass catches stragglers
     }
-    for await (const [childName, child] of dir.entries()) {
-      if (child.kind === 'file') {
-        try {
-          await child.remove();
-          files++;
-        }
-        catch {}
+    const killTree = async path => {
+      let names = [];
+      try {
+        names = await this.fs.reader.list(path);
       }
-      else {
-        try {
-          await dir.removeEntry(childName, {recursive: true});
-        }
-        catch {}
+      catch {
+        return;
       }
-    }
+      for (const {name: child, kind} of names) {
+        const childPath = path + '/' + child;
+        if (kind === 'file') {
+          try {
+            if (await this.fs.writer.remove(childPath)) {
+              files++;
+            }
+          }
+          catch {}
+        }
+        else {
+          await killTree(childPath);
+          try {
+            await this.fs.writer.remove(childPath);
+          }
+          catch {}
+        }
+      }
+    };
+    await killTree(dirPath);
     try {
-      await this.account.removeEntry(name);
-      return {removed: true, files};
+      if (await this.fs.writer.remove(dirPath)) {
+        return {removed: true, files};
+      }
     }
     catch {}
     try {
-      await this.account.removeEntry(name, {recursive: true});
-      return {removed: true, files};
+      if (await this.fs.writer.remove(dirPath, {recursive: true})) {
+        return {removed: true, files};
+      }
     }
     catch {}
     return {removed: false, files};
@@ -853,13 +860,14 @@ export class MaildirStore {
   /** removes all message files of one folder (resync) */
   async wipe(folder) {
     const maildir = await this.folder(folder, {create: true});
-    return wipeFolder(maildir);
+    return wipeFolder(this.fs, maildir);
   }
 
   /** byte size of a message file, null when gone */
   async fileSize(entry) {
     try {
-      return (await entry.file.getFile()).size;
+      const st = await this.fs.reader.stat(entry.path);
+      return st.exists && st.kind === 'file' ? st.size : null;
     }
     catch {
       return null;
@@ -868,80 +876,87 @@ export class MaildirStore {
 
   /** RFC822 bytes of one local message (also reads untracked user droppings) */
   async readFile(entry) {
-    const file = await entry.file.getFile();
+    const file = await this.fs.reader.read(entry.path);
     return new Uint8Array(await file.arrayBuffer());
   }
 
   async readUidValidity(folder) {
     const maildir = await this.folder(folder, {create: false});
-    return maildir ? readUidValidity(maildir) : null;
+    return maildir ? readUidValidity(this.fs, maildir) : null;
   }
 
   async writeUidValidity(folder, uidvalidity) {
     const maildir = await this.folder(folder, {create: true});
-    await writeUidValidity(maildir, uidvalidity);
+    await writeUidValidity(this.fs, maildir, uidvalidity);
   }
 
   /** deletes the stale .uidvalidity marker (folder about to be re-created) */
   async clearUidValidity(folder, delimiter = this.delimiter) {
-    await clearUidValidity(this.account, folder, delimiter);
+    await clearUidValidity(this.fs, this.account, folder, delimiter);
   }
 
   /**
    * Discards the pulled local copy of this account: every Maildir, the
    * .uidvalidity markers and the snapshot are gone — the whole account dir
-   * itself is removed from the root. Uses removeEntry({recursive}) on the
-   * PARENT handle (the spec-backed way); a manual deep sweep is the fallback
-   * for builds lacking the recursive flag. Does NOT re-create the dir — the
-   * next sync's open() brings it back fresh.
+   * itself is removed from the root. The gateway's recursive remove() is
+   * the spec-backed way; a manual deep sweep is the fallback for builds
+   * lacking the recursive flag. Does NOT re-create the dir — the next
+   * sync's open() brings it back fresh.
    * @returns {Promise<number>} top-level entries visibly freed
    */
   async reset() {
     let cleaned = 0;
     try {
-      await this.root.removeEntry(this.slug, {recursive: true});
-      this.account = null;
-      return cleaned + 1;
+      if (await this.fs.writer.remove(this.slug, {recursive: true})) {
+        this.account = null;
+        return 1;
+      }
     }
     catch {}
-    const kill = async (parent, name, handle, recursive) => {
+    const kill = async path => {
       try {
-        await parent.removeEntry(name, {recursive: !!recursive});
-        return true;
+        return await this.fs.writer.remove(path, {recursive: true});
       }
       catch {}
-      if (handle.kind === 'directory') {
-        for await (const [childName, child] of handle.entries()) {
-          await kill(handle, childName, child, true);
-        }
-        try {
-          await parent.removeEntry(name, {recursive: true});
-          return true;
-        }
-        catch {}
-        try {
-          await parent.removeEntry(name);
-          return true;
-        }
-        catch {}
+      let names = [];
+      try {
+        names = await this.fs.reader.list(path);
       }
-      else {
-        try {
-          await handle.remove();
-          return true;
-        }
-        catch {}
+      catch {
+        return false;
       }
-      return false;
+      let ok = true;
+      for (const {name, kind} of names) {
+        const childPath = path + '/' + name;
+        ok = (kind === 'file'
+          ? await this.fs.writer.remove(childPath).catch(() => false)
+          : await kill(childPath)) && ok;
+      }
+      if (!ok) {
+        return false;
+      }
+      try {
+        return await this.fs.writer.remove(path);
+      }
+      catch {
+        return false;
+      }
     };
-    for await (const [name, handle] of this.account.entries()) {
-      if (await kill(this.account, name, handle, true)) {
-        cleaned++;
+    const accountPath = this.account ?? this.slug;
+    try {
+      for (const {name, kind} of await this.fs.reader.list(accountPath)) {
+        if (kind === 'file'
+          ? await this.fs.writer.remove(accountPath + '/' + name).catch(() => false)
+          : await kill(accountPath + '/' + name)) {
+          cleaned++;
+        }
       }
     }
+    catch {}
     try {
-      await this.root.removeEntry(this.slug, {recursive: true});
-      this.account = null;
+      if (await this.fs.writer.remove(this.slug, {recursive: true})) {
+        this.account = null;
+      }
     }
     catch {}
     return cleaned;

@@ -16,7 +16,10 @@ data/sync/
                    the offscreen, boot() stays the visible-page gate); root
                    handle plumbing lives in root-handle.mjs (opfs default or
                    the picker-persisted external directory)
-  maildir.mjs    ← Maildir store on the granted root handle (shared layer)
+  maildir.mjs    ← Maildir store on the fs gateway (shared layer; the
+                   facade comes from /core/fs.mjs — THE module that touches
+                   handles; every mutation emits an fs-event tagged with the
+                   caller's prepare() origin)
   snapshot.mjs   ← .sync-state.json (uid → msgid/flags last-good view)
   offscreen/     ← the sync engine, running inside the SHARED offscreen
                     host document (/offscreen/index.html, manager.mjs);

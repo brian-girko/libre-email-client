@@ -76,7 +76,7 @@
 'use strict';
 
 import {createClient} from './client.mjs';
-import {bootSilent} from '../disk.mjs';
+import {prepare} from '/core/fs.mjs';
 import {MaildirStore} from '../maildir.mjs';
 import {createSync} from './sync.mjs';
 import {runAllFilters} from '../filters/run.mjs';
@@ -581,7 +581,10 @@ function rechecking() {
 }
 
 async function recheckHandle() {
-  const gate = await bootSilent();
+  // fresh per session: the per-origin cache would pin a stale verdict, and
+  // the verdict fields (raw/reason) keep feeding the log line below
+  const fs = await prepare('offscreen', {silent: true, fresh: true});
+  const gate = fs.gate;
   // diagnosis channel: failures always log; granted only ever logs once
   if (!gate.ok || !pristineGrantLogged) {
     engineLog('sync',
@@ -590,7 +593,7 @@ async function recheckHandle() {
     );
     pristineGrantLogged = gate.ok;
   }
-  return gate;
+  return fs;
 }
 
 // ---------------------------------------------------------------- runs
@@ -793,7 +796,8 @@ async function withSession(job) {
     // the stored gate preferences ride in the job: the headless defaults
     // follow them until this session ends (the last job's prefs stand)
     gatePrefs = job.prefs || {purge: null, drop: null};
-    const gate = await recheckHandle();
+    const fs = await recheckHandle();
+    const gate = fs.gate;
     access = {
       granted: gate.ok,
       reason: gate.ok ? null : (gate.reason ?? 'undetermined'),
@@ -811,9 +815,7 @@ async function withSession(job) {
       );
       return {started: false, reason: gate.reason};
     }
-    const rootHandle = gate.handle;
-    account = job.account;
-    const only = job.kind.endsWith('-dir') ? job.dir : undefined;
+    account = job.account;    const only = job.kind.endsWith('-dir') ? job.dir : undefined;
     const dirsNote = (job.kind === 'sync-dirs' || job.kind === 'dry-dirs')
       ? ` · ${describeDirs(job.dirs)}`
       : '';
@@ -851,7 +853,7 @@ async function withSession(job) {
       slug: account.slug,
       bridgeUrl: bridgeRes.url
     });
-    store = new MaildirStore(rootHandle, account.slug);
+    store = new MaildirStore(fs, account.slug);
     await store.open();
     if (job.kind === 'discard') {
       engineLog('discard', 'wiping the local copy…');

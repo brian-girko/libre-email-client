@@ -28,7 +28,7 @@
 
 'use strict';
 
-import {bootSilent} from '../sync/disk.mjs';
+import {prepare} from '/core/fs.mjs';
 import {
   accountDir,
   maildirOf,
@@ -141,13 +141,13 @@ function outsideWindow(meta, maxAgeAt) {
 // ---------------------------------------------------------------- scanner
 
 /** Every local Maildir of an account, as server folder names. */
-async function accountFolders(account) {
+async function accountFolders(fs, accountPath) {
   const out = [];
-  for await (const [name, handle] of account.entries()) {
-    if (handle.kind === 'directory') {
-      const md = await maildirOf(handle);
+  for (const entry of await fs.reader.list(accountPath)) {
+    if (entry.kind === 'directory') {
+      const md = await maildirOf(fs, accountPath + '/' + entry.name);
       if (md) {
-        out.push(folderFor(name, '/'));
+        out.push(folderFor(entry.name, '/'));
       }
     }
   }
@@ -172,15 +172,15 @@ function isLiveUnread(entry) {
  * `more` is the remainder (also set when the header budget ran dry, since
  * those candidates count but cannot show a subject).
  */
-async function countAccount(root, spec, maxAgeAt) {
-  const account = await accountDir(root, spec.slug, {create: false});
+async function countAccount(fs, spec, maxAgeAt) {
+  const account = await accountDir(fs, spec.slug, {create: false});
   if (!account) {
     return {count: 0, scanned: 0, subjects: [], more: 0,
       detail: 'no local copy synced yet', error: null, hasMaildir: false};
   }
   const folderSel = String(spec.folder ?? '').trim() || 'INBOX';
   const folders = spec.mode === 'query'
-    ? (await accountFolders(account))
+    ? (await accountFolders(fs, account))
     : [folderSel];
   if (spec.mode === 'query') {
     folders.sort((a, b) => (a === 'INBOX' ? -1 : b === 'INBOX' ? 1 : 0));
@@ -192,11 +192,11 @@ async function countAccount(root, spec, maxAgeAt) {
   let scanned = 0;
   let remaining = false;   // budget dry / list cap: count kept, subject not shown
   for (const folder of folders) {
-    const md = await folderDir(account, folder, {create: false, delimiter: '/'});
+    const md = await folderDir(fs, account, folder, {create: false, delimiter: '/'});
     if (!md) {
       continue;
     }
-    const local = await listLocal(md, folder);
+    const local = await listLocal(fs, md, folder);
     for (const entry of local.messages.values()) {
       if (!isLiveUnread(entry)) {
         continue;
@@ -210,10 +210,10 @@ async function countAccount(root, spec, maxAgeAt) {
         }
         // the common path reads its slice now, for the subject line
         budget.left--;
-        const fh = await entry.file.getFile().catch(() => null);
-        if (fh) {
+        const file = await fs.reader.read(entry.path).catch(() => null);
+        if (file) {
           const meta = messageMeta(new Uint8Array(
-            await fh.slice(0, HEADER_BYTES).arrayBuffer()));
+            await file.slice(0, HEADER_BYTES).arrayBuffer()));
           subjects.add(meta.subject ?? '');
         }
         continue;
@@ -227,12 +227,12 @@ async function countAccount(root, spec, maxAgeAt) {
         continue;
       }
       budget.left--;
-      const fh = await entry.file.getFile().catch(() => null);
-      if (!fh) {
+      const file = await fs.reader.read(entry.path).catch(() => null);
+      if (!file) {
         continue;   // renamed away mid-scan (flag race), not unknown truth
       }
       const meta = messageMeta(new Uint8Array(
-        await fh.slice(0, HEADER_BYTES).arrayBuffer()));
+        await file.slice(0, HEADER_BYTES).arrayBuffer()));
       if (terms) {
         if (!matchUnread(entry.flags ?? [], meta, terms)) {
           continue;
@@ -277,8 +277,9 @@ async function handle(msg) {
     accounts: []
   };
   try {
-    const verdict = await bootSilent();
-    if (!verdict.ok || !(verdict.handle instanceof FileSystemDirectoryHandle)) {
+    const fs = await prepare('offscreen', {silent: true});
+    const verdict = fs.gate;
+    if (!verdict.ok) {
       // a lapsed pick or a failing gate: nothing can be read. Report the
       // condition on every account (the sync engine narrates the same
       // verdicts over its own log channel).
@@ -315,7 +316,7 @@ async function handle(msg) {
           lastSyncAt: spec.lastSyncAt ?? null
         };
         try {
-          const r = await countAccount(verdict.handle, spec, maxAgeAt);
+          const r = await countAccount(fs, spec, maxAgeAt);
           entry.count = r.count;
           entry.detail = r.detail;
           entry.hasMaildir = r.hasMaildir !== false;

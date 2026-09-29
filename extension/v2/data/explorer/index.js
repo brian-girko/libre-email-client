@@ -18,6 +18,7 @@
 'use strict';
 
 import {initTheme} from '/data/client/theme.mjs';
+import {prepare, joinPath} from '/core/fs.mjs';
 import {
   MODE_EXTERNAL,
   getStorageMode,
@@ -61,10 +62,12 @@ function iconSpan(svg) {
   return icon;
 }
 
-// The current traversal state: an array of directory handles from the root
-// to the displayed directory, plus the display name of the root.
+// The current traversal state: the directory NAMES from the root to the
+// displayed directory (the fs gateway works on root-relative paths; ''
+// is the root itself), plus the display name of the root.
+let fs = null;   // the context's fs gateway facade (core/fs.mjs)
 let rootName = '';
-let path = []; // [dirHandle, ...], empty = root itself
+let path = []; // ['', 'sub', ...] — segment names, empty = root itself
 
 // Selection state: names of the selected entries within the current
 // directory, the listed entries themselves, and the shift-range anchor.
@@ -160,8 +163,13 @@ function start({handle, name}) {
   gate.hidden = true;
   shell.hidden = false;
   rootName = name;
-  path = [handle];
-  render();
+  path = [];
+  // the gate verified this exact handle — the gateway wraps it fresh (the
+  // cache must not pin a facade from a previous grant cycle)
+  prepare('explorer', {handle, fresh: true}).then(facade => {
+    fs = facade;
+    render();
+  }).catch(e => showGate('Storage init failed: ' + e2msg(e), false));
 }
 
 grantBtn.addEventListener('click', async () => {
@@ -187,28 +195,25 @@ grantBtn.addEventListener('click', async () => {
 
 // ---- write access ----------------------------------------------------------
 //
-// Deleting, renaming, importing and creating folders need readwrite. OPFS
-// grants it implicitly; for an external directory the browser prompt fires
-// from the toolbar gesture that triggered the action.
+// Deleting, renaming, importing and creating folders need readwrite. The
+// lazy upgrade lives on the gateway's writer (core/fs.mjs): OPFS grants
+// it implicitly; for an external directory the browser prompt fires from
+// the toolbar gesture that triggered the action.
 
 async function ensureWriteAccess() {
-  if (await getStorageMode() !== MODE_EXTERNAL) {
-    return true;
-  }
-  const {handle} = await ownedRootHandle();
-  if (!handle) {
+  // the facade is up the moment start() rendered; a click racing the
+  // resolution is simply refused (same surface as a denied permission)
+  if (!fs) {
     return false;
   }
-  if (await handle.queryPermission({mode: 'readwrite'}) === 'granted') {
-    return true;
-  }
-  return await handle.requestPermission({mode: 'readwrite'}) === 'granted';
+  return fs.writer.ensureWriteAccess();
 }
 
 // ---- the listing -----------------------------------------------------------
 
-function currentDir() {
-  return path[path.length - 1];
+/** root-relative path of the displayed directory ('' = the root) */
+function currentDirPath() {
+  return path.join('/');
 }
 
 function currentName() {
@@ -234,11 +239,11 @@ function renderBreadcrumb() {
     if (i === path.length - 1) {
       const here = document.createElement('span');
       here.className = 'here';
-      here.textContent = i === 0 ? currentName() : path[i].name;
+      here.textContent = i === 0 ? currentName() : path[i];
       breadcrumb.append(here);
       continue;
     }
-    const label = i === 0 ? currentName() : path[i].name;
+    const label = i === 0 ? currentName() : path[i];
     const crumb = document.createElement('button');
     crumb.type = 'button';
     crumb.textContent = label;
@@ -301,7 +306,7 @@ function rangeSelect(entry) {
 
 function enterDirectory(entry) {
   resetSelection();
-  path = [...path, entry.handle];
+  path = [...path, entry.name];
   render();
 }
 
@@ -341,11 +346,11 @@ function onRowKeydown(entry, e) {
 
 async function listCurrent() {
   const entries = [];
-  for await (const entry of currentDir().values()) {
+  for (const entry of await fs.reader.list(currentDirPath())) {
     if (entry.name.startsWith('.')) {
       continue; // the tree's own probes and flags are not the user's files
     }
-    entries.push({name: entry.name, kind: entry.kind, handle: entry});
+    entries.push({name: entry.name, kind: entry.kind});
   }
   entries.sort((a, b) => {
     if (a.kind !== b.kind) {
@@ -410,12 +415,12 @@ function renderRows(entries) {
   }
 }
 
-// Sizes load lazily per row: OPFS lists can be huge and getFile() is a real
-// syscall per file.
+// Sizes load lazily per row: OPFS lists can be huge and every stat is a
+// real syscall.
 async function sizeTextLater(entry, node) {
   try {
-    const file = await entry.handle.getFile();
-    node.textContent = sizeText(file.size);
+    const st = await fs.reader.stat(joinPath(currentDirPath(), entry.name));
+    node.textContent = st.exists && st.kind === 'file' ? sizeText(st.size) : '';
   }
   catch {
     node.textContent = '';
@@ -474,11 +479,10 @@ async function deleteSelected() {
   if (!confirmList(names, 'Delete ' + (names.length > 1 ? names.length + ' items?' : '“' + names[0] + '”?') + ' This cannot be undone.')) {
     return;
   }
-  const dir = currentDir();
   let failed = 0;
   for (const entry of entries) {
     try {
-      await dir.removeEntry(entry.name, {recursive: true});
+      await fs.writer.remove(joinPath(currentDirPath(), entry.name), {recursive: true});
       selection.delete(entry.name);
     }
     catch (e) {
@@ -495,7 +499,7 @@ async function deleteSelected() {
 
 async function downloadEntry(entry) {
   try {
-    const file = await entry.handle.getFile();
+    const file = await fs.reader.read(joinPath(currentDirPath(), entry.name));
     const url = URL.createObjectURL(file);
     const a = document.createElement('a');
     a.href = url;
@@ -555,10 +559,8 @@ function startRename(entry) {
     const newName = input.value.trim();
     if (commit && newName && newName !== entry.name) {
       try {
-        if (typeof entry.handle.move !== 'function') {
-          throw new Error('this browser does not support renaming');
-        }
-        await entry.handle.move(newName);
+        await fs.writer.move(joinPath(currentDirPath(), entry.name),
+          joinPath(currentDirPath(), newName));
         selection.delete(entry.name);
         selection.add(newName);
         anchorIndex = -1;
@@ -600,7 +602,7 @@ async function createNewFolder() {
     return setStatus('Write permission denied for the storage root.', 'bad');
   }
   try {
-    await currentDir().getDirectoryHandle(name, {create: true});
+    await fs.writer.mkdir(joinPath(currentDirPath(), name));
     hideNewFolderForm();
     await render();
     setStatus('Created folder ' + name, 'ok');
@@ -617,12 +619,12 @@ async function importFiles(files) {
   if (!await ensureWriteAccess()) {
     return setStatus('Write permission denied for the storage root.', 'bad');
   }
-  const dir = currentDir();
   const conflicts = [];
   for (const file of files) {
     try {
-      await dir.getFileHandle(file.name);
-      conflicts.push(file.name);
+      if (await fs.reader.exists(joinPath(currentDirPath(), file.name))) {
+        conflicts.push(file.name);
+      }
     }
     catch {}
   }
@@ -632,10 +634,7 @@ async function importFiles(files) {
   let ok = 0;
   for (const file of files) {
     try {
-      const handle = await dir.getFileHandle(file.name, {create: true});
-      const writable = await handle.createWritable();
-      await writable.write(file);
-      await writable.close();
+      await fs.writer.write(joinPath(currentDirPath(), file.name), file);
       ok++;
     }
     catch (e) {

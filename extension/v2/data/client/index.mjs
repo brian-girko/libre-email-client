@@ -19,6 +19,17 @@ import {cancel as cancelJob, dismiss as dismissJob} from './jobs.mjs';
 import {getPref, setPref} from './prefs.mjs';
 import * as counters from './counters.mjs';
 
+// TEMPORARY debug aid — print every fs-event crossing the runtime bus
+// (core/fs.mjs emits {type:'fs-event', origin, operation, src, dest} after
+// every file/dir create/change/delete/move, from any context). Remove once
+// the gateway's event stream is wired to real consumers.
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg?.type === 'fs-event') {
+    console.log(`[fs-event] ${msg.origin} · ${msg.operation} · ${msg.src}` +
+      (msg.dest ? ' → ' + msg.dest : ''));
+  }
+});
+
 initTheme();
 initFontScale();
 

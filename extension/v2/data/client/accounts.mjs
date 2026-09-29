@@ -16,13 +16,13 @@ import {load as loadDirs} from './dirs.mjs';
  */
 export async function listAccounts() {
   try {
-    const root = await getRootHandle();
+    const fs = await getRootHandle();
     const out = [];
-    for await (const [name, handle] of root.entries()) {
-      if (handle.kind !== 'directory' || name.startsWith('.')) {
+    for (const entry of await fs.reader.list('')) {
+      if (entry.kind !== 'directory' || entry.name.startsWith('.')) {
         continue;
       }
-      out.push({id: name, label: name});
+      out.push({id: entry.name, label: entry.name});
     }
     out.sort((a, b) => a.id.localeCompare(b.id));
     return out;

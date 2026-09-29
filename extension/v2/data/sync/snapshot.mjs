@@ -29,10 +29,15 @@ export function emptySnapshot() {
   };
 }
 
-export async function loadSnapshot(account) {
+/**
+ * The account's last-known-good server view, read through the fs gateway
+ * (core/fs.mjs). Missing/corrupt → emptySnapshot().
+ * @param {object} fs an fs gateway facade (prepare()'s {reader, writer})
+ * @param {string} accountPath the account dir, root-relative
+ */
+export async function loadSnapshot(fs, accountPath) {
   try {
-    const fh = await account.getFileHandle(STATE_FILE);
-    const text = await (await fh.getFile()).text();
+    const text = await fs.reader.readText(accountPath + '/' + STATE_FILE);
     const snap = JSON.parse(text);
     if (snap && snap.version === SNAPSHOT_VERSION && typeof snap.folders === 'object') {
       return snap;
@@ -42,13 +47,11 @@ export async function loadSnapshot(account) {
   return emptySnapshot();
 }
 
-export async function saveSnapshot(account, snap) {
+/** complete rewrite of the account's .sync-state.json ('change' event) */
+export async function saveSnapshot(fs, accountPath, snap) {
   snap.lastSyncAt = new Date().toISOString();
   snap.version = SNAPSHOT_VERSION;
-  const fh = await account.getFileHandle(STATE_FILE, {create: true});
-  const w = await fh.createWritable();
-  await w.write(JSON.stringify(snap, null, 1));
-  await w.close();
+  await fs.writer.write(accountPath + '/' + STATE_FILE, JSON.stringify(snap, null, 1));
 }
 
 export function folderState(snap, folder) {

@@ -62,7 +62,7 @@ function trunc(text) {
  * unparsable. Null only when even the file stat fails.
  * @returns {Promise<number|null>} epoch ms
  */
-async function messageTime(parsed, entry) {
+async function messageTime(parsed, entry, store) {
   const d = parsed?.date;
   if (d instanceof Date && !Number.isNaN(d.getTime())) {
     return d.getTime();
@@ -74,7 +74,8 @@ async function messageTime(parsed, entry) {
     }
   }
   try {
-    return (await entry.file.getFile()).lastModified;
+    const st = await store.fs.reader.stat(entry.path);
+    return st.exists && st.kind === 'file' ? st.lastModified : null;
   }
   catch {
     return null;
@@ -172,7 +173,7 @@ export async function runFilter(store, {
       continue;
     }
     if (cutoff != null) {
-      const t = await messageTime(parsed.parsed, entry);
+      const t = await messageTime(parsed.parsed, entry, store);
       if (t == null || t < cutoff) {
         continue;
       }
@@ -327,7 +328,7 @@ export async function runAllFilters(store, {
         continue;
       }
       if (cutoff != null) {
-        const t = await messageTime(parsed.parsed, entry);
+        const t = await messageTime(parsed.parsed, entry, store);
         if (t == null || t < cutoff) {
           continue;
         }
