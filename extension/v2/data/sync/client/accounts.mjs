@@ -45,6 +45,20 @@ export function normalizeAccount(id, cfg) {
   return {id, ...cfg};
 }
 
+/**
+ * The one account label every picker and log line renders: "<name> —
+ * <user>@<host>" (the options-page label, an em dash, the IMAP identity).
+ * The sync panel's Account select and the mail client's account picker
+ * (data/client/accounts.mjs) both go through this — one format everywhere,
+ * and changes to the format happen here and nowhere else.
+ * @param {{id, name, user, host}} account a loadAccounts() entry
+ * @returns {string}
+ */
+export function accountLabel(account) {
+  const name = account?.name || account?.id || '';
+  return name + ' — ' + (account?.user || '') + '@' + (account?.host || '');
+}
+
 // Returns the master password for this browser session, asking for it (and
 // checking it against the stored verifier) when it is not known yet. Returns
 // null when there is no master password or the user did not confirm it.

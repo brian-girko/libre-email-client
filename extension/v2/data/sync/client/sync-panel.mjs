@@ -40,7 +40,7 @@
 
 import '../../components/prompt-view.js';
 import './components/sync-view.js';
-import {loadAccounts, decryptPassword} from './accounts.mjs';
+import {loadAccounts, decryptPassword, accountLabel} from './accounts.mjs';
 import {MaildirStore, sameFolder} from '../maildir.mjs';
 import {bootSilent} from '../disk.mjs';
 import {getRootHandle} from '../../client/local-api.mjs';
@@ -353,7 +353,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     accounts = await loadAccounts(promptEl, {decrypt: false}).catch(() => []);
     syncView.setAccounts(accounts.map(a => ({
       id: a.id,
-      label: (a.name || a.id) + ' — ' + a.user + '@' + a.host
+      label: accountLabel(a)
     })));
     if (forcedAccount) {
       syncView.setLockedAccount(forcedAccount);
@@ -541,7 +541,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     }
     const acc = findAccount(forcedAccount);
     const label = acc
-      ? (acc.name || acc.id) + ' — ' + acc.user + '@' + acc.host
+      ? accountLabel(acc)
       : '"' + forcedAccount + '" is not configured (options page)';
     if (label === announced) {
       return;

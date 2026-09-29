@@ -3,15 +3,25 @@
 // accounts.mjs — account enumeration from the granted directory handle.
 //
 // Every top-level directory of the root handle is an offlineimap-style
-// account tree (its name is the sync slug). No chrome.storage, no worker:
-// accounts are what the filesystem shows.
+// account tree (its name is the sync slug). Accounts are what the
+// filesystem shows; the picker's LABEL is the sync interface's format
+// ("Name — user@host", the accountLabel helper of the sync registry),
+// read from the options-page registry as plain metadata. Ids and every
+// behavior stay filesystem-keyed.
 
 import {getPref, setPref} from './prefs.mjs';
 import {getRootHandle} from './local-api.mjs';
 import {load as loadDirs} from './dirs.mjs';
+import {loadAccounts as loadRegistry, accountLabel} from '../sync/client/accounts.mjs';
 
 /**
  * Account directories directly under the granted root, alphabetical.
+ * Labels follow the sync interface's format ("Name — user@host",
+ * accountLabel in ../sync/client/accounts.mjs): a directory matching a
+ * configured account's slug shows the registry name and address instead
+ * of the raw slug. Pure metadata read — decrypt:false, so no password is
+ * ever touched and no master-password prompt can fire; an unreadable
+ * registry, or a dir with no configured account, keeps the plain slug.
  * @returns {Promise<Array<{id, label}>>}
  */
 export async function listAccounts() {
@@ -25,6 +35,25 @@ export async function listAccounts() {
       out.push({id: entry.name, label: entry.name});
     }
     out.sort((a, b) => a.id.localeCompare(b.id));
+    let registry = [];
+    try {
+      registry = await loadRegistry(null, {decrypt: false});
+    }
+    catch {
+      /* no readable registry — the plain slug labels stay */
+    }
+    const bySlug = new Map();
+    for (const a of registry) {
+      if (a?.slug && !bySlug.has(a.slug)) {
+        bySlug.set(a.slug, a);   // first registry match wins on a slug clash
+      }
+    }
+    for (const a of out) {
+      const match = bySlug.get(a.id);
+      if (match) {
+        a.label = accountLabel(match);
+      }
+    }
     return out;
   }
   catch (e) {
