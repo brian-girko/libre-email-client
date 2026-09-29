@@ -318,4 +318,77 @@ await assert.rejects(() => bare.reader.list(''), /no granted storage root/);
 await assert.rejects(() => bare.writer.write('x', 'y'), /no granted storage root/);
 ok('a failed gate returns a verdict facade whose calls reject');
 
+// ---- 6. classifyEvent: fs-event → current-account view routing --------------
+//
+// The client's routing table (data/client/fs-events.mjs): other accounts,
+// metadata, scratch and triple mkdirs never call a view; dir-view rides
+// folder-set changes only; the open dir delta-deltas the mails view; a
+// renamed-away/deleted open message adds the mail view.
+
+const {classifyEvent} = await import('/data/client/fs-events.mjs');
+const CTX = {account: 'acc', dir: 'INBOX'};
+const MD5 = '0f9263536b9fc61ada745644735bfd8f';
+const name = (uid, extra) =>
+  `1790660635.M822P9ae4Q1.sync,U=${uid},FMD5=${MD5}${extra ?? ''}`;
+const ev = (operation, src, dest) =>
+  ({type: 'fs-event', origin: 'offscreen', operation, src, dest});
+
+const c = (msg, ctx = CTX) => classifyEvent(msg, ctx);
+
+assert.deepEqual(c(ev('create', 'other/INBOX/cur/x')),
+  {match: 'other', slug: 'other', dirs: [], calls: [], note: 'other account'});
+ok('other-account events match nothing');
+
+assert.deepEqual(c(ev('change', 'acc/.sync-state.json')).calls, []);
+assert.equal(c(ev('change', 'acc/.sync-state.json')).note, 'meta');
+assert.equal(c(ev('change', 'acc/INBOX/cur/.hidden')).note, 'meta');
+ok('metadata files never call a view');
+
+assert.deepEqual(c(ev('move', 'acc/INBOX/tmp/x.tmp-1-1', `acc/INBOX/cur/${name(5, ',I=2,S')}`)).calls,
+  ['mails-view(delta INBOX)', 'dir-view(counts INBOX)']);
+ok('atomic commit: tmp src ignored; dest deltas the open dir and its counters');
+
+assert.deepEqual(c(ev('create', 'acc/Work')).calls, ['dir-view']);
+assert.deepEqual(c(ev('delete', 'acc/Work')).calls, ['dir-view']);
+assert.deepEqual(c(ev('delete', 'acc')).calls, ['dir-view']);
+ok('folder set changes (and the account dir) call dir-view');
+
+assert.equal(c(ev('create', 'acc/Work/tmp')).note, 'maildir triple');
+ok('triple mkdirs call nothing');
+
+assert.deepEqual(c(ev('create', `acc/INBOX/cur/${name(7, ',I=2,S')}`)).calls,
+  ['mails-view(delta INBOX)', 'dir-view(counts INBOX)']);
+assert.deepEqual(c(ev('change', `acc/INBOX/new/${name(7)}`)).calls,
+  ['mails-view(delta INBOX)']);
+assert.deepEqual(c(ev('create', `acc/Work/cur/${name(7)}`)).calls,
+  ['dir-view(counts Work)']);
+assert.equal(c(ev('change', `acc/Work/cur/${name(7)}`)).note, 'other dir (Work)');
+ok('open-dir ops delta + count; other dirs count only; change never counts');
+
+const flagRename = c(ev('move', `acc/INBOX/cur/${name(5, ',I=2,S')}`, `acc/INBOX/cur/${name(5, ',I=2,FS')}`));
+assert.deepEqual(flagRename.calls,
+  ['mails-view(delta INBOX)', 'dir-view(counts INBOX)', 'mail-view(uid 5)']);
+ok('flag rename: delta + counters (\Seen moved) + mail view (uid from src)');
+
+const purge = c(ev('delete', `acc/INBOX/cur/${name(5, ',I=2,S')}`));
+assert.deepEqual(purge.calls,
+  ['mails-view(delta INBOX)', 'dir-view(counts INBOX)', 'mail-view(uid 5)']);
+ok('delete in the open dir: delta + counters + mail view');
+
+const crossMove = c(ev('move', `acc/INBOX/cur/${name(9)}`, `acc/Work/cur/${name(9)}`));
+assert.deepEqual(crossMove.dirs, ['INBOX', 'Work']);
+assert.deepEqual(crossMove.calls,
+  ['mails-view(delta INBOX)', 'dir-view(counts INBOX, Work)', 'mail-view(uid 9)']);
+ok('cross-dir move out of the open dir: both folders counted, message left');
+
+const intoOpen = c(ev('move', `acc/Work/cur/${name(9)}`, `acc/INBOX/cur/${name(9)}`));
+assert.deepEqual(intoOpen.calls,
+  ['mails-view(delta INBOX)', 'dir-view(counts Work, INBOX)']);
+ok('move INTO the open dir deltas without a mail view (src dir counted first)');
+
+const noDir = c(ev('create', `acc/INBOX/cur/${name(7)}`), {account: 'acc', dir: null});
+assert.deepEqual(noDir.calls, ['dir-view(counts INBOX)']);
+assert.equal(c(ev('create', 'acc/INBOX'), {account: null, dir: null}).match, 'unselected');
+ok('no open dir still counts; no account selected degrades cleanly');
+
 console.log(`fs-gateway.test: all ${n} checks pass`);

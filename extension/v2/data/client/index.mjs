@@ -17,18 +17,8 @@ import {subscribe as subscribeLog, setStatus as setLogStatus} from './logger.mjs
 import {init as initSyncRun, requestSync} from './sync-run.mjs';
 import {cancel as cancelJob, dismiss as dismissJob} from './jobs.mjs';
 import {getPref, setPref} from './prefs.mjs';
+import {init as initFsEvents} from './fs-events.mjs';
 import * as counters from './counters.mjs';
-
-// TEMPORARY debug aid — print every fs-event crossing the runtime bus
-// (core/fs.mjs emits {type:'fs-event', origin, operation, src, dest} after
-// every file/dir create/change/delete/move, from any context). Remove once
-// the gateway's event stream is wired to real consumers.
-chrome.runtime.onMessage.addListener(msg => {
-  if (msg?.type === 'fs-event') {
-    console.log(`[fs-event] ${msg.origin} · ${msg.operation} · ${msg.src}` +
-      (msg.dest ? ' → ' + msg.dest : ''));
-  }
-});
 
 initTheme();
 initFontScale();
@@ -255,6 +245,12 @@ function currentAccountId() {
 function currentDirName() {
   return selectedDir;
 }
+
+// the fs-event stream (core/fs.mjs): every mutation broadcast anywhere in
+// the extension is classified against the current account and open dir —
+// print-only for now (fs-events.mjs decides which view components would
+// refresh; wiring those calls is the next step)
+initFsEvents({account: currentAccountId, dir: currentDirName});
 
 // sync and filter runs write into the account dir from other pages (the
 // offscreen engine — background syncs and their post-sync INBOX filter
