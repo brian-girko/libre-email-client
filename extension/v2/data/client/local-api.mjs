@@ -11,7 +11,17 @@
 //   listThreadsDelta()    → the post-sync in-place reconcile's read: a uid
 //                           +flag sweep over the filenames diffed against a
 //                           per-folder cache of the last full read — only
-//                           new mail parses headers; unchanged rows recycle
+//                           new mail parses headers; unchanged rows recycle.
+//                           The read is a PROPOSAL: its reconciled rows
+//                           install on the returned commit() only (called
+//                           by list.mjs past its token guard) — a read
+//                           superseded mid-flight leaves the cache for
+//                           the winning read to re-diff.
+//                           The read returns its reconciliation behind a
+//                           commit() and never mutates the cache itself:
+//                           a caller whose token was superseded mid-read
+//                           discards the result and the cache stays honest
+//                           for the winning read
 //   setFlags/delete/move  → file renames (renameFile/moveBetweenFolders);
 //                           delete = \Deleted flag rename, the sync engine
 //                           replays the server effect from those names
@@ -192,13 +202,31 @@ export function dropLocalApi(accountId) {
 }
 
 async function buildApi(accountId) {
-  const fs = await getRootHandle();
-  const store = new MaildirStore(fs, accountId);
-  await store.open();
+  return apiForStore(new MaildirStore(await getRootHandle(), accountId), accountId);
+}
+
+/**
+ * Builds the MailApi facade over an INJECTED store. buildApi() resolves the
+ * granted root and delegates here; tests inject an in-memory store-backed
+ * facade instead (the same seam style data/sync/filters/run.test.mjs uses).
+ * @param {MaildirStore} store an open store bound to the account dir
+ * @param {string} accountId the account slug (== store.account)
+ */
+export function apiForStore(store, accountId) {
   let selected = null;
   // single-slot delta cache for listThreadsDelta(): the folder's last read
   // rows (uid → folderRows row shape, meta included). Lives per memoized api;
   // a re-granted handle builds a fresh instance, so invalidation comes free.
+  //
+  // A delta read NEVER mutates this cache itself — it returns the reconciled
+  // rows behind a commit() and the CALLER decides (list.mjs sync(): a read
+  // whose token was superseded mid-flight discards its result, and a cache
+  // already advanced by the discarded read would make the winning read diff
+  // clean and skip the render — the stale-row-until-refresh race). A full
+  // listThreads() read still seeds it eagerly on purpose: the seeded rows
+  // ARE the disk truth at that moment (not a diff), so a discarded load()
+  // cannot lose an update — any later delta re-diffs that truth and any
+  // newer load() re-renders it in full.
   let dirCache = null;
 
   const api = {
@@ -266,7 +294,9 @@ async function buildApi(accountId) {
       const {rows} = await folderRows(store, accountId, selected);
       const threads = groupThreads(await withMeta(rows, store));
       // seed the delta cache from the full read: the rows are fresh,
-      // meta-parsed folderRows shape — the next delta only diffs
+      // meta-parsed folderRows shape — the next delta only diffs. Eager is
+      // fine here (unlike the delta path): these rows are the disk truth
+      // itself, so a caller discarding this load() loses nothing.
       const uidvalidity = Number(await store.readUidValidity(selected)) || 0;
       dirCache = {
         folder: selected,
@@ -283,10 +313,16 @@ async function buildApi(accountId) {
      * single-slot cache of the last full read. Unchanged messages reuse
      * the cached row objects — no header re-parse; a message's headers
      * cannot change under one uid (flag truth is the filename). Returns
-     * {changed, threads, added, removed, flagged} so callers can skip the
-     * DOM entirely when the sweep matched the cache exactly. A folder
-     * change, uidvalidity change or a cold cache falls back to the full
-     * read (which also re-seeds the cache).
+     * {changed, threads, added, removed, flagged, commit} so callers can
+     * skip the DOM entirely when the sweep matched the cache exactly —
+     * and so a caller whose result turned stale mid-read (a newer
+     * sync()/load() superseded its token) can DISCARD it without having
+     * already lost the diff: this call never mutates dirCache itself,
+     * commit() is what installs the reconciled rows (and only the read
+     * holding the newest token may call it). A folder change, uidvalidity
+     * change or a cold cache falls back to the full read (whose rows
+     * arrive behind the same commit shape). commit is null when
+     * changed:false — nothing to install.
      */
     async listThreadsDelta() {
       if (!selected) throw new Error('openDir() first');
@@ -295,6 +331,15 @@ async function buildApi(accountId) {
       const cache = dirCache;
       const freshSheet = !local || cache?.folder !== selected ||
         (uidvalidity && cache?.uidvalidity && uidvalidity !== cache.uidvalidity);
+      // installs the reconciled rows this read produced; captured locally so
+      // a late call can never overwrite a NEWER read's cache state
+      const commitInto = rows => {
+        dirCache = {
+          folder: selected,
+          uidvalidity,
+          rows: new Map(rows.map(row => [row.uid, row])),
+        };
+      };
       if (freshSheet) {
         // missing mirror: the folder is not a Maildir on disk — the same
         // 'no such mailbox' openDir() raises (err.code 'mirror') so the
@@ -305,16 +350,20 @@ async function buildApi(accountId) {
           throw err;
         }
         const rows = await deltaRows(local, selected, store);
-        dirCache = {
-          folder: selected,
-          uidvalidity,
-          rows: new Map(rows.map(row => [row.uid, row])),
+        return {
+          changed: true,
+          threads: groupThreads(rows),
+          added: [],
+          removed: [],
+          flagged: [],
+          commit: () => commitInto(rows),
         };
-        return {changed: true, threads: groupThreads(rows), added: [], removed: [], flagged: []};
       }
       // the live uid+flag truth from the filenames; \Deleted rows leave the
       // view (folderRows() keeps them out), interlopers join by uid as
-      // usual. No content reads.
+      // usual. No content reads. All reconciliation lands on a CANDIDATE
+      // map — the cache itself only moves on commit().
+      const next = new Map(cache.rows);
       const live = new Map();   // uid → flags on disk right now
       for (const [uid, entry] of local.entries) {
         if (!entry.flags.includes('\\Deleted')) {
@@ -333,16 +382,17 @@ async function buildApi(accountId) {
           added.push(uid);
         }
         else if (!sameSet(flags, row.flags)) {
-          row.flags = flags;   // identity kept; subject/from/date hold
+          next.set(uid, {...row, flags});   // identity kept; subject/from/date hold
           touched.push(uid);
         }
       }
       removedUids = [...cache.rows.keys()].filter(uid => !live.has(uid));
       for (const uid of removedUids) {
-        cache.rows.delete(uid);
+        next.delete(uid);
       }
       if (!added.length && !removedUids.length && !touched.length) {
-        return {changed: false, threads: null, added: [], removed: [], flagged: []};
+        return {changed: false, threads: null, added: [], removed: [], flagged: [],
+          commit: null};
       }
       // new arrivals: build rows, parse their headers only. Interlopers join
       // regardless of \Deleted — folderRows() serves them the same way.
@@ -360,16 +410,17 @@ async function buildApi(accountId) {
         }
         await withMeta(fresh, store);
         for (const row of fresh) {
-          cache.rows.set(row.uid, row);
+          next.set(row.uid, row);
         }
       }
-      const rows = [...cache.rows.values()].sort((a, b) => b.uid - a.uid);
+      const rows = [...next.values()].sort((a, b) => b.uid - a.uid);
       return {
         changed: true,
         threads: groupThreads(rows),
         added,
         removed: removedUids,
         flagged: touched,
+        commit: () => commitInto(rows),
       };
     },
 

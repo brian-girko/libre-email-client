@@ -221,24 +221,33 @@ const timers = {};
 let pendingUids = new Set();
 
 function schedule(key, fn) {
-  if (!timers[key]) {
-    timers[key] = setTimeout(() => {
-      timers[key] = null;
+  if (timers[key]) {
+    return;   // already scheduled — the pending pair fires for this burst
+  }
+  const forceId = key === 'dirView' ? null : setTimeout(() => {
+    // a long burst (a whole sync run) must not starve the views forever:
+    // force MY OWN trailing edge through after MAX_WAIT_MS — and only mine
+    // (a later schedule() call's trailing edge must never be cancelled here)
+    if (timers[key] === trailing) {
+      clearTimeout(trailing);
+      delete timers[key];
       fn();
-    }, DELAY_MS);
-    if (key !== 'dirView') {
-      // a long burst (a whole sync run) must not starve the views forever:
-      // force the first scheduled reconcile through after MAX_WAIT_MS
-      timers[key + ':force'] = setTimeout(() => {
-        if (timers[key]) {
-          clearTimeout(timers[key]);
-          timers[key] = null;
-          fn();
-        }
-        clearTimeout(timers[key + ':force']);
-        timers[key + ':force'] = null;
-      }, MAX_WAIT_MS);
     }
+    delete timers[key + ':force'];
+  }, MAX_WAIT_MS);
+  const trailing = setTimeout(() => {
+    // normal fire: retire my force timer first so no orphan can later cancel
+    // a NEW trailing edge scheduled for the next burst
+    if (forceId != null) {
+      clearTimeout(forceId);
+      delete timers[key + ':force'];
+    }
+    delete timers[key];
+    fn();
+  }, DELAY_MS);
+  timers[key] = trailing;
+  if (forceId != null) {
+    timers[key + ':force'] = forceId;
   }
 }
 

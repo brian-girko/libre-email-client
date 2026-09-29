@@ -415,7 +415,10 @@ async function load(id, name, {refresh = false} = {}) {
 // The read itself is a delta (`api.listThreadsDelta()`): a filenename sweep
 // diffed against the folder's cached rows, so a run that moved nothing
 // costs nothing — no re-read of headers, no render, no counter churn.
-// The delta read keeps the same validation the old openDir() call served:
+// The delta read is a proposal: its reconciled rows install on commit()
+// only, called here after the token check — a sync superseded mid-read
+// discards its result and leaves the cache for the winner to re-diff.
+// The read keeps the same validation the old openDir() call served:
 // a folder whose mirror is gone raises 'no such mailbox' (err.code 'mirror'),
 // so a deleted folder shows the status note instead of a silently empty list.
 async function sync(id, name) {
@@ -428,10 +431,20 @@ async function sync(id, name) {
     if (token !== loadToken) {
       return;
     }
-    const {threads, changed} = await api.listThreadsDelta();
+    const {threads, changed, commit} = await api.listThreadsDelta();
     if (token !== loadToken || !changed) {
-      return;   // nothing on disk moved — the view stays exactly as it is
+      // A superseded token must NOT commit: the newer sync/load re-diffs the
+      // same disk truth (the cache was left untouched) and renders it —
+      // committing here would advance the cache past the diff and leave
+      // nothing for the winner to reconcile (the stale-row-until-refresh
+      // race). The !changed case has nothing to install anyway (commit null).
+      if (changed) {
+        console.log('[list] folder sync superseded mid-read — left uncommitted ' +
+          'for the newer read');
+      }
+      return;   // the winning read re-diffs the same disk truth and renders it
     }
+    commit();   // only the read holding the newest token installs its rows
     totalPages = Math.max(1, Math.ceil(threads.length / pageSize));
     if (page >= totalPages) {
       page = totalPages - 1;

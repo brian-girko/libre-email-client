@@ -14,7 +14,11 @@
 //    itself can never be written, moved into or removed;
 // 4. store: open/listFolders/listLocal/rename/move/remove/removeFolder/
 //    reset keep their maildir semantics through the gateway, entries
-//    carry root-relative `path`s (no handles leave the gateway).
+//    carry root-relative `path`s (no handles leave the gateway);
+// 5. local api: listThreadsDelta() is a PROPOSAL — the reconciled rows
+//    install on commit() only, so a caller discarding a superseded read
+//    leaves the cache honest for the winning read (no lost delete/flag
+//    diff, no stale row until refresh).
 
 import {register} from 'node:module';
 register('./offscreen/root-loader.mjs', import.meta.url);
@@ -480,5 +484,81 @@ unecho();
 await fs.writer.remove('echo-probe.txt', {quiet: true});
 assert.equal(echoed.length, 1);
 ok('gateway echoes same-context events to onFsEvent (unsubscribe works)');
+
+// ---- 8. local api: listThreadsDelta() is a proposal until commit ------------
+//
+// The client's reconcile read (data/client/local-api.mjs) must NOT mutate
+// its per-folder delta cache while reading: list.mjs sync() discards the
+// result of a read whose token was superseded mid-flight, and a cache
+// already advanced by the discarded read would make the WINNING read diff
+// clean (changed:false) — the row stays on screen until a manual refresh.
+// Sequence-pinned here deterministically: read #1 discards its commit (the
+// "superseded caller"), read #2 must still see the change.
+
+const {apiForStore} = await import('/data/client/local-api.mjs');
+
+const deltaRoot = new MockDir(null, 'delta-root');
+const deltaFs = await prepare('delta-test', {handle: deltaRoot, fresh: true});
+const deltaStore = new MaildirStore(deltaFs, 'acc');
+await deltaStore.open();
+drain();   // store.open()'s account create — the event stream isn't under test here
+
+const mail = new TextEncoder().encode('From: x@y.z\r\n\r\nbody one\r\n');
+const mail2 = new TextEncoder().encode('From: p@q.r\r\n\r\nbody two\r\n');
+await deltaStore.writeMessage('INBOX', 11, ['\\Seen'], mail);
+await deltaStore.writeMessage('INBOX', 12, ['\\Seen'], mail2);
+drain();
+
+const deltaApi = apiForStore(deltaStore, 'acc');
+await deltaApi.openDir('INBOX');
+await deltaApi.listThreads();   // seeds the delta cache with uid 11 + 12
+
+// ---- 8a. a superseded read must not eat the diff ----------------------------
+
+await deltaStore.removeMessage([...(await deltaStore.listLocal('INBOX')).entries.values()]
+  .find(e => e.uid === 11));
+
+const read1 = await deltaApi.listThreadsDelta();
+assert.equal(read1.changed, true);
+assert.deepEqual(read1.removed, [11]);
+ok('delta sees the deletion (changed:true, removed:[11])');
+
+const read2 = await deltaApi.listThreadsDelta();  // read1's commit is DISCARDED
+assert.equal(read2.changed, true, 'the winning read must still diff the deletion');
+assert.deepEqual(read2.removed, [11]);
+assert.ok(read2.commit, 'a changed delta carries its commit');
+ok('superseded read leaves the cache honest — the next read re-diffs the deletion');
+
+// a peek at the untouched disk: only uid 12 remains (the deletion ran for real)
+const remaining = [...(await deltaStore.listLocal('INBOX')).entries.values()]
+  .map(e => e.uid);
+assert.deepEqual(remaining.sort(), [12]);
+ok('sanity: disk carries uid 12 only — the read/cache split is what is under test');
+
+read2.commit();   // the winning read installs its rows
+
+const read3 = await deltaApi.listThreadsDelta();
+assert.equal(read3.changed, false);
+assert.equal(read3.commit, null);
+assert.deepEqual(read3.threads, null);
+ok('after commit the delta is a clean no-op (changed:false, commit null)');
+
+// ---- 8b. flag changes hold off the cache the same way -----------------------
+
+const entry12 = [...(await deltaStore.listLocal('INBOX')).entries.values()]
+  .find(e => e.uid === 12);
+await deltaStore.renameMessage('INBOX', entry12, {flags: []});   // strip \Seen
+
+const flagRead = await deltaApi.listThreadsDelta();
+assert.equal(flagRead.changed, true);
+assert.deepEqual(flagRead.flagged, [12]);
+assert.deepEqual(flagRead.added, []);
+assert.deepEqual(flagRead.removed, []);
+// the cache row's flags must be UNTOUCHED until commit — a discarded read
+// must not have already flipped them in place
+flagRead.commit();
+const afterCommit = await deltaApi.listThreadsDelta();
+assert.equal(afterCommit.changed, false);
+ok('flag reconcile also lands on commit only (no in-place cache flip)');
 
 console.log(`fs-gateway.test: all ${n} checks pass`);
