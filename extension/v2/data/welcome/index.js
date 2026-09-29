@@ -35,12 +35,25 @@ async function showStep(step) {
   document.querySelectorAll('.step').forEach(s => s.hidden = true);
   document.getElementById('step-' + step).hidden = false;
 
-  // Update progress dots
+  // Update progress dots by numbered level ('2a'/'2b' both sit on level 2) —
+  // the old i < step compared against the literal string, so step 2 never
+  // lit a dot at all
+  const level = String(step).startsWith('2') ? 2 : Number(step);
   const dots = document.querySelectorAll('.dot');
-  dots.forEach((d, i) => d.classList.toggle('active', i < step));
+  dots.forEach((d, i) => d.classList.toggle('active', i < level));
+
+  // On step 2a (remote bridge), load and check the configured server URL
+  if (step === '2a') {
+    await onBridgeStepEnter();
+  }
 
   // On step 2b (local native), auto-check native client
   if (step === '2b') {
+    // Entering the local path switches the connection mode to the built-in
+    // bridge: worker.mjs reads 'ws.mode' per ask, so a Remote URL saved
+    // earlier must not keep driving syncs. The URL itself stays stored —
+    // returning to the remote card re-verifies it in one click.
+    chrome.storage.local.set({'ws.mode': 'native'});
     checkNativeOnEntry();
   }
 
@@ -184,56 +197,251 @@ async function checkNativeOnEntry() {
   }
 }
 
-// Bridge check
-async function checkBridge() {
-  const status = document.getElementById('bridge-status');
-  status.className = '';
-  status.textContent = 'Checking bridge...';
+// Step-2a bridge configuration: the server URL lives in the input box, is
+// verified against the ws -> TCP dial protocol and saved right here — no
+// detour through the options page.
+const wsUrlEl = document.getElementById('f-ws-url');
+const bridgeStatusEl = document.getElementById('bridge-status');
+const bridgeNoteEl = document.getElementById('bridge-note');
 
-  const {['ws.url']: url} = await chrome.storage.local.get('ws.url');
-  if (!url) {
-    status.className = 'error';
-    status.textContent = 'No bridge URL configured. Set it in the options page.';
-    return;
+// The URL that was last probed AND saved, or null while the input holds
+// something not (yet) verified. Next on step 2a stays locked until the
+// field matches this, so what is saved is always what was probed.
+let bridgeVerified = null;
+// one check at a time: the Verify button and the step-entry auto-check
+// share the status line and the buttons
+let verifying = false;
+
+// One-line helpers; an empty message resets (and un-classes) the line
+function setBridgeStatus(message, cls = '') {
+  bridgeStatusEl.textContent = message;
+  bridgeStatusEl.className = cls;
+}
+
+function setBridgeNote(message, cls = '') {
+  bridgeNoteEl.textContent = message;
+  bridgeNoteEl.className = cls;
+  bridgeNoteEl.hidden = !message;
+}
+
+// Lock the step: the saved-vs-probed invariant is gone, Next closes
+function clearBridgeVerified() {
+  bridgeVerified = null;
+  document.querySelector('#step-2a [data-cmd="next"]').disabled = true;
+  setBridgeNote('');
+}
+
+// Host permission patterns only accept http(s): ws -> http, wss -> https —
+// the same origin mapping the options page uses. Returns the origin, or
+// null when the URL is not a parseable ws(s):// one.
+function bridgeOrigin(url) {
+  if (!/^wss?:\/\//i.test(url)) {
+    return null;
   }
-
   try {
-    const ws = new WebSocket(url);
-    const result = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Connection timed out')), 5000);
-      ws.onopen = () => {
-        ws.send(JSON.stringify({op: 'open', host: 'localhost', port: 1, secure: false}));
-      };
-      ws.onmessage = (e) => {
-        clearTimeout(timeout);
-        try {
-          resolve(JSON.parse(e.data));
-        }
-        catch {
-          resolve({op: 'unknown'});
-        }
-        ws.close();
-      };
-      ws.onerror = () => {
-        clearTimeout(timeout);
-        reject(new Error('Cannot connect to bridge'));
-      };
-    });
-
-    if (result.op === 'ready' || result.op === 'error') {
-      status.className = 'success';
-      status.textContent = 'Bridge is working! (responded with: ' + result.op + ')';
-    }
-    else {
-      status.className = 'error';
-      status.textContent = 'Bridge responded with unexpected format.';
-    }
+    return new URL(url.replace(/^ws/i, 'http')).origin;
   }
-  catch (e) {
-    status.className = 'error';
-    status.textContent = 'Bridge check failed: ' + e.message;
+  catch {
+    return null;
   }
 }
+
+// True when the origin permission for this URL is already granted, so a
+// probe can run without any prompt. (async: an unparseable stored URL
+// becomes a rejection, not a crash)
+async function wsOriginGranted(url) {
+  const origin = new URL(String(url).replace(/^ws/i, 'http')).origin;
+  return chrome.permissions.contains({origins: [origin + '/*']});
+}
+
+// One dial-protocol probe: open the socket and send the dummy
+// {op:'open', host:'localhost', port:1} control frame; resolve the server's
+// first text reply. A protocol-speaking server answers {op:'ready'} or
+// {op:'error'} — see core/ws-to-tls/ws-to-tls.js; anything else, a socket
+// failure, an early close or the 5s timeout rejects. The socket is closed
+// on every path.
+function probeBridge(url, cap = 5000) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url);
+    let timer = null;
+    let done = false;
+    const finish = (fn, arg) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      }
+      catch {
+        // the socket already died on its own
+      }
+      fn(arg);
+    };
+
+    timer = setTimeout(() =>
+      finish(() => reject(new Error('Connection timed out'))), cap);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({op: 'open', host: 'localhost', port: 1, secure: false}));
+    };
+    ws.onmessage = (e) => {
+      let result = {op: 'unknown'};
+      try {
+        result = JSON.parse(e.data);
+      }
+      catch {
+        // not JSON: handled by the caller as an unexpected format
+      }
+      finish(() => resolve(result));
+    };
+    // a socket that dies without replying (refused connects land on the
+    // error event first) must fail now instead of hanging into the cap
+    ws.onclose = () =>
+      finish(() => reject(new Error('Connection closed before the bridge answered')));
+    ws.onerror = () =>
+      finish(() => reject(new Error('Cannot connect to bridge')));
+  });
+}
+
+// The shared check body: probe the URL and, on a protocol answer, persist
+// 'ws.mode' + 'ws.url' and unlock Next. worker.mjs answers bridge-acquire
+// with the URL only when the mode is 'external', so both keys ride along.
+// The host permission (when still missing) is the caller's job: the button
+// path requests it inside its own user gesture, and the entry path only
+// reaches here when the permission already stands.
+async function runBridgeCheck(url) {
+  const nextBtn = document.querySelector('#step-2a [data-cmd="next"]');
+  setBridgeStatus('Checking bridge...', '');
+  setBridgeNote('');
+
+  let result;
+  try {
+    result = await probeBridge(url);
+  }
+  catch (e) {
+    setBridgeStatus('Bridge check failed: ' + (e?.message || e), 'error');
+    return false;
+  }
+
+  if (result && (result.op === 'ready' || result.op === 'error')) {
+    // Either answer proves the server speaks the dial protocol: 'ready'
+    // accepted the (dummy) dial, 'error' is the protocol's own refusal —
+    // the sample bridge rejects the localhost:1 probe dial that way.
+    setBridgeStatus(result.op === 'error'
+      ? 'Bridge is working! It refused the dummy dial with a protocol error, as expected.'
+      : 'Bridge is working! (responded with: ' + result.op + ')', 'success');
+    await chrome.storage.local.set({
+      'ws.mode': 'external',
+      'ws.url': url
+    });
+    bridgeVerified = url;
+    nextBtn.disabled = false;
+    setBridgeNote('Saved — the extension will use this server for IMAP connections.', 'success');
+    return true;
+  }
+  setBridgeStatus('Bridge responded with unexpected format.', 'error');
+  return false;
+}
+
+// Verify & Save (the step-2a button): validate the typed URL, request the
+// origin host permission — this must happen here, inside the click gesture —
+// then probe and persist. Returns whether Next is unlocked.
+async function verifyAndSaveBridge() {
+  if (verifying) {
+    return false;
+  }
+  const url = wsUrlEl.value.trim();
+  const btn = document.querySelector('#step-2a [data-cmd="check-bridge"]');
+
+  // A typed-but-unverified URL must never leave Next enabled, whatever the
+  // earlier state was.
+  clearBridgeVerified();
+
+  if (!url) {
+    setBridgeStatus('Enter the bridge server URL.', 'error');
+    return false;
+  }
+  const origin = bridgeOrigin(url);
+  if (!origin) {
+    setBridgeStatus('Enter a valid ws:// or wss:// URL', 'error');
+    return false;
+  }
+
+  verifying = true;
+  btn.disabled = true;
+  try {
+    const granted = await chrome.permissions.request({
+      origins: [origin + '/*']
+    });
+    if (!granted) {
+      setBridgeStatus('Permission for ' + origin + ' denied', 'error');
+      return false;
+    }
+    return await runBridgeCheck(url);
+  }
+  catch (e) {
+    setBridgeStatus('Bridge check failed: ' + (e?.message || e), 'error');
+    return false;
+  }
+  finally {
+    verifying = false;
+    btn.disabled = false;
+  }
+}
+
+// Step-2a entry: load the stored URL into the input, then re-check it
+// automatically when the origin permission already stands — the probe is
+// silent, but an ungranted origin must not pop the permission prompt
+// outside a user gesture, so those cases report and wait for the button.
+async function onBridgeStepEnter() {
+  if (verifying) {
+    return;
+  }
+  clearBridgeVerified();
+  wsUrlEl.value = '';
+
+  const {'ws.mode': wsMode, 'ws.url': wsUrl} = await chrome.storage.local.get({
+    'ws.mode': '',
+    'ws.url': ''
+  });
+  const url = String(wsUrl || '').trim();
+  if (!url || !bridgeOrigin(url)) {
+    setBridgeStatus('', '');
+    return;
+  }
+  wsUrlEl.value = url;
+
+  const granted = await wsOriginGranted(url).catch(() => false);
+  if (granted && wsMode === 'external') {
+    // the stored URL still stands chrome-side: re-probe it quietly so the
+    // step reflects the server's current state, not the last session's
+    if (await runBridgeCheck(url).catch(() => false)) {
+      return;
+    }
+    // stored server stopped answering: runBridgeCheck left the failure in
+    // the status line — only add the note pointing at the button
+    setBridgeNote('Bridge URL loaded from settings — press Verify & Save to check and save it.', '');
+    return;
+  }
+  setBridgeStatus('', '');
+  setBridgeNote(granted
+    ? 'Bridge URL loaded from settings — press Verify & Save to check and save it.'
+    : 'Bridge URL loaded from settings — press Verify & Save to grant access and check the server.', '');
+}
+
+// Any input change invalidates what was probed: re-lock Next until the new
+// URL verifies again. Typing the verified URL back (undo, a stray space
+// trimmed) restores its state, since the field then holds exactly the
+// probed-and-saved value.
+wsUrlEl.addEventListener('input', () => {
+  if (wsUrlEl.value.trim() === bridgeVerified) {
+    return;
+  }
+  clearBridgeVerified();
+  setBridgeNote('Press Verify & Save to check and store this URL.', '');
+});
 
 // Sample bridge
 function showSampleBridge() {
@@ -260,7 +468,6 @@ function loadBridgeScript() {
 
 // Download the real bridge script
 async function downloadSampleBridge() {
-  const status = document.getElementById('bridge-status');
   try {
     const code = await loadBridgeScript();
     const blob = new Blob([code], {type: 'text/javascript'});
@@ -272,20 +479,18 @@ async function downloadSampleBridge() {
     URL.revokeObjectURL(url);
   }
   catch (e) {
-    status.className = 'error';
-    status.textContent = 'Cannot load the bridge script: ' + e.message;
+    setBridgeNote('Cannot load the bridge script: ' + e.message, 'error');
   }
 }
 
 // Copy the real bridge script to the clipboard
 async function copySampleBridge() {
-  const status = document.getElementById('bridge-status');
   const btn = document.querySelector('[data-cmd="copy-bridge"]');
   try {
     const code = await loadBridgeScript();
     await navigator.clipboard.writeText(code);
-    status.className = 'success';
-    status.textContent = 'Bridge script copied to clipboard.';
+    // the note line, not #bridge-status: the verification result must stay
+    setBridgeNote('Bridge script copied to clipboard.', 'success');
     if (btn) {
       const old = btn.value;
       btn.value = 'Copied!';
@@ -293,8 +498,7 @@ async function copySampleBridge() {
     }
   }
   catch (e) {
-    status.className = 'error';
-    status.textContent = 'Cannot copy the bridge script: ' + e.message;
+    setBridgeNote('Cannot copy the bridge script: ' + e.message, 'error');
   }
 }
 
@@ -582,7 +786,7 @@ document.addEventListener('click', async ({target}) => {
     }
   }
   else if (cmd === 'check-bridge') {
-    checkBridge();
+    verifyAndSaveBridge();
   }
   else if (cmd === 'sample-bridge') {
     showSampleBridge();
@@ -598,9 +802,6 @@ document.addEventListener('click', async ({target}) => {
   }
   else if (cmd === 'check') {
     checkNativeConnection();
-  }
-  else if (cmd === 'options') {
-    chrome.runtime.openOptionsPage();
   }
 });
 

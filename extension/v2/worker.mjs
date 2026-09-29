@@ -279,7 +279,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             if (/^wss?:\/\//i.test(url)) {
               return {ok: true, url};
             }
-            return {ok: false, error: 'no external ws url configured (options → WS/TCP bridge)'};
+            return {ok: false, error: 'no external ws url configured (welcome wizard → Remote Bridge)'};
           }
           return acquire(refKey);
         })

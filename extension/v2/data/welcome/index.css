@@ -241,6 +241,20 @@ body[data-os=linux] .windows {
   color: var(--error);
 }
 
+/* Bridge auxiliary note (save feedback, copy/download feedback) — a second
+   line so it never clobbers the verification result in #bridge-status */
+#bridge-note {
+  padding: 10px;
+  font-size: 90%;
+  opacity: 0.8;
+}
+#bridge-note.success {
+  color: #27a043;
+}
+#bridge-note.error {
+  color: var(--error);
+}
+
 /* Native status */
 #native-status {
   padding: 10px;

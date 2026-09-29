@@ -33,18 +33,25 @@
   <!-- Step 2a: Remote Bridge -->
   <section id="step-2a" class="step" hidden>
     <h1>Remote WS/TS Bridge</h1>
-    <p>The bridge connects the extension to your IMAP server over WebSocket.</p>
+    <p>The bridge connects the extension to your IMAP server over WebSocket. Enter the server below: Verify &amp; Save takes the host permission, checks the dial protocol and stores the URL, then Next unlocks for the account setup.</p>
+    <div class="form">
+      <label>Server URL
+        <input type="text" id="f-ws-url" placeholder="ws://.../token or wss://.../token" autocomplete="off" spellcheck="false">
+      </label>
+      <p class="hint">Prefer <code>wss://</code> for anything off this machine &mdash; the token in the URL path is the server's only access control.</p>
+    </div>
     <div class="actions">
-      <input type="button" data-cmd="check-bridge" value="Check Bridge">
+      <input type="button" data-cmd="check-bridge" value="Verify &amp; Save">
       <input type="button" data-cmd="sample-bridge" value="Sample NodeJS Bridge">
     </div>
     <p id="bridge-status"></p>
+    <p id="bridge-note" hidden></p>
     <div id="sample-code" hidden>
       <h2>Sample NodeJS Bridge</h2>
       <p>The bridge ships inside this extension as <code>core/ws-to-tls/ws-to-tls.js</code> &mdash; a zero-dependency Node script (Node 16+; uses only the <code>net</code>/<code>tls</code>/<code>crypto</code> built-ins).</p>
       <p>Download it (button below), then run:</p>
       <pre><code>node ws-to-tls.js --ws-port 8080</code></pre>
-      <p>It prints its URL, e.g. <code>ws://127.0.0.1:8080/&lt;random-token&gt;</code> &mdash; paste that exact URL into the extension's options page. The token in the URL path is the server's only access control.</p>
+      <p>It prints its URL, e.g. <code>ws://127.0.0.1:8080/&lt;random-token&gt;</code> &mdash; paste that exact URL into the Server URL box above and press Verify &amp; Save. The token in the URL path is the server's only access control.</p>
       <input type="button" data-cmd="download-bridge" value="Download ws-to-tls.js">
       <input type="button" data-cmd="copy-bridge" value="Copy to clipboard">
     </div>
@@ -54,12 +61,11 @@
         <li>The bridge can be written in any language &mdash; the protocol is simple: receive <code>{op:'open', host, port, secure}</code> as a text frame, reply with <code>{op:'ready'}</code> or <code>{op:'error'}</code>, then tunnel binary frames.</li>
         <li>Useful when multiple users on a network share one bridge.</li>
         <li>Useful when you cannot install native apps on the user's computer.</li>
-        <li>Configure the bridge URL in the extension's <a href="#" data-cmd="options">options page</a>.</li>
       </ul>
     </div>
     <div class="nav">
       <input type="button" data-cmd="back" value="Back">
-      <input type="button" data-cmd="next" value="Next">
+      <input type="button" data-cmd="next" value="Next" disabled>
     </div>
   </section>
 
