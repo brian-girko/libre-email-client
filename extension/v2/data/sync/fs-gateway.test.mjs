@@ -408,8 +408,20 @@ ok('atomic commit: tmp src ignored; dest deltas the open dir and its counters');
 
 assert.deepEqual(c(ev('create', 'acc/Work')).calls, ['dir-view']);
 assert.deepEqual(c(ev('delete', 'acc/Work')).calls, ['dir-view']);
-assert.deepEqual(c(ev('delete', 'acc')).calls, ['dir-view']);
-ok('folder set changes (and the account dir) call dir-view');
+assert.deepEqual(c(ev('delete', 'acc')).calls, ['accounts-view', 'dir-view']);
+ok('folder set changes call dir-view; the account dir also re-reads the picker');
+
+const rootOther = c(ev('create', 'newacct'));
+assert.deepEqual(rootOther.calls, ['accounts-view']);
+assert.deepEqual(rootOther.actions, [{component: 'accounts-view'}]);
+assert.equal(rootOther.match, 'other');
+assert.equal(rootOther.note, 'other account');
+assert.deepEqual(c(ev('delete', 'newacct')).calls, ['accounts-view']);
+assert.deepEqual(c(ev('create', 'brandnew'), {account: null, dir: null}).calls,
+  ['accounts-view']);
+assert.deepEqual(c(ev('create', '.picker-probe')).calls, []);
+ok('root-level account dirs reach the picker even for other/unselected ' +
+  'matches; hidden root entries stay meta');
 
 assert.equal(c(ev('create', 'acc/Work/tmp')).note, 'maildir triple');
 ok('triple mkdirs call nothing');

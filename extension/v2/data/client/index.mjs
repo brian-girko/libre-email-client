@@ -4,11 +4,11 @@ import './components/logger-view.js';
 import {initTheme} from './theme.mjs';
 import {initFontScale} from './font-scale.mjs';
 import {init as initDirs, load as loadDirs, refresh as refreshDirs,
-  refreshCounts} from './dirs.mjs';
+  refreshCounts, currentAccount as treeAccount} from './dirs.mjs';
 import {loadAccounts} from '../sync/client/accounts.mjs';
 import {init as initList, load as loadList, runSearch, clearSearch, isSearching} from './list.mjs';
 import {init as initPreview, refresh as refreshPreview} from './preview.mjs';
-import {init as initAccounts} from './accounts.mjs';
+import {init as initAccounts, refreshAccounts} from './accounts.mjs';
 import {init as initResize} from './resize.mjs';
 import {init as initShortcuts} from './shortcuts.mjs';
 import {initFilters, reconcileOpenFolder} from './filters.mjs';
@@ -71,8 +71,9 @@ applyPopupSize();
 // folder of the selected account, "Account" syncs the whole account, and
 // "Open" just opens the sync client (data/sync/client/index.html) on a new
 // tab without syncing. The selected-account mirror lives further down
-// (the fs-event router reads it from its getters, long after this module
-// finished evaluating).
+// (the sync/search buttons read it from their getters, long after this
+// module finished evaluating — the fs-event router reads the tree's own
+// account instead, see the initFsEvents wiring below).
 
 const syncDirBtn = document.getElementById('sync-dir');
 const syncAccountBtn = document.getElementById('sync-account');
@@ -224,7 +225,11 @@ function resetSearchBox() {
   searchClear.hidden = true;
 }
 // the currently selected account/dir live in dirs.mjs/list.mjs state; the
-// dir-selected listener mirrors them here
+// dir-selected listener mirrors them here for the title/favicon and the
+// sync/search buttons — a dir must genuinely be open for those. The fs-event
+// router below does NOT read this mirror: its account comes from the tree
+// itself (dirs.currentAccount()), so the change feed already flows while no
+// folder is selected yet (the just-opened client of a first sync).
 let selectedAccount = null;
 let selectedDir = null;
 dirsView.addEventListener('dir-selected', e => {
@@ -250,14 +255,21 @@ function currentDirName() {
 //   mail-view(uid N)    → preview.refresh     (open message's file changed)
 //                         — filename-flag toolbar touch-up only, or closes
 //                         the card when the message is gone; no re-parse
+//   accounts-view       → accounts.refreshAccounts (an account dir appeared
+//                         under / was removed from the granted root — the
+//                         picker re-enumerates even when nothing is open)
+// account: the tree's own account (dirs.currentAccount) — set as soon as
+// loadDirs() runs, so a first sync's events are 'mine' before any folder
+// exists; dir: the dir-selected mirror (an open folder genuinely needed).
 initFsEvents({
-  account: currentAccountId,
+  account: treeAccount,
   dir: currentDirName,
   calls: {
     dirView: refreshDirs,
     dirCounts: refreshCounts,
     mailsDelta: reconcileOpenFolder,
-    mailView: uid => refreshPreview(currentAccountId(), uid)
+    mailView: uid => refreshPreview(currentAccountId(), uid),
+    accountsView: refreshAccounts
   }
 });
 

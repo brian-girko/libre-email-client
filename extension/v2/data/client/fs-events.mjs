@@ -26,6 +26,11 @@
 //                     the filename), so the preview only reconciles the
 //                     toolbar from the filename flags — it never re-parses
 //                     the body; a vanished message closes the card
+//   accounts-view     the account picker — a ROOT-LEVEL single-segment path
+//                     (an account directory mkdir'd under or removed from
+//                     the granted root) re-reads the picker's enumeration no
+//                     matter which account this page is showing, so a first
+//                     (or second) account comes alive without a reload
 //
 // Everything else is filtered out with a reason: events of other accounts,
 // metadata files (.sync-state.json, .sync-prefs.json, .uidvalidity,
@@ -59,7 +64,8 @@ const MAX_WAIT_MS = 1000; // forced fire mid-burst (progressive sync updates)
  *   ops (the router's input); calls = the same ops as printable strings
  *   (dir-view → dirs.refresh, dir-view(counts) → dirs.refreshCounts,
  *   mails-view(delta) → filters.reconcileOpenFolder, mail-view(uid N) →
- *   preview.refresh); note = why nothing would be called (null otherwise)
+ *   preview.refresh, accounts-view → accounts.refreshAccounts);
+ *   note = why nothing would be called (null otherwise)
  */
 export function classifyEvent(msg, {account = null, dir = null} = {}) {
   const verdict = {
@@ -78,6 +84,17 @@ export function classifyEvent(msg, {account = null, dir = null} = {}) {
     return verdict;
   }
   verdict.slug = src[0];
+  // A root-level single-segment endpoint is an ACCOUNT-tree change: an
+  // account dir mkdir'd under, or removed from, the granted root. It
+  // concerns the account picker no matter which account this page shows —
+  // classified before the account-match short-circuits below and dispatched
+  // as the accounts-view op from here even when the match isn't 'mine'.
+  // Root-hidden entries (.picker-probe & friends) are not accounts.
+  const accountDirs = dest ? [src, dest] : [src];
+  if (accountDirs.some(segs => segs.length === 1 && !segs[0].startsWith('.'))) {
+    verdict.actions.push({component: 'accounts-view'});
+    verdict.calls.push('accounts-view');
+  }
   if (!account) {
     verdict.match = 'unselected';
     verdict.note = 'no account selected';
@@ -196,7 +213,8 @@ function toSegs(path) {
 
 // ---- the router ------------------------------------------------------------
 
-let calls = null;   // {dirView, dirCounts, mailsDelta, mailView} — injected
+let calls = null;   // {dirView, dirCounts, mailsDelta, mailView,
+                    //  accountsView} — injected
 let ctx = () => ({});   // {account, dir} getters, evaluated per event
 
 const timers = {};
@@ -234,7 +252,21 @@ function route(msg) {
     (verdict.calls.length
       ? ` · would call: ${verdict.calls.join(', ')}`
       : ` · none (${verdict.note})`));
-  if (verdict.match !== 'mine' || !calls) {
+  if (verdict.match !== 'mine') {
+    // non-mine events drive ONLY the accounts-view op (an account dir
+    // appearing/disappearing matters with this page showing any account);
+    // the view ops below need the matching context
+    if (!calls || !verdict.actions.some(a => a.component === 'accounts-view')) {
+      return;
+    }
+    for (const action of verdict.actions) {
+      if (action.component === 'accounts-view') {
+        schedule('accounts', () => calls.accountsView?.());
+      }
+    }
+    return;
+  }
+  if (!calls) {
     return;
   }
   for (const action of verdict.actions) {
@@ -246,6 +278,11 @@ function route(msg) {
     }
     else if (action.component === 'dir-view') {
       schedule('counts', () => calls.dirCounts?.());
+    }
+    else if (action.component === 'accounts-view') {
+      // a root-level change of THIS account also re-reads the picker: the
+      // dir-view above rebuilds the tree, this keeps the <select> honest
+      schedule('accounts', () => calls.accountsView?.());
     }
     else if (action.component === 'mail-view') {
       pendingUids.add(action.uid);
@@ -261,12 +298,13 @@ function route(msg) {
 
 /**
  * Installs the router. account/dir are GETTER functions evaluated per
- * event (index.mjs mirrors them from the dir-selected event); the calls
- * object carries the view callables — any entry may be absent, that view
- * simply never refreshes from events.
+ * event — account from the folder tree (dirs.mjs, valid before any folder
+ * is selected), dir mirrored from the dir-selected event; the calls object
+ * carries the view callables — any entry may be absent, that view simply
+ * never refreshes from events.
  * @param {{account?: Function, dir?: Function, calls?: {
  *   dirView?: Function, dirCounts?: Function, mailsDelta?: Function,
- *   mailView?: Function}}} wiring
+ *   mailView?: Function, accountsView?: Function}}} wiring
  */
 export function init({account, dir, calls: injected} = {}) {
   calls = injected ?? null;

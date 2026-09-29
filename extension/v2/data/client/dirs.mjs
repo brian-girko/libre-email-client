@@ -133,6 +133,65 @@ function notify(name) {
   }));
 }
 
+// The tree's own account — the router (data/client/fs-events.mjs) reads this
+// as its context getter. Valid from load()'s entry, LONG before any folder
+// is selected, which is what lets the fs-event stream drive the empty tree:
+// an initial sync that creates INBOX while nothing is open still classifies
+// as 'mine' and lands as a dir-view refresh here.
+function currentAccount() {
+  return accountId;
+}
+
+/**
+ * Adopt the folder the load() flow would have opened: the saved pref, else
+ * INBOX, else the first folder — selected on the tree, persisted, and
+ * announced as 'dir-selected' (which also boots the mails view). With
+ * force (load()'s own path) the selection is always recomputed; without it
+ * (the fs-event path via refreshTree) the adoption acts ONLY when the tree
+ * carries no live selection — the empty tree left by the initial-sync
+ * window adopts the first folder the moment the sync creates one, without
+ * ever re-adopting over a user's own choice. The else-arm refreshes the
+ * empty-tree status from the same force logic (a run that ends without
+ * folders re-words the placeholder).
+ * @param {string} id the account the dirs came from (read folder ids guard)
+ * @returns {Promise<void>}
+ */
+async function adoptInitialDir(id, token, dirs, force) {
+  const current = el?.selected ?? null;
+  if (!force && current && dirs.some(d => d?.name === current)) {
+    return;   // the tree's own folder is still on disk: keep it
+  }
+  const saved = await getPref(dirKey(id), null);
+  if (accountId !== id || !el?.isConnected || token !== loadToken) {
+    return;   // the account was switched while the pref was read
+  }
+  let initial = dirs.find(d => d.name === saved);
+  if (!initial) {
+    // saved folder no longer exists (deleted locally): clear the pref so
+    // the stale name cannot linger
+    if (saved != null) {
+      await setPref(dirKey(id), null);
+    }
+    initial = dirs.find(d => d.name.toUpperCase() === 'INBOX') || dirs[0];
+  }
+  if (!initial) {
+    el.syncNeeded(isSyncRunning()
+      ? 'Initial sync in progress — please wait for it to complete.'
+      : 'This account has no folders yet — run a sync.');
+    return;
+  }
+  if (!el.select(initial.name)) {
+    return;
+  }
+  if (initial.name !== saved) {
+    await setPref(dirKey(id), initial.name);
+  }
+  if (token !== loadToken || accountId !== id || !el?.isConnected) {
+    return;   // superseded mid-adoption: the newer load() owns the state
+  }
+  notify(initial.name);
+}
+
 async function load(id) {
   accountId = id;
   const token = ++loadToken;
@@ -175,31 +234,7 @@ async function load(id) {
     // Nothing to bring up to date in the background — the tree/list render
     // from the disk truth immediately (the picker's re-grant flow recovers a
     // lost handle; the sync engine's own pass refreshes the files).
-    const saved = await getPref(dirKey(id), null);
-    let initial = dirs.find(d => d.name === saved);
-    if (!initial) {
-      // saved folder no longer exists (deleted locally): clear the pref so
-      // the stale name cannot linger
-      if (saved != null) {
-        await setPref(dirKey(id), null);
-      }
-      initial = dirs.find(d => d.name.toUpperCase() === 'INBOX') || dirs[0];
-    }
-    if (initial) {
-      el.select(initial.name);
-      if (initial.name !== saved) {
-        await setPref(dirKey(id), initial.name);
-      }
-      if (token !== loadToken) {
-        return;
-      }
-      notify(initial.name);
-    }
-    else {
-      el.syncNeeded(isSyncRunning()
-        ? 'Initial sync in progress — please wait for it to complete.'
-        : 'This account has no folders yet — run a sync.');
-    }
+    await adoptInitialDir(id, token, dirs, true);
   }
   catch (e) {
     if (token !== loadToken) {
@@ -311,23 +346,34 @@ function sameFolderList(a, b) {
 // re-assigned only when the folder set itself changed (folder
 // create/drop), while the per-folder unread/total updates arrive through
 // the counter feed row by row.
+// For a tree that carries no live selection (the initial-sync window's
+// empty tree) the refresh adopts the first folder the sync created —
+// adoptInitialDir() without force — which is what turns the first dir-view
+// into a real tree AND emits the dir-selected the list view needs. The
+// forced load() path keeps its own semantics (account switch, reload).
 async function refreshTree() {
   if (!accountId || !el?.isConnected) {
     return;
   }
+  const id = accountId;
+  const token = loadToken;
   try {
-    const api = await getMailApi(accountId);
+    const api = await getMailApi(id);
     const dirs = await api.listDirs();
+    if (accountId !== id || !el?.isConnected || token !== loadToken) {
+      return;   // the account was switched (or reloaded) while the read ran
+    }
     const names = dirs.map(d => d?.name).filter(Boolean);
-    counters.prune(accountId, names);
-    pruneCountCache(accountId, names);
+    counters.prune(id, names);
+    pruneCountCache(id, names);
     if (!el?.isConnected) {
       return;
     }
     if (!sameFolderList(el.dirs, dirs)) {
       el.dirs = dirs;
     }
-    countDirs(api, accountId, loadToken);
+    await adoptInitialDir(id, token, dirs, false);
+    countDirs(api, id, token);   // after adoption: counts stream into a built tree
   }
   catch {
     /* transient read failure: the next event retries */
@@ -480,4 +526,5 @@ async function deleteDir(e) {
   });
 }
 
-export {init, load, currentDirs, refreshTree as refresh, refreshCounts};
+export {init, load, currentDirs, currentAccount, refreshTree as refresh,
+  refreshCounts};
