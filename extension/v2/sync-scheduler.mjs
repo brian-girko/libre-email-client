@@ -64,9 +64,12 @@
 //
 // Out-of-cycle triggers: a master.pass write into chrome.storage.session
 // (any page, any write with a value) runs the full-boot sweep — accounts
-// that skipped for an unconfirmed master sync right away. The engine's
-// post-run 'sync-pending-dirs' state report re-arms the account's dirty
-// alarm, so dirs left holding pending moves resync on the dirty cadence.
+// that skipped for an unconfirmed master sync right away. A new account in
+// chrome.storage.local (options page or welcome wizard) gets its full
+// cadence armed the moment it exists — boot reconcile only saw the old
+// registry. The engine's post-run 'sync-pending-dirs' state report re-arms
+// the account's dirty alarm, so dirs left holding pending moves resync on
+// the dirty cadence.
 // The context menu adds two more: a full sweep ('Sync Now') and a badge
 // dirty sweep ('Update Badge Now' — syncBadgeDirs, one 'sync-dirs' job per
 // badge-enabled account over its badge-defined folder, or over the account's
@@ -686,6 +689,15 @@ const booting = (async () => {
   }
 })();
 
+// seed the new-account watch's known-id cache once boot has settled: a
+// registry read in the listener itself could race the very write that
+// fired it, while this snapshot is guaranteed older than any change
+// reported afterwards
+let knownAccounts = null;
+booting.then(async () => {
+  knownAccounts = (await registry()).map(a => a.id);
+}).catch(() => {});
+
 // -------------------------------------------------------------- listeners
 
 chrome.alarms.onAlarm.addListener(alarm => {
@@ -750,6 +762,53 @@ chrome.storage.onChanged.addListener((changes, area) => {
   })().catch(e =>
     dlog('scheduler', '[scheduler] master-pass sweep failed:',
       e?.message || e));
+});
+
+// a new account appeared (the options page writes plain 'accounts'; the
+// welcome wizard too, right after Finish): its full cadence needs arming
+// the moment it exists — boot reconcile only saw the OLD registry. The
+// diff is id-based (ids are stable, slugs are not), and the arming mirrors
+// the boot's 'fresh cadence' arm: only accounts with NO existing full
+// alarm get one, so a re-fired edit can never shift another account's
+// timer. Removals are intentionally NOT handled here: a shrinking
+// accounts array can be an in-flight edit, and jobFull already drops
+// alarms whose account vanished from the registry.
+
+chrome.storage.onChanged.addListener(async (changes, area) => {
+  if (area !== 'local' || !('accounts' in changes)) {
+    return;
+  }
+  try {
+    const next = Array.isArray(changes.accounts.newValue)
+      ? changes.accounts.newValue : [];
+    await booting;
+    const known = knownAccounts ?? (await registry()).map(a => a.id);
+    knownAccounts = next.map(a => a.id);
+    const added = next.filter(a => a?.id && !known.includes(a.id));
+    if (!added.length) {
+      return;   // edits, reorders, removals: nothing new to schedule
+    }
+    await booting;
+    dlog('scheduler', '[scheduler] account (id) added:',
+      added.map(a => a.label || a.id).join(', '));
+    const cfg = await settings();
+    const armed = (await chrome.alarms.getAll()
+      .catch(() => [])).filter(isOurs).map(a => a.name);
+    for (const acc of added) {
+      // fresh cadence only when none is armed (and full syncs are on):
+      // mirrors the boot's 'boot fresh' arm, never re-times old accounts
+      if (cfg.enabled && cfg.fullEnabled &&
+          !armed.includes(FULL_PREFIX + acc.id)) {
+        await armFull(acc.id, cfg.fullMs, 'new account ' + acc.id)
+          .catch(() => {});
+      }
+    }
+    await logNextRuns('new account');
+  }
+  catch (e) {
+    dlog('scheduler', '[scheduler] new-account watch failed:',
+      e?.message || e);
+  }
 });
 
 chrome.runtime.onMessage.addListener(msg => {

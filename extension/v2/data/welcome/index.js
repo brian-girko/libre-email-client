@@ -462,6 +462,61 @@ async function saveAccount() {
   }
 
   await chrome.storage.local.set(writes);
+  // the saved account becomes the one this form edits: a retry (a cancelled
+  // master-password prompt, a failed save) must UPDATE it, not mint a
+  // second account with a fresh random id
+  editingId = id;
+  return id;
+}
+
+// Auto-sync after a saved account: load the fresh record (decrypting the
+// password just-in-time — a master-password prompt appears here when needed,
+// window stays open until the job is accepted), then submit it through the
+// regular chain, exactly like the options page does. An unresolvable
+// password (cancelled/wrong master) skips the sync without closing: a stale
+// first sync is worse than a click on Sync now later.
+// Returns true when the sync job was accepted.
+async function startAutoSync(id, formPass) {
+  const promptEl = document.getElementById('prompt');
+  const {loadAccounts} = await import('/data/sync/client/accounts.mjs');
+  let account = null;
+  if (formPass) {
+    // The form's plain password is authoritative and fresh; the record is
+    // only reloaded for metadata (id/name/slug) — no decryption round-trip.
+    account = (await loadAccounts(promptEl, {decrypt: false}).catch(() => []))
+      .find(a => a.id === id) || null;
+    if (account) account.pass = formPass;
+  }
+  else {
+    // Field left empty = keep the stored password, whatever that is; this is
+    // the one path that may prompt for the master password.
+    account = (await loadAccounts(promptEl, {decrypt: true}).catch(e => {
+      console.error('[welcome] account load failed:', e?.message || e);
+      return [];
+    })).find(a => a.id === id) || null;
+  }
+  if (!account || !account.pass) {
+    console.error('[welcome] auto-sync skipped: no usable password for', id);
+    return false;
+  }
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: 'sync-request',
+      rid: 'auto-' + Date.now().toString(36),
+      kind: 'sync',
+      account
+    });
+    if (!res?.ok) {
+      console.error('[welcome] auto-sync not accepted:',
+        res?.error || 'engine did not answer');
+      return false;
+    }
+    return true;
+  }
+  catch (e) {
+    console.error('[welcome] auto-sync failed:', e?.message || e);
+    return false;
+  }
 }
 
 // Form input listeners
@@ -499,8 +554,31 @@ document.addEventListener('click', async ({target}) => {
   }
   else if (cmd === 'finish') {
     if (validateForm()) {
-      await saveAccount();
-      window.close();
+      // the Finish button: disabled while the save + sync-start runs
+      target.disabled = true;
+      let started = false;
+      try {
+        const id = await saveAccount();
+        started = await startAutoSync(id,
+          document.getElementById('f-pass').value);
+      }
+      catch (e) {
+        console.error('[welcome] finish failed:', e?.message || e);
+        document.getElementById('form-error').textContent =
+          'Saving the account failed — try again.';
+        target.disabled = false;
+        return;
+      }
+      if (started) {
+        window.close();
+      }
+      else {
+        // leave the wizard open with feedback: the user can retry Finish or
+        // start the sync later from the client
+        document.getElementById('form-error').textContent =
+          'Account saved, but the first sync could not start. Press Finish to retry, or Sync now in the mail client.';
+        target.disabled = false;
+      }
     }
   }
   else if (cmd === 'check-bridge') {
