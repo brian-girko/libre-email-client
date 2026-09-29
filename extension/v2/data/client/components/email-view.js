@@ -74,6 +74,21 @@ function formatSize(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+// True when a part carries no visible content: whitespace only, or HTML made
+// of empty elements only (e.g. the `<div dir="auto"></div>` that Gmail emits
+// for a message composed and sent with no body). Anything else renders.
+function isBlankContent(value) {
+  if (typeof value !== 'string') {
+    return true;
+  }
+  const stripped = value
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ');
+  return !/\S/.test(stripped);
+}
+
 class EmailView extends HTMLElement {
   #uid = null;
   #displayMode = 'block';
@@ -403,7 +418,7 @@ class EmailView extends HTMLElement {
 
   #renderEmail(email) {
     const root = this.shadowRoot;
-    root.querySelector('.subject').textContent = email.subject || '(no subject)';
+    root.querySelector('.subject').textContent = (email.subject || '').trim() || '(no subject)';
     root.querySelector('.from').textContent = formatAddress(email.from);
     const to = formatAddressList(email.to);
     root.querySelector('.to').textContent = to ? 'to: ' + to : '';
@@ -444,7 +459,13 @@ class EmailView extends HTMLElement {
     this.#chips.hidden = !chips.length;
 
     this.#body.replaceChildren();
-    const html = typeof email.html === 'string' ? email.html : '';
+    // Prefer HTML, but not when it is visually empty (whitespace or empty
+    // elements only — e.g. the `<div dir="auto"></div>` Gmail emits for an
+    // email sent with no body): fall to the text path, and when that is
+    // blank too, show an explicit "(empty message)" instead of a silent
+    // blank iframe.
+    let html = typeof email.html === 'string' && !isBlankContent(email.html) ? email.html : '';
+    const blankText = isBlankContent(email.text);
     if (html && this.#displayMode !== 'text') {
       let content = replaceCids(html, cids);
       if (this.#displayMode !== 'remote') {
@@ -453,7 +474,7 @@ class EmailView extends HTMLElement {
       this.#renderInIframe(injectZoom(content, this.#fontScale));
     }
     else {
-      const text = email.text || (html ? '(no plain text version)' : '(empty message)');
+      const text = (!blankText && email.text) || (html ? '(no plain text version)' : '(empty message)');
       const content = '<style>pre{font:inherit;margin:0;padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}</style>'
         + '<pre>' + escapeHtml(text) + '</pre>';
       this.#renderInIframe(injectZoom(injectCsp(content, BLOCK_CSP), this.#fontScale));
