@@ -40,18 +40,12 @@ const toolbar = document.getElementById('toolbar');
 const downloadBtn = document.getElementById('download-btn');
 const renameBtn = document.getElementById('rename-btn');
 const deleteBtn = document.getElementById('delete-btn');
+const newDirForm = document.getElementById('new-dir-form');
+const newDirName = document.getElementById('new-dir-name');
 const newFolderBtn = document.getElementById('new-folder-btn');
-const newFolderForm = document.getElementById('new-folder-form');
-const newFolderName = document.getElementById('new-folder-name');
-const newFolderCreate = document.getElementById('new-folder-create');
-const newFolderCancel = document.getElementById('new-folder-cancel');
+const newMaildirBtn = document.getElementById('new-maildir-btn');
 const importBtn = document.getElementById('import-btn');
 const importInput = document.getElementById('import-input');
-const newMaildirBtn = document.getElementById('new-maildir-btn');
-const newMaildirForm = document.getElementById('new-maildir-form');
-const newMaildirName = document.getElementById('new-maildir-name');
-const newMaildirCreate = document.getElementById('new-maildir-create');
-const newMaildirCancel = document.getElementById('new-maildir-cancel');
 
 const e2msg = e => e?.message || String(e);
 
@@ -592,14 +586,8 @@ function startRename(entry) {
   input.addEventListener('blur', () => finish(false));
 }
 
-function hideNewFolderForm() {
-  newFolderForm.hidden = true;
-  newFolderBtn.hidden = false;
-  newFolderName.value = '';
-}
-
 async function createNewFolder() {
-  const name = newFolderName.value.trim();
+  const name = newDirName.value.trim();
   if (!name) {
     return;
   }
@@ -608,7 +596,7 @@ async function createNewFolder() {
   }
   try {
     await fs.writer.mkdir(joinPath(currentDirPath(), name));
-    hideNewFolderForm();
+    newDirName.value = '';
     await render();
     setStatus('Created folder ' + name, 'ok');
   }
@@ -617,17 +605,11 @@ async function createNewFolder() {
   }
 }
 
-function hideNewMaildirForm() {
-  newMaildirForm.hidden = true;
-  newMaildirBtn.hidden = false;
-  newMaildirName.value = '';
-}
-
 // A maildir is the base directory plus the three standard subdirectories
 // cur, new and tmp — created here in one action, parent first so the
 // gateway's mkdir does not have to be recursive.
 async function createNewMaildir() {
-  const name = newMaildirName.value.trim();
+  const name = newDirName.value.trim();
   if (!name) {
     return;
   }
@@ -645,7 +627,7 @@ async function createNewMaildir() {
     await render();
     return setStatus('Could not create maildir: ' + e2msg(e), 'bad');
   }
-  hideNewMaildirForm();
+  newDirName.value = '';
   await render();
   setStatus('Created maildir ' + name + ' (cur, new, tmp)', 'ok');
 }
@@ -695,39 +677,16 @@ renameBtn.addEventListener('click', () => {
   }
 });
 
-newFolderBtn.addEventListener('click', () => {
-  newFolderForm.hidden = false;
-  newFolderBtn.hidden = true;
-  newMaildirForm.hidden = true;
-  newMaildirBtn.hidden = false;
-  newFolderName.focus();
-});
-newFolderCancel.addEventListener('click', hideNewFolderForm);
-newFolderForm.addEventListener('submit', e => {
+// One always-visible inline form: 'New Folder' creates a plain directory,
+// 'New Maildir' also lays down cur, new and tmp — the submitter button
+// picks the action.
+newDirForm.addEventListener('submit', e => {
   e.preventDefault();
-  createNewFolder();
-});
-newFolderName.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    hideNewFolderForm();
+  if (e.submitter === newMaildirBtn) {
+    createNewMaildir();
   }
-});
-
-newMaildirBtn.addEventListener('click', () => {
-  newMaildirForm.hidden = false;
-  newMaildirBtn.hidden = true;
-  newFolderForm.hidden = true;
-  newFolderBtn.hidden = false;
-  newMaildirName.focus();
-});
-newMaildirCancel.addEventListener('click', hideNewMaildirForm);
-newMaildirForm.addEventListener('submit', e => {
-  e.preventDefault();
-  createNewMaildir();
-});
-newMaildirName.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    hideNewMaildirForm();
+  else {
+    createNewFolder();
   }
 });
 

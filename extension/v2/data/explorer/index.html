@@ -18,19 +18,11 @@
         <button id="rename-btn" type="button" disabled>Rename</button>
         <button id="delete-btn" type="button" disabled>Delete</button>
         <span class="spacer"></span>
-        <button id="new-folder-btn" type="button">New folder</button>
-        <form id="new-folder-form" hidden>
-          <input id="new-folder-name" type="text" placeholder="Folder name"
+        <form id="new-dir-form">
+          <input id="new-dir-name" type="text" placeholder="Folder name"
             autocomplete="off" spellcheck="false">
-          <button id="new-folder-create" type="submit">Create</button>
-          <button id="new-folder-cancel" type="button">Cancel</button>
-        </form>
-        <button id="new-maildir-btn" type="button">New maildir</button>
-        <form id="new-maildir-form" hidden>
-          <input id="new-maildir-name" type="text" placeholder="Maildir name"
-            autocomplete="off" spellcheck="false">
-          <button id="new-maildir-create" type="submit">Create</button>
-          <button id="new-maildir-cancel" type="button">Cancel</button>
+          <button id="new-folder-btn" type="submit">New Folder</button>
+          <button id="new-maildir-btn" type="submit">New Maildir</button>
         </form>
         <button id="import-btn" type="button">Import files</button>
         <input id="import-input" type="file" multiple hidden>
