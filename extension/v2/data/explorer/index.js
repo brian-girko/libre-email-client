@@ -162,7 +162,7 @@ function start({handle, name}) {
   gate.hidden = true;
   shell.hidden = false;
   rootName = name;
-  path = [];
+  path = restorePathFromHash();
   // the gate verified this exact handle — the gateway wraps it fresh (the
   // cache must not pin a facade from a previous grant cycle)
   prepare('explorer', {handle, fresh: true}).then(facade => {
@@ -222,6 +222,29 @@ function currentName() {
 function resetSelection() {
   selection = new Set();
   anchorIndex = -1;
+}
+
+// The path lives in the url hash ('#/foo/bar') so a refresh of the tab
+// reopens the same directory; the options page mirrors its tabs into the
+// hash the same way. Names are escaped, and replaceState keeps browser
+// history clean — only the visited-at-reload state persists.
+function syncHash() {
+  const hash = '#/' + path.map(encodeURIComponent).join('/');
+  if (path.length && location.hash !== hash) {
+    history.replaceState(null, '', hash);
+  }
+  else if (!path.length && location.hash) {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+}
+
+/** the ['foo', 'bar'] carried by '#/foo/bar', or [] when absent/invalid */
+function restorePathFromHash() {
+  const hash = decodeURIComponent(location.hash.slice(1));
+  if (!hash.startsWith('/')) {
+    return [];
+  }
+  return hash.slice(1).split('/').filter(Boolean);
 }
 
 // The last crumb is plain text (the current directory, nothing to click);
@@ -428,7 +451,10 @@ async function sizeTextLater(entry, node) {
 
 let renderSeq = 0;
 
-async function render() {
+// note: the read error of a previous directory — the recovery render
+// lands at the root and shows it instead of the success counts
+async function render(note) {
+  syncHash();
   const seq = ++renderSeq;
   renderBreadcrumb();
   listing.textContent = '';
@@ -440,6 +466,14 @@ async function render() {
   catch (e) {
     resetSelection();
     updateToolbar();
+    // a stale hash (or a directory deleted elsewhere) must not dead-end
+    // the page: surface the error once and fall back to the root — a
+    // root that cannot be listed is a real failure, so no second jump
+    if (path.length) {
+      const missed = '/' + currentDirPath();
+      path = []; // the recovery render lists the root instead
+      return render('Could not read ' + missed + ': ' + e2msg(e) + ' — back at the root');
+    }
     return setStatus('Could not read directory: ' + e2msg(e), 'bad');
   }
   if (seq !== renderSeq) {
@@ -455,6 +489,9 @@ async function render() {
   const dirs = entries.filter(e => e.kind === 'directory').length;
   renderRows(entries);
   syncSelectionClasses();
+  if (note) {
+    return setStatus(note, 'bad'); // recovery render: the error outranks the counts
+  }
   setStatus(entries.length
     ? dirs + ' folders, ' + (entries.length - dirs) + ' files — single-click to select, double-click opens (folders) or downloads (files)'
     : 'empty directory', 'ok');
