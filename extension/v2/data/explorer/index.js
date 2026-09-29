@@ -12,8 +12,8 @@
 // ranges, Space toggles the focused row); a double click opens it —
 // directories are entered, files are downloaded. The toolbar offers
 // download, delete and rename for the selection plus always-available
-// new-folder and import actions. Write access is requested lazily on the
-// first mutating action.
+// new-folder, new-maildir and import actions. Write access is requested
+// lazily on the first mutating action.
 
 'use strict';
 
@@ -47,6 +47,11 @@ const newFolderCreate = document.getElementById('new-folder-create');
 const newFolderCancel = document.getElementById('new-folder-cancel');
 const importBtn = document.getElementById('import-btn');
 const importInput = document.getElementById('import-input');
+const newMaildirBtn = document.getElementById('new-maildir-btn');
+const newMaildirForm = document.getElementById('new-maildir-form');
+const newMaildirName = document.getElementById('new-maildir-name');
+const newMaildirCreate = document.getElementById('new-maildir-create');
+const newMaildirCancel = document.getElementById('new-maildir-cancel');
 
 const e2msg = e => e?.message || String(e);
 
@@ -612,6 +617,39 @@ async function createNewFolder() {
   }
 }
 
+function hideNewMaildirForm() {
+  newMaildirForm.hidden = true;
+  newMaildirBtn.hidden = false;
+  newMaildirName.value = '';
+}
+
+// A maildir is the base directory plus the three standard subdirectories
+// cur, new and tmp — created here in one action, parent first so the
+// gateway's mkdir does not have to be recursive.
+async function createNewMaildir() {
+  const name = newMaildirName.value.trim();
+  if (!name) {
+    return;
+  }
+  if (!await ensureWriteAccess()) {
+    return setStatus('Write permission denied for the storage root.', 'bad');
+  }
+  const base = joinPath(currentDirPath(), name);
+  try {
+    await fs.writer.mkdir(base);
+    for (const sub of ['cur', 'new', 'tmp']) {
+      await fs.writer.mkdir(joinPath(base, sub));
+    }
+  }
+  catch (e) {
+    await render();
+    return setStatus('Could not create maildir: ' + e2msg(e), 'bad');
+  }
+  hideNewMaildirForm();
+  await render();
+  setStatus('Created maildir ' + name + ' (cur, new, tmp)', 'ok');
+}
+
 async function importFiles(files) {
   if (!files.length) {
     return;
@@ -660,6 +698,8 @@ renameBtn.addEventListener('click', () => {
 newFolderBtn.addEventListener('click', () => {
   newFolderForm.hidden = false;
   newFolderBtn.hidden = true;
+  newMaildirForm.hidden = true;
+  newMaildirBtn.hidden = false;
   newFolderName.focus();
 });
 newFolderCancel.addEventListener('click', hideNewFolderForm);
@@ -670,6 +710,24 @@ newFolderForm.addEventListener('submit', e => {
 newFolderName.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     hideNewFolderForm();
+  }
+});
+
+newMaildirBtn.addEventListener('click', () => {
+  newMaildirForm.hidden = false;
+  newMaildirBtn.hidden = true;
+  newFolderForm.hidden = true;
+  newFolderBtn.hidden = false;
+  newMaildirName.focus();
+});
+newMaildirCancel.addEventListener('click', hideNewMaildirForm);
+newMaildirForm.addEventListener('submit', e => {
+  e.preventDefault();
+  createNewMaildir();
+});
+newMaildirName.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    hideNewMaildirForm();
   }
 });
 

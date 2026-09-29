@@ -170,6 +170,7 @@ async function fsWrite(origin, root, filePath, data, {quiet = false} = {}) {
     }
     catch (e) {
       if (e?.name !== 'NotFoundError') {
+        console.log(e);
         throw e;   // e.g. a DIRECTORY sits at this path — surface it
       }
       existed = false;
