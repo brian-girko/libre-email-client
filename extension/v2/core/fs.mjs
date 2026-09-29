@@ -77,6 +77,28 @@ async function dirAt(root, segs, {create = false} = {}) {
   return dir;
 }
 
+// ------------------------------------------------------------------ errors
+
+/**
+ * Path-tagged wrapper for an escaping FS Access API error. The API's
+ * DOMExceptions carry no path, so every consumer log would die with a bare
+ * "NotFoundError: A requested file or directory could not be found…" and
+ * one call site could never tell WHICH path went missing. PRESERVES e.name
+ * so every caller's NotFoundError / TypeMismatchError branching keeps
+ * working. Errors of the gateway's own composition (the "fs:" guards) pass
+ * through untouched — they already say what went wrong.
+ */
+function tagged(e, what, path, dest = null) {
+  if (e instanceof Error && /^fs[a-z.]*: /.test(e.message)) {
+    return e;
+  }
+  const where = dest == null ? `'${path}'` : `'${path}' → '${dest}'`;
+  const err = new Error(`fs ${what} ${where}: ${e?.name ?? 'Error'}: ` +
+    String(e?.message ?? e));
+  err.name = e?.name ?? 'Error';
+  return err;
+}
+
 // ------------------------------------------------------------------ events
 
 // Same-context subscribers: sendMessage does NOT deliver to the sender, so
@@ -115,7 +137,13 @@ function emitFsEvent(origin, operation, src, dest) {
 // ------------------------------------------------------------------ reader
 
 async function fsList(root, dirPath = '') {
-  const dir = await dirAt(root, splitPath(dirPath));
+  let dir;
+  try {
+    dir = await dirAt(root, splitPath(dirPath));
+  }
+  catch (e) {
+    throw tagged(e, 'list', dirPath);
+  }
   const out = [];
   for await (const [name, handle] of dir.entries()) {
     out.push({name, kind: handle.kind});
@@ -125,8 +153,21 @@ async function fsList(root, dirPath = '') {
 
 async function fsRead(root, filePath) {
   const segs = splitPath(filePath);
-  const dir = await dirAt(root, segs.slice(0, -1));
-  return (await dir.getFileHandle(segs[segs.length - 1])).getFile();
+  let dir;
+  let fh;
+  try {
+    dir = await dirAt(root, segs.slice(0, -1));
+    fh = await dir.getFileHandle(segs[segs.length - 1]);
+  }
+  catch (e) {
+    throw tagged(e, 'read', filePath);
+  }
+  try {
+    return await fh.getFile();
+  }
+  catch (e) {
+    throw tagged(e, 'read', filePath);
+  }
 }
 
 async function fsStat(root, path) {
@@ -134,8 +175,22 @@ async function fsStat(root, path) {
   if (!segs.length) {
     return {exists: true, kind: 'directory', size: 0, lastModified: 0};
   }
-  const parent = await dirAt(root, segs.slice(0, -1));
   const name = segs[segs.length - 1];
+  let parent;
+  try {
+    parent = await dirAt(root, segs.slice(0, -1));
+  }
+  catch (e) {
+    // a missing PARENT means the path itself cannot exist ("exists" is a
+    // predicate — the very shape every missing-dir caller depends on: the
+    // initial sync's maildirOf() probes <acc>/<dir>/tmp before <acc>/<dir>
+    // ever exists, and the client asks exists() on just-deleted dirs)
+    if (e?.name === 'NotFoundError') {
+      return {exists: false, kind: null, size: 0, lastModified: 0};
+    }
+    // a FILE blocks the parent chain (TypeMismatchError): a real shape error
+    throw tagged(e, 'stat', path);
+  }
   try {
     const file = await (await parent.getFileHandle(name)).getFile();
     return {exists: true, kind: 'file', size: file.size, lastModified: file.lastModified};
@@ -145,10 +200,15 @@ async function fsStat(root, path) {
       return {exists: false, kind: null, size: 0, lastModified: 0};
     }
     if (e?.name === 'TypeMismatchError') {
-      await parent.getDirectoryHandle(name);   // rethrows NotFoundError if truly gone
+      try {
+        await parent.getDirectoryHandle(name);   // rethrows NotFoundError if truly gone
+      }
+      catch (e2) {
+        throw tagged(e2, 'stat', path);
+      }
       return {exists: true, kind: 'directory', size: 0, lastModified: 0};
     }
-    throw e;
+    throw tagged(e, 'stat', path);
   }
 }
 
@@ -170,16 +230,20 @@ async function fsWrite(origin, root, filePath, data, {quiet = false} = {}) {
     }
     catch (e) {
       if (e?.name !== 'NotFoundError') {
-        console.log(e);
         throw e;   // e.g. a DIRECTORY sits at this path — surface it
       }
       existed = false;
     }
   }
-  const fh = await dir.getFileHandle(name, {create: true});
-  const w = await fh.createWritable();
-  await w.write(data);
-  await w.close();
+  try {
+    const fh = await dir.getFileHandle(name, {create: true});
+    const w = await fh.createWritable();
+    await w.write(data);
+    await w.close();
+  }
+  catch (e) {
+    throw tagged(e, 'write', filePath);
+  }
   if (!quiet) {
     emitFsEvent(origin, existed ? 'change' : 'create', segs.join('/'), null);
   }
@@ -198,10 +262,15 @@ async function fsMkdir(origin, root, dirPath, {quiet = false} = {}) {
   }
   catch (e) {
     if (e?.name !== 'NotFoundError') {
-      throw e;   // e.g. a FILE sits at this path — surface the mismatch
+      throw tagged(e, 'mkdir', dirPath);   // e.g. a FILE sits at this path — surface the mismatch
     }
   }
-  await dirAt(root, segs, {create: true});
+  try {
+    await dirAt(root, segs, {create: true});
+  }
+  catch (e) {
+    throw tagged(e, 'mkdir', dirPath);
+  }
   if (!quiet) {
     emitFsEvent(origin, 'create', segs.join('/'), null);
   }
@@ -215,35 +284,40 @@ async function fsMove(origin, root, srcPath, destPath, {quiet = false} = {}) {
   if (!src.length || !dest.length) {
     throw new Error('fs.move: empty path');
   }
-  const srcParent = await dirAt(root, src.slice(0, -1));
-  let handle;
   try {
-    handle = await srcParent.getFileHandle(src[src.length - 1]);
-  }
-  catch (e) {
-    if (e?.name === 'TypeMismatchError') {
-      // a directory rename attempt — same call the explorer made directly
-      handle = await srcParent.getDirectoryHandle(src[src.length - 1]);
+    const srcParent = await dirAt(root, src.slice(0, -1));
+    let handle;
+    try {
+      handle = await srcParent.getFileHandle(src[src.length - 1]);
+    }
+    catch (e) {
+      if (e?.name === 'TypeMismatchError') {
+        // a directory rename attempt — same call the explorer made directly
+        handle = await srcParent.getDirectoryHandle(src[src.length - 1]);
+      }
+      else {
+        throw e;
+      }
+    }
+    if (typeof handle.move !== 'function') {
+      throw new Error('this browser does not support renaming');
+    }
+    const destDir = await dirAt(root, dest.slice(0, -1));
+    const destName = dest[dest.length - 1];
+    if (src.slice(0, -1).join('/') === dest.slice(0, -1).join('/')) {
+      await handle.move(destName);
     }
     else {
-      throw e;
+      await handle.move(destDir, destName);
     }
+    if (!quiet) {
+      emitFsEvent(origin, 'move', src.join('/'), dest.join('/'));
+    }
+    return dest.join('/');
   }
-  if (typeof handle.move !== 'function') {
-    throw new Error('this browser does not support renaming');
+  catch (e) {
+    throw tagged(e, 'move', src.join('/'), dest.join('/'));
   }
-  const destDir = await dirAt(root, dest.slice(0, -1));
-  const destName = dest[dest.length - 1];
-  if (src.slice(0, -1).join('/') === dest.slice(0, -1).join('/')) {
-    await handle.move(destName);
-  }
-  else {
-    await handle.move(destDir, destName);
-  }
-  if (!quiet) {
-    emitFsEvent(origin, 'move', src.join('/'), dest.join('/'));
-  }
-  return dest.join('/');
 }
 
 /** deletes one file or directory tree; emits 'delete'; missing → false */
@@ -252,7 +326,16 @@ async function fsRemove(origin, root, path, {recursive = false, quiet = false} =
   if (!segs.length) {
     throw new Error('fs: refusing to remove the root itself');
   }
-  const parent = await dirAt(root, segs.slice(0, -1));
+  let parent;
+  try {
+    parent = await dirAt(root, segs.slice(0, -1));
+  }
+  catch (e) {
+    if (e?.name === 'NotFoundError') {
+      return false;   // parent gone → the entry cannot exist: same no-op
+    }
+    throw tagged(e, 'remove', path);
+  }
   try {
     await parent.removeEntry(segs[segs.length - 1], {recursive: !!recursive});
   }

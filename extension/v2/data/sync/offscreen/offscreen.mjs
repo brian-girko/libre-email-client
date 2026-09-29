@@ -1007,7 +1007,9 @@ async function withSession(job) {
     return {started: true};
   }
   catch (e) {
-    engineLog('warn', 'FAILED: ' + (e?.stack || e), 'warn');
+    engineLog('warn',
+      'FAILED [' + (activeLabel || 'sync') + ']: ' + (e?.stack || e),
+      'warn');
     // The job still settles — always. Best-effort last duties before the
     // teardown: the INBOX messages the dying run LANDED are filtered too
     // ("received messages are filtered, error or not" — engine may be

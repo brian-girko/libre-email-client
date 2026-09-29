@@ -311,6 +311,63 @@ assert.equal(await fs.reader.exists('acc'), false);
 assert.equal(drain().at(-1).operation, 'delete');
 ok('reset removes the whole account dir');
 
+// ---- 4b. missing PARENT dirs read as "not exists", never a crash ------------
+// (regression: the initial-sync survey crashed its whole run — fsStat
+// resolved the parent OUTSIDE its catch, so a missing <slug>/<dir> threw
+// NotFoundError instead of answering {exists: false} / null. The survey's
+// listLocal() → null IS the designed "local dir missing" signal.)
+
+assert.equal(await fs.reader.exists('new-account/INBOX/tmp'), false);
+assert.deepEqual(await fs.reader.stat('new-account/INBOX/new'),
+  {exists: false, kind: null, size: 0, lastModified: 0});
+ok('exists/stat answer "not exists" when a parent dir is missing');
+
+let listed = null;
+try {
+  await fs.reader.list('new-account/INBOX/cur');
+}
+catch (e) {
+  listed = e;
+}
+assert.equal(listed?.name, 'NotFoundError');   // listLocal's catch keys on the NAME
+assert.match(listed?.message ?? '', /'new-account\/INBOX\/cur'/);
+ok('list of a missing dir still throws, but tagged with its path (name kept)');
+
+const fresh = new MaildirStore(fs, 'new-account');
+await fresh.open();   // only the account dir exists — no folders yet
+drain();
+assert.equal(await fresh.listLocal('INBOX'), null);
+assert.equal(await fresh.readUidValidity('INBOX'), null);
+ok('store survey helpers survive a virgin account (listLocal/readUidValidity → null)');
+
+let moveErr = null;
+try {
+  await fs.writer.move('new-account/nope/a', 'new-account/nope/b');
+}
+catch (e) {
+  moveErr = e;
+}
+assert.match(moveErr?.message ?? '',
+  /^fs move 'new-account\/nope\/a' → 'new-account\/nope\/b'/);
+assert.equal(moveErr?.name, 'NotFoundError');
+ok('move failures carry the src → dest path, name preserved');
+
+await fs.writer.write('tag-blocker', 'x');   // a FILE where a dir is wanted
+drain();
+let shape = null;
+try {
+  await fs.writer.mkdir('tag-blocker/sub');
+}
+catch (e) {
+  shape = e;
+}
+assert.equal(shape?.name, 'TypeMismatchError');
+assert.match(shape?.message ?? '', /'tag-blocker\/sub'/);
+ok('a file blocking a dir chain surfaces as TypeMismatchError with its path');
+
+await fs.writer.remove('tag-blocker', {quiet: true});
+drain();
+
 // ---- 5. a failing gate refuses every operation ------------------------------
 
 const bare = await prepare('nogate', {silent: true, fresh: true});

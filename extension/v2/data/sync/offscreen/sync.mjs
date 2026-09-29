@@ -1656,7 +1656,9 @@ async function rowsFor(name, uidnext) {
         continue;
       }
       i++;
-      const tag = `${op.kind === 'append' ? 'upload' : op.kind} ${op.folder}/${op.fileName ?? op.uid ?? '*'}`;
+      const tag = `${op.kind === 'append' ? 'upload' : op.kind} ` +
+        `${op.folder}/${op.fileName ?? op.uid ?? '*'}` +
+        (op.toFolder ? ` → ${op.toFolder}` : '');
       try {
         switch (op.kind) {
           case 'resync': {
