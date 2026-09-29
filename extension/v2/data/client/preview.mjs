@@ -2,6 +2,7 @@ import './components/email-view.js';
 import './components/emails-view.js';
 import {getMailApi} from './mail.mjs';
 import {FONT_SCALE_DEFAULTS, normalizeFontScale} from './font-scale.mjs';
+import {starColorOf} from './star-colors.mjs';
 
 let el = null;
 let list = null;
@@ -140,11 +141,14 @@ function init(element, listView, dirsView) {
   });
 }
 
-// Re-read one open card — the fs-event router's mail-view call: the
-// message's file was renamed away (a flag rewrite or folder move from
-// another context) or deleted under the open preview. readFile() re-lists
-// the folder per attempt, so the rename is survived; a gone message fails
-// the card ("body not available locally"). A closed card is a no-op.
+// Reconcile one open card with the filename truth — the fs-event router's
+// mail-view call. The message's file was renamed away (a flag rewrite or
+// folder move from another context) or deleted under the open preview, and
+// NO fs-event ever changes email content (flag truth lives in the maildir
+// filename; 'change' events are never routed here), so the body/iframe is
+// never re-parsed: readFlags() touches only the toolbar; a gone message
+// closes the card. A closed card is a no-op; a transient read failure
+// leaves the card as it is.
 async function refresh(accountId, uid) {
   if (accountId == null || uid == null) {
     return;
@@ -153,19 +157,22 @@ async function refresh(accountId, uid) {
   if (!card) {
     return;
   }
+  let flags;
   try {
     const api = await getMailApi(accountId);
-    const raw = await api.readFile(uid);
-    if (cardFor(uid) !== card) {
-      return;   // the card closed while the read ran
-    }
-    card.raw = raw;
+    flags = await api.readFlags(uid);
   }
-  catch (e) {
-    if (cardFor(uid) === card) {
-      card.fail(e?.message || String(e));
-    }
+  catch {
+    return;   // no dir open / transient read failure: keep what we have
   }
+  if (cardFor(uid) !== card) {
+    return;   // the card closed while the read ran
+  }
+  if (flags == null) {
+    card.remove();   // the message is gone from the folder
+    return;
+  }
+  card.color = starColorOf(flags);
 }
 
 export {init, refresh};

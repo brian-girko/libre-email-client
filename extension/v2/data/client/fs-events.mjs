@@ -21,7 +21,11 @@
 //                     flag truth lives in the filename
 //   mail-view         the open message — its file was renamed away or
 //                     deleted under it (a flag rename or purge from another
-//                     context); a create can never be the open message
+//                     context); a create can never be the open message.
+//                     No fs-event can change mail content (flag truth is
+//                     the filename), so the preview only reconciles the
+//                     toolbar from the filename flags — it never re-parses
+//                     the body; a vanished message closes the card
 //
 // Everything else is filtered out with a reason: events of other accounts,
 // metadata files (.sync-state.json, .sync-prefs.json, .uidvalidity,

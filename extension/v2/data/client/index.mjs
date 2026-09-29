@@ -248,6 +248,8 @@ function currentDirName() {
 //   dir-view(counts)    → dirs.refreshCounts  (unread/total moved)
 //   mails-view(delta)   → filters.reconcileOpenFolder (guarded in-place sync)
 //   mail-view(uid N)    → preview.refresh     (open message's file changed)
+//                         — filename-flag toolbar touch-up only, or closes
+//                         the card when the message is gone; no re-parse
 initFsEvents({
   account: currentAccountId,
   dir: currentDirName,

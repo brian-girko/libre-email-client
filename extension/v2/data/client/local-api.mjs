@@ -378,6 +378,20 @@ async function buildApi(accountId) {
       return await readMessage(store, accountId, selected, uid);
     },
 
+    /**
+     * Flags of one message of the open dir — the maildir filename truth,
+     * no content read. null when the uid no longer lists (purged, \Deleted
+     * or moved to another folder): folderRows() keeps those rows out.
+     * The preview's fs-event refresh runs on this alone — flag truth
+     * lives in the filename, so the body never needs a re-read.
+     */
+    async readFlags(uid) {
+      if (!selected) throw new Error('openDir() first');
+      const {rows} = await folderRows(store, accountId, selected);
+      const row = rows.find(r => r.uid === Number(uid));
+      return row ? [...row.flags] : null;
+    },
+
     async search(options) {
       const {
         dir,
