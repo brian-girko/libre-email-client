@@ -327,7 +327,7 @@
         <legend>Filters</legend>
         <div class="row">
           <button type="button" id="add-filter">Add filter</button>
-          <span class="hint">Order matters: filters are evaluated top to bottom and the first match wins. Use the ↑/↓ buttons to move a row.</span>
+          <span class="hint">Order matters: filters are evaluated top to bottom and the first match wins. Use the ↑/↓ buttons to move a row. A "stop" filter protects the messages it matches from every filter below it.</span>
         </div>
         <div id="filter-list"></div>
         <p class="hint" id="filter-list-empty">No filters yet.</p>
@@ -356,6 +356,13 @@ from:news@example.com'></text-viewer>
           </fieldset>
           <fieldset>
             <legend>Action</legend>
+            <label>Action
+              <select id="ff-action">
+                <option value="move">Move to destination server folder</option>
+                <option value="stop">Stop filters — leave the message where it is</option>
+              </select>
+            </label>
+            <p class="hint" id="ff-action-hint" hidden>A matching message is left untouched and the remaining filters are never consulted for it — a guard rule: place it above the filters it must shield.</p>
             <label>Destination server folder
               <input type="text" id="ff-folder" placeholder="Newsletters, Work, ...">
             </label>

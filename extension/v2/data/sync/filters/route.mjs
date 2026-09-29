@@ -4,8 +4,9 @@
 // key 'filters') and the matcher in query.mjs. routeMessage(raw, opts)
 // parses the message with the bundled postal-mime parser, walks the filter
 // list in stored order (first match wins — the options page's rule) and
-// returns the folder the message has to be delivered to, plus the filter's
-// createFolder wish so the caller can create the directory before moving.
+// reports WHAT matched: a move filter's destination folder (plus its
+// createFolder wish so the caller can create the directory before
+// moving) or a stop filter's "leave it, and skip the remaining filters".
 //
 // Callers: the sync interface (via loadFilters) and the offscreen engine.
 // The offscreen document has no chrome.storage, so the filter LIST always
@@ -67,20 +68,25 @@ export async function parseMessage(raw) {
 /**
  * Decides the destination of one email: parses it, walks the filter list
  * in order and reports the folder of the first filter that matches.
+ * moving); a winning 'stop' filter (action === 'stop') names no folder —
+ * it means "leave this message alone, later filters are not consulted".
  * Skipped: disabled filters, filters scoped to another account
  * (accountId '' = all accounts) and legacy entries whose query is not a
  * string ("old format — edit and save again" rows never match). An empty
  * query matches nothing, exactly like the query language itself.
  * @param {Uint8Array} raw raw RFC822 message bytes
  * @param {{filters: Array, accountId?: string|null}} opts filters as
- *   stored by the options page ({id, enabled, accountId, query, folder,
- *   createFolder, description}); accountId of the mail's own account
- * @returns {Promise<{matched: boolean, folder: string|null,
- *            createFolder: boolean, filter: {id, description}|null,
- *            detail: object|null}>}
+ *   stored by the options page ({id, enabled, accountId, query, action,
+ *   folder, createFolder, description}); accountId of the mail's own
+ *   account
+ * @returns {Promise<{matched: boolean, action: string|null,
+ *            folder: string|null, createFolder: boolean,
+ *            filter: {id, description}|null, detail: object|null}>}
+ *   action is 'move' | 'stop' | null (nothing matched); folder is the
+ *   winning move filter's destination, null for a stop winner
  */
 export async function routeMessage(raw, {filters, accountId = null} = {}) {
-  const none = {matched: false, folder: null, createFolder: false, filter: null, detail: null};
+  const none = {matched: false, action: null, folder: null, createFolder: false, filter: null, detail: null};
   const parsed = await parseMessage(raw);
   if (!parsed.ok) {
     return {...none, detail: {reason: parsed.reason}};
@@ -95,12 +101,17 @@ export async function routeMessage(raw, {filters, accountId = null} = {}) {
     if (typeof filter.query !== 'string') {
       continue;   // legacy row: can never match until edited and saved
     }
+    const stop = filter.action === 'stop';
+    if (!stop && !filter.folder) {
+      continue;   // a move filter without a destination is not runnable
+    }
     const detail = filterMatches(filter.query, parsed.msg);
     if (detail.matched) {
       return {
         matched: true,
-        folder: String(filter.folder ?? ''),
-        createFolder: !!filter.createFolder,
+        action: stop ? 'stop' : 'move',
+        folder: stop ? null : String(filter.folder ?? ''),
+        createFolder: stop ? false : !!filter.createFolder,
         filter: {id: filter.id ?? null, description: filter.description ?? ''},
         detail
       };

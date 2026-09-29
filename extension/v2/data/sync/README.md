@@ -508,6 +508,18 @@ edges stay obvious: a pull the run never landed has nothing on disk to
 filter (correctly absent from the pass), and the pass touches the local
 mirror only — a wedged bridge never takes part in it.
 
+**Stop filters.** Each stored filter carries an optional `action` field:
+`move` (the default, absent on every pre-existing row) renames the match
+into the filter's folder as before, while `stop` moves nothing — the
+message stays where it is and the walk ENDS there: later filters are
+never consulted for it. A stop filter is the per-message guard: place it
+above the move filters it must shield, and their queries can stay
+simple (no `not` chains). Stop filters are runnable everywhere the move
+filters are — the sync panel's filter row (a single pick reports its
+matches, renames nothing), "use all filters" walks and the post-sync
+pass; the executor treats a missing folder as fine exactly when the
+action is `stop`.
+
 **Purge gate:** a message that is in the snapshot but gone from the
 Maildir with *no* foreign-FMD5 file anywhere in the handle (the user took
 the file outside the granted directory) classifies as `deleteServer` — a

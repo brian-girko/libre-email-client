@@ -14,6 +14,14 @@
 // the precedence, and a match whose destination equals the source dir
 // anchors the message in place instead of letting later filters move it.
 //
+// Action shapes: a filter is either a MOVE (action 'move', the default —
+// a match renames the message into filter.folder) or a STOP (action
+// 'stop' — a match moves nothing and ENDS the walk for that message:
+// later filters are never consulted, the message stays where it is).
+// A stop filter is the per-message guard, placed above the filters it
+// must shield — first match wins, so a stop hit protects the message
+// from every move below it.
+//
 // Store-only by design: the caller hands in the MaildirStore, so this
 // module runs equally panel-side (the sync interface page owns the granted
 // handle too) and later inside the offscreen engine. No chrome.*, no
@@ -88,9 +96,11 @@ async function messageTime(parsed, entry, store) {
  * @param {object} opts
  * @param {string} opts.dir local Maildir dir (server folder name)
  * @param {object} opts.filter an options-page filter {id, enabled,
- *   accountId, query, folder, createFolder, description} — folder is
- *   canonicalized onto the store's delimiter before any comparison,
- *   log line or move ('/'-typed paths on '.'-delimiter servers)
+ *   accountId, query, action, folder, createFolder, description} — a
+ *   'move' filter moves into folder, a 'stop' filter (action === 'stop')
+ *   matches, logs and moves nothing; folder is canonicalized onto the
+ *   store's delimiter before any comparison, log line or move
+ *   ('/'-typed paths on '.'-delimiter servers)
  * @param {string|null} [opts.accountId] the mail's own account id
  *   (filters scoped to another account never match)
  * @param {string} [opts.scope] 'unread' | '10m' | '30m' | '1h' | '5h' —
@@ -100,15 +110,17 @@ async function messageTime(parsed, entry, store) {
  *   the stored list (shown as 'of Filter N' in match lines); null/absent
  *   omits the filter number (single-filter runs)
  * @param {Function} [opts.log] log(content, cls)
- * @returns {Promise<{candidates: number, matched: number, moved: number}>}
+ * @returns {Promise<{candidates: number, matched: number, moved: number,
+ *            kept: number}>} kept = matches anchored by the stop action
  */
 export async function runFilter(store, {
   dir, filter, accountId = null, scope = 'unread', dry = false,
   filterNo = null, log = () => {}
 } = {}) {
-  const res = {candidates: 0, matched: 0, moved: 0};
+  const res = {candidates: 0, matched: 0, moved: 0, kept: 0};
+  const stop = filter?.action === 'stop';
   if (!filter || typeof filter !== 'object' ||
-      typeof filter.query !== 'string' || !filter.folder) {
+      typeof filter.query !== 'string' || (!stop && !filter.folder)) {
     log('filter run: the selected filter is not runnable (no query or destination folder)', 'warn');
     return res;
   }
@@ -123,9 +135,10 @@ export async function runFilter(store, {
   // the destination in the account's own spelling: '/'-typed filter
   // paths map onto the hierarchy delimiter, so the src===dest guard,
   // the snapshot lookup, the match lines and the move all compare and
-  // target the canonical name
-  const dest = normalizeFolderPath(filter.folder, store.delimiter);
-  if (dir && sameFolder(dest, dir, store.delimiter)) {
+  // target the canonical name. A stop filter names no destination: its
+  // matches simply stay put.
+  const dest = stop ? '' : normalizeFolderPath(filter.folder, store.delimiter);
+  if (dir && dest && sameFolder(dest, dir, store.delimiter)) {
     log(`filter skipped: source and destination are both "${dir}" — nothing to match`, 'warn');
     return res;
   }
@@ -192,7 +205,11 @@ export async function runFilter(store, {
         ? `Line ${nums} of Filter ${Number(filterNo)}`
         : `Line ${nums}`;
       const subj = parsed.msg.subject ? `"${trunc(parsed.msg.subject)}" ` : '';
-      log(`${subj}-> ${lines} -> ${dest}`);
+      log(`${subj}-> ${lines} -> ${stop ? 'stop filters (nothing moved)' : dest}`);
+      if (stop) {
+        res.kept++;   // a match ends here: nothing to rename
+        continue;
+      }
       hits.push({uid, entry});
     }
   }
@@ -238,16 +255,19 @@ export async function runFilter(store, {
  * exactly the options page's delivery-time rule. A winner whose
  * destination IS the run's source dir anchors the message in place
  * (nothing to move, later filters never see it), so a self-targeted
- * match can never push the message into a wrong dir. One candidate
- * failing (unreadable, unparseable, failed move) never stops the rest.
+ * match can never push the message into a wrong dir; a 'stop' winner
+ * anchors the same way with no destination at all — it moves nothing
+ * and cuts the walk for that message. One candidate failing
+ * (unreadable, unparseable, failed move) never stops the rest.
  * @param {MaildirStore} store the account's open local mirror
  * @param {object} opts
  * @param {string} opts.dir local Maildir dir (server folder name)
  * @param {Array<object>} opts.filters options-page filters in STORED
- *   order ({id, enabled, accountId, query, folder, createFolder,
- *   description}) — the walk order IS the precedence; each folder is
- *   canonicalized onto the store's delimiter before any comparison,
- *   log line or move
+ *   order ({id, enabled, accountId, query, action, folder, createFolder,
+ *   description}) — the walk order IS the precedence; a 'stop' winner
+ *   (action === 'stop') anchors its messages without touching them;
+ *   each move filter's folder is canonicalized onto the store's
+ *   delimiter before any comparison, log line or move
  * @param {string|null} [opts.accountId] the mail's own account id
  * @param {string} [opts.scope] 'unread' | '10m' | '30m' | '1h' | '5h'
  * @param {Set<number>} [opts.onlyUids] explicit candidate set — replaces
@@ -259,8 +279,9 @@ export async function runFilter(store, {
  *   or a non-finite result omits the filter number
  * @param {Function} [opts.log] log(content, cls)
  * @returns {Promise<{candidates: number, matched: number, moved: number,
- *            kept: number}>} kept = messages anchored in dir by a
- *   winner whose destination equals the source dir
+ *            kept: number}>} kept = messages anchored in dir by a 'stop'
+ *   winner (protected from later filters) or by a move winner whose
+ *   destination equals the source dir
  */
 export async function runAllFilters(store, {
   dir, filters, accountId = null, scope = 'unread', dry = false,
@@ -339,7 +360,8 @@ export async function runAllFilters(store, {
       let winner = null;
       for (const filter of list) {
         if (!filter || typeof filter !== 'object' || filter.enabled === false ||
-            typeof filter.query !== 'string' || !filter.folder ||
+            typeof filter.query !== 'string' ||
+            (filter.action !== 'stop' && !filter.folder) ||
             (filter.accountId && filter.accountId !== accountId)) {
           continue;
         }
@@ -357,10 +379,13 @@ export async function runAllFilters(store, {
       // one line per match: subject, the MATCHED query line numbers only
       // (never the rule text), destination — 'of Filter N' when the
       // caller can name the filter's position in the stored list; the
-      // destination is canonicalized onto the store's delimiter before
-      // any comparison or move ('/'-typed paths on '.'-delimiter servers)
+      // destination of a move filter is canonicalized onto the store's
+      // delimiter before any comparison or move ('/'-typed paths on
+      // '.'-delimiter servers). A stop winner is its own case: no
+      // destination, no move — the message stays where it is.
       const filter = winner.filter;
-      const dest = normalizeFolderPath(filter.folder, store.delimiter);
+      const stop = filter.action === 'stop';
+      const dest = stop ? '' : normalizeFolderPath(filter.folder, store.delimiter);
       const nums = winner.detail.lines
         .filter(l => l.hit)
         .map(l => l.n)
@@ -368,6 +393,11 @@ export async function runAllFilters(store, {
       const no = number(filter);
       const lines = no != null ? `Line ${nums} of Filter ${no}` : `Line ${nums}`;
       const subj = parsed.msg.subject ? `"${trunc(parsed.msg.subject)}" ` : '';
+      if (stop) {
+        log(`${subj}-> ${lines} -> stop filters (message stays in "${dir}" — later filters skipped)`);
+        res.kept++;
+        continue;
+      }
       if (sameFolder(dest, dir, store.delimiter)) {
         log(`${subj}-> ${lines} -> stays in "${dir}" ` +
           '(destination equals source — later filters skipped)');

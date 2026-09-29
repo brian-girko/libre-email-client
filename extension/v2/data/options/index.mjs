@@ -1117,15 +1117,20 @@ saveActionsBtn.addEventListener('click', async () => {
 
 // ---- Filters tab: editing, storage and ordering of filter rules ----
 
-// A filter is {id, enabled, accountId('' = all), query, folder, createFolder,
-// description}. This page only writes the list to chrome.storage.local
-// ('filters') and lets the user reorder it with up/down buttons;
-// matching/moving is the background worker's job.
+// A filter is {id, enabled, accountId('' = all), query, action, folder,
+// createFolder, description} — action 'move' (default, absent on legacy
+// rows) moves a match into folder, action 'stop' leaves the matched
+// message untouched and ends the filter walk for it (folder/createFolder
+// are kept in storage but unused while stop is active). This page only
+// writes the list to chrome.storage.local ('filters') and lets the user
+// reorder it with up/down buttons; matching/moving is the background
+// worker's job.
 
 const ffInputs = {
   account: document.getElementById('ff-account'),
   enabled: document.getElementById('ff-enabled'),
   query: document.getElementById('ff-query'),
+  action: document.getElementById('ff-action'),
   folder: document.getElementById('ff-folder'),
   createFolder: document.getElementById('ff-create-folder'),
   description: document.getElementById('ff-description')
@@ -1157,17 +1162,36 @@ function renderFilterAccounts() {
   }
 }
 
+// the action select drives the inputs it does not apply to: a 'stop'
+// filter names no destination, so folder and create-folder grey out —
+// the same disable-not-hide pattern the badge fields use
+function updateActionFields() {
+  const stop = ffInputs.action.value === 'stop';
+  document.getElementById('ff-action-hint').hidden = !stop;
+  ffInputs.folder.disabled = stop;
+  ffInputs.createFolder.disabled = stop;
+}
+
+ffInputs.action.addEventListener('change', updateActionFields);
+
 // One-line summary of the rule: multi-line queries (line-per-rule, lines act
 // as OR) render their lines joined with " | ". A user-entered description
-// takes over the row text; without one the fallback says where the query
-// moves the mail. The generated rule → target string stays available as
-// the row's tooltip either way.
+// takes over the row text; without one the fallback says what the query
+// does with the mail (move target, or stop-the-walk for a guard rule).
+// The generated rule → target string stays available as the row's tooltip
+// either way.
 function describeFilter(filter) {
+  const stop = filter.action === 'stop';
   const rule = typeof filter.query !== 'string'
     ? 'old format — edit and save again'
     : (filter.query.split(/\r?\n/).map(line => line.trim()).filter(Boolean).join(' | ') || 'every message');
-  const tip = rule + ' → move to ' + filter.folder;
-  const text = filter.description || "Your query moves to '" + filter.folder + "' (remote folder)";
+  const tip = stop
+    ? rule + ' → stop filters (no move)'
+    : rule + ' → move to ' + filter.folder;
+  const text = filter.description ||
+    (stop
+      ? 'Your query stops filters — nothing is moved'
+      : "Your query moves to '" + filter.folder + "' (remote folder)");
   return {text, tip};
 }
 
@@ -1290,9 +1314,12 @@ function openFilterEditor(filter) {
   ffInputs.enabled.checked = filter.enabled !== false;
   // legacy filters (old format) open with an empty query
   ffInputs.query.value = typeof filter.query === 'string' ? filter.query : '';
+  // unknown/absent action values act as move (all pre-action rows)
+  ffInputs.action.value = filter.action === 'stop' ? 'stop' : 'move';
   ffInputs.folder.value = filter.folder || '';
   ffInputs.createFolder.checked = !!filter.createFolder;
   ffInputs.description.value = filter.description || '';
+  updateActionFields();
   ffInputs.account.value = '';
   for (const option of ffInputs.account.options) {
     if (option.value === (filter.accountId || '')) {
@@ -1324,7 +1351,7 @@ function flashFilter(message = 'Saved', error = false) {
 }
 
 addFilterBtn.addEventListener('click', () => {
-  openFilterEditor({id: uid(), enabled: true, accountId: '', query: '', folder: '', createFolder: false});
+  openFilterEditor({id: uid(), enabled: true, accountId: '', action: 'move', query: '', folder: '', createFolder: false});
 });
 
 cancelFilterBtn.addEventListener('click', closeFilterEditor);
@@ -1334,14 +1361,19 @@ filterFormEl.addEventListener('submit', async e => {
   if (!editingFilter) {
     return;
   }
+  const stop = ffInputs.action.value === 'stop';
   const folder = ffInputs.folder.value.trim();
-  if (!folder) {
+  if (!stop && !folder) {
     flashFilter('Destination folder is required', true);
     return;
   }
   editingFilter.query = ffInputs.query.value;
-  editingFilter.folder =
-    normalizeFolderPath(folder, await accountDelimiter(ffInputs.account.value));
+  editingFilter.action = stop ? 'stop' : 'move';
+  editingFilter.folder = stop
+    // a stop filter names no destination: whatever is stored stays there
+    // untouched (greyed out in the editor) and is simply not used
+    ? editingFilter.folder
+    : normalizeFolderPath(folder, await accountDelimiter(ffInputs.account.value));
   editingFilter.createFolder = ffInputs.createFolder.checked;
   editingFilter.description = ffInputs.description.value.trim();
   editingFilter.accountId = ffInputs.account.value;

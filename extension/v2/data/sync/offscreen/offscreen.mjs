@@ -656,10 +656,12 @@ function reportDelimiter(account, summary) {
  * nothing on disk to filter, and a run that died mid-apply still filters
  * everything it managed to receive before dying ({dirty: true} narrates
  * that). First match wins per message in the filters' stored order
- * ('of Filter N' numbering); every match is renamed into its destination
- * Maildir (keepFmd5), the next sync pushes the server move — safe on a
- * failed run too, since the snapshot stays uncommitted and the renames
- * are re-detected as pending moves. Dir-scoped runs carry filters only
+ * ('of Filter N' numbering); every match of a move filter is renamed into
+ * its destination Maildir (keepFmd5), the next sync pushes the server
+ * move — safe on a failed run too, since the snapshot stays uncommitted
+ * and the renames are re-detected as pending moves. A 'stop' match
+ * (filter action 'stop') moves nothing: the message stays in the INBOX
+ * and the walk ends there. Dir-scoped runs carry filters only
  * when the run is the INBOX itself; other folders sync bare. Interface-
  * submitted jobs carry no filters: the sync interface keeps its own
  * behavior — its filter row stays fully manual.
@@ -668,7 +670,8 @@ function reportDelimiter(account, summary) {
 async function runPostSyncFilters(job, store, account, uids, {dirty = false} = {}) {
   const stored = Array.isArray(job.filters) ? job.filters : [];
   const filters = stored.filter(f => f && f.enabled !== false &&
-    typeof f.query === 'string' && f.folder);
+    typeof f.query === 'string' &&
+    (f.action === 'stop' || f.folder));
   // full-account runs and INBOX-scoped dir runs filter their new INBOX
   // pulls; any other folder's dir run is bare — no filter pass
   const dirScopedInbox = job.kind === 'sync-dir' &&

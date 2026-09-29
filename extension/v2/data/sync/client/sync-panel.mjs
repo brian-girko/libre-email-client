@@ -432,11 +432,14 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     }
     const list = stored
       .filter(f => f && f.enabled !== false &&
-        typeof f.query === 'string' && f.folder &&
+        typeof f.query === 'string' &&
+        (f.action === 'stop' || f.folder) &&
         (!f.accountId || (acc && f.accountId === acc.id)))
       .map(f => ({
         id: f.id,
-        label: `Your query moves to '${f.folder}' (remote folder)`
+        label: f.action === 'stop'
+          ? `Your query stops filters (no move)`
+          : `Your query moves to '${f.folder}' (remote folder)`
       }));
     const preferred = acc ? await getLastPref('lastFilter.' + acc.id) : '';
     syncView.setFilters(list, preferred || null);
@@ -782,7 +785,8 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     }
     const filters = await loadFilters().catch(() => []);
     const runnable = f => f && f.enabled !== false &&
-      typeof f.query === 'string' && f.folder &&
+      typeof f.query === 'string' &&
+      (f.action === 'stop' || f.folder) &&
       (!f.accountId || f.accountId === picked.id);
     let chosen;
     if (detail?.filterId === '__all__') {
@@ -820,8 +824,10 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     // a single pick whose destination IS the source dir never starts:
     // compared through the account's delimiter spelling ('/'-typed
     // filter paths vs the canonical listFolders names); the run.mjs
-    // guard repeats the check as the last line of defence
+    // guard repeats the check as the last line of defence. A stop
+    // filter names no destination — the guard does not apply.
     if (detail?.filterId !== '__all__' &&
+        chosen[0].action !== 'stop' &&
         sameFolder(chosen[0].folder, dir, store.delimiter)) {
       syncView.setStatus(`source and destination are both "${dir}" — filter not run`);
       return;
@@ -870,6 +876,7 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
         totals.candidates = res.candidates;
         totals.matched = res.matched;
         totals.moved = res.moved;
+        totals.kept = res.kept;
       }
       const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
       note(`filter ${dry ? 'dry run' : 'run'} finished` +
