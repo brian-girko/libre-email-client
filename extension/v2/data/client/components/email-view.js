@@ -484,9 +484,7 @@ class EmailView extends HTMLElement {
       const cs = getComputedStyle(this);
       const style = doc.createElement('style');
       style.textContent =
-        ':where(html){color-scheme:' + cs.colorScheme + ';}' +
-        ':where(body){color:' + cs.color + ';font-family:' + cs.fontFamily +
-        ';font-size:15px;line-height:1.5;}';
+        ':where(body){font-family:' + cs.fontFamily + ';font-size:15px;line-height:1.5;}';
       doc.head.append(style);
       // resize
       const measure = () => {
