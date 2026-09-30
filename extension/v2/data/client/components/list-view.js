@@ -1004,16 +1004,14 @@ class ListView extends HTMLElement {
     this.#mode = 'ready';
     this.#message = '';
     const scrollTop = this.scrollTop;
-    // With an active selection filter, checked == matches must stay true:
-    // #applyFilter re-derives the selection from the query over the fresh
-    // rows (and re-renders — a rare, user-filtered view; the reconcile path
-    // above carries every other change in place).
-    if (this.#filterQuery) {
-      this.#applyFilter(this.#filterQuery);
-    }
-    else {
-      this.#syncDom();
-    }
+    // The checked set is the user's; it was already intersected with the
+    // rows still present above. A sync must never re-derive it from the
+    // filter query: doing so wiped the whole selection on every delta that
+    // touched the folder (new mail, flags, moves) and unchecked the row
+    // just opened via double-click, right after #selectOnly had checked it.
+    // Filtering stays a one-shot "check the matches" action at typing time
+    // (#applyFilter); the user's subsequent toggles remain authoritative.
+    this.#syncDom();
     this.scrollTop = scrollTop;
     if (gone.length) {
       this.dispatchEvent(new CustomEvent('email-gone', {
@@ -1615,8 +1613,13 @@ class ListView extends HTMLElement {
     again?.focus({preventScroll: true});
   }
 
-  // Selection filter: the checked set always equals "the rows matching the
-  // query". Terms are space-separated and all must match (AND), against the
+  // Selection filter: one-shot "check the matches" — running it (at typing
+  // time and from build()) replaces the selection with the rows matching the
+  // query. It is NOT re-run by sync(): after the first derivation the checked
+  // set is the user's, and a background reconcile must never re-derive it
+  // (that deselected everything not matching, including the row just opened
+  // by double-click). New rows arriving via sync render unchecked.
+  // Terms are space-separated and all must match (AND), against the
   // decoded sender/subject of the thread or of any of its messages. A
   // matching thread selects the whole conversation; an empty query clears
   // the selection.
