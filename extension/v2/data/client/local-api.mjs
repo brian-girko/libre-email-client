@@ -188,10 +188,23 @@ export async function getLocalApi(accountId) {
     throw new Error('getLocalApi: accountId required');
   }
   let memo = apis.get(accountId);
+  // A memoized promise that rejected once must not poison every later call:
+  // one transient root-read failure (sleep/wake, a momentary drive drop)
+  // would otherwise be replayed instantly on every refresh — the fs-events
+  // keep arriving while the views silently no-op forever.
   if (memo) {
-    return await memo;
+    try {
+      return await memo;
+    }
+    catch (e) {
+      apis.delete(accountId);
+      throw e;
+    }
   }
-  memo = buildApi(accountId);
+  memo = buildApi(accountId).catch(e => {
+    apis.delete(accountId);
+    throw e;
+  });
   apis.set(accountId, memo);
   return await memo;
 }

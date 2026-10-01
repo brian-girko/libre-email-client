@@ -103,6 +103,41 @@ function pruneCountCache(id, names) {
   }
 }
 
+// One bounded self-retry after a failed refresh: with the api memo now
+// dropping rejections, a retry re-resolves fresh — so an isolated transient
+// failure recovers by itself instead of waiting for the next fs-event.
+const RETRY_SWEEP_MS = 1000;
+let sweepRetry = null;
+
+function retrySweep(fn) {
+  if (sweepRetry) {
+    return;   // one re-attempt per burst — no stacking on event storms
+  }
+  sweepRetry = setTimeout(() => {
+    sweepRetry = null;
+    if (el?.isConnected) {
+      fn();
+    }
+  }, RETRY_SWEEP_MS);
+}
+
+// Paint every already-known count onto a (re)built tree. Rows start at
+// "-/-" and the deliverCount dedup only replays folders whose numbers MOVE —
+// without this, a rebuild following an unchanged sweep leaves rows at
+// placeholders until their next change.
+function replayCounts(id) {
+  if (id !== accountId || !el?.isConnected) {
+    return;
+  }
+  const map = lastCounts.get(id);
+  if (!map) {
+    return;
+  }
+  for (const [name, counts] of map) {
+    el.addCount(name, counts);
+  }
+}
+
 async function countDirs(api, id, token) {
   try {
     // Consume the returned array even when the progress callback fired: a
@@ -230,6 +265,7 @@ async function load(id) {
       return;
     }
     el.dirs = dirs;
+    replayCounts(id);
     countDirs(api, id, token);
     // Nothing to bring up to date in the background — the tree/list render
     // from the disk truth immediately (the picker's re-grant flow recovers a
@@ -371,12 +407,14 @@ async function refreshTree() {
     }
     if (!sameFolderList(el.dirs, dirs)) {
       el.dirs = dirs;
+      replayCounts(id);
     }
     await adoptInitialDir(id, token, dirs, false);
     countDirs(api, id, token);   // after adoption: counts stream into a built tree
   }
-  catch {
+  catch (e) {
     /* transient read failure: the next event retries */
+    console.warn('[dirs] tree refresh failed:', e?.message || e);
   }
 }
 
@@ -393,8 +431,12 @@ async function refreshCounts() {
     const api = await getMailApi(accountId);
     countDirs(api, accountId, loadToken);
   }
-  catch {
-    /* transient read failure: the next event retries */
+  catch (e) {
+    // visible now: a poisoned memo used to replay this failure forever,
+    // silently — "the next event retries" no longer holds when the api
+    // await itself is what fails
+    console.warn('[dirs] counts refresh failed:', e?.message || e);
+    retrySweep(() => refreshCounts());
   }
 }
 
