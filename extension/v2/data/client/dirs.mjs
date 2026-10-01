@@ -107,7 +107,9 @@ function pruneCountCache(id, names) {
 // dropping rejections, a retry re-resolves fresh — so an isolated transient
 // failure recovers by itself instead of waiting for the next fs-event.
 const RETRY_SWEEP_MS = 1000;
+const RETRY_SWEEP_MAX = 3;    // then wait for the next fs-event — no grind
 let sweepRetry = null;
+let sweepRetries = 0;
 
 function retrySweep(fn) {
   if (sweepRetry) {
@@ -429,6 +431,7 @@ async function refreshCounts() {
   }
   try {
     const api = await getMailApi(accountId);
+    sweepRetries = 0;   // api resolution success = the wedge cannot recur
     countDirs(api, accountId, loadToken);
   }
   catch (e) {
@@ -436,7 +439,11 @@ async function refreshCounts() {
     // silently — "the next event retries" no longer holds when the api
     // await itself is what fails
     console.warn('[dirs] counts refresh failed:', e?.message || e);
-    retrySweep(() => refreshCounts());
+    if (sweepRetries < RETRY_SWEEP_MAX) {
+      sweepRetries++;
+      retrySweep(() => refreshCounts());
+    }
+    // else: give up quietly — the next fs-event retries with a fresh build
   }
 }
 
