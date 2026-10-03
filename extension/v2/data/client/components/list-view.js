@@ -217,8 +217,8 @@ class ListView extends HTMLElement {
         .actions {
           flex: none;
           position: sticky;
-          margin-inline-start: 7px;
-          top: 0;
+          margin-inline: 7px;
+          top: 1px;
           z-index: 1;
           display: flex;
           flex-wrap: wrap;

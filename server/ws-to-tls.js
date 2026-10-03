@@ -13,12 +13,19 @@
 // tunnels the stream as BINARY frames. secure:false dials plaintext TCP
 // (clients like the WASM IMAP client do TLS themselves); secure:true lets
 // this server terminate TLS.
+//
+// The listening side is plaintext ws:// by default; pass --tls (or
+// options.tls) to listen for wss://. Without --cert/--key a self-signed
+// certificate is generated into --cert-dir (default ./certs) via openssl.
 
 'use strict';
 
 const net = require('net');
 const tls = require('tls');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const {execSync} = require('child_process');
 const {Buffer} = require('node:buffer');
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -423,14 +430,79 @@ function makeConn(sock, options, log) {
   return conn;
 }
 
+// ---------- TLS credentials for the listening side (wss://) ----------
+// Explicit --cert/--key win; otherwise a self-signed cert is generated into
+// certDir (default ./certs) via openssl, the same way imap-test-server.mjs
+// does it. Generation happens once; later runs reuse the files on disk.
+// X.509 SANs cannot express subnets, so the default set lists the common
+// local-network addresses explicitly; pass --san for anything else.
+function ensureWssCerts(options, log) {
+  const certDir = options.certDir || './certs';
+  const certFile = path.resolve(options.cert || path.join(certDir, 'cert.pem'));
+  const keyFile = path.resolve(options.key || path.join(certDir, 'key.pem'));
+  if ((options.cert && !options.key) || (options.key && !options.cert)) {
+    throw new Error('--cert and --key must be given together');
+  }
+  if (!options.cert && (!fs.existsSync(certFile) || !fs.existsSync(keyFile))) {
+    fs.mkdirSync(certDir, {recursive: true});
+    const san = ['IP:127.0.0.1', 'DNS:localhost'];
+    if (options.san) {
+      for (const entry of String(options.san).split(',')) {
+        const e = entry.trim();
+        if (e) {
+          san.push(e);
+        }
+      }
+    }
+    log('generating self-signed certificate into ' + certDir + '...');
+    try {
+      execSync(
+        `openssl req -x509 -newkey rsa:2048 -keyout "${keyFile}" -out "${certFile}" -days 365 -nodes -subj "/CN=127.0.0.1"` +
+        ` -addext "subjectAltName=${san.join(',')}"` +
+        ` -addext "basicConstraints=critical,CA:FALSE"` +
+        ` -addext "keyUsage=digitalSignature,keyEncipherment"` +
+        ` -addext "extendedKeyUsage=serverAuth"`,
+        {stdio: 'ignore'}
+      );
+    }
+    catch (e) {
+      throw new Error('could not generate a self-signed certificate (is openssl installed?): ' + e.message);
+    }
+  }
+  try {
+    return {key: fs.readFileSync(keyFile), cert: fs.readFileSync(certFile)};
+  }
+  catch (e) {
+    throw new Error('cannot read TLS credentials (' + keyFile + ', ' + certFile + '): ' + e.message);
+  }
+}
+
 // ---------- server bootstrap (shared by all run modes) ----------
 // push({cmd, ...}) reports 'connected' (port/token/url), 'disconnected'
 // ('requested' | 'error') and 'log' messages to the surrounding mode.
 function startBridge(options, push) {
   const log = (message) => push({cmd: 'log', message});
-  const server = net.createServer((sock) => {
-    makeConn(sock, options, log);
-  });
+  let server;
+  try {
+    if (options.tls) {
+      server = tls.createServer(ensureWssCerts(options, log), (sock) => {
+        makeConn(sock, options, log);
+      });
+    }
+    else {
+      server = net.createServer((sock) => {
+        makeConn(sock, options, log);
+      });
+    }
+  }
+  catch (e) {
+    push({
+      cmd: 'disconnected',
+      reason: 'error',
+      message: 'tls: ' + e.message
+    });
+    return {server: null, close: () => Promise.resolve()};
+  }
   server.on('error', (e) => push({
     cmd: 'disconnected',
     reason: 'error',
@@ -441,7 +513,7 @@ function startBridge(options, push) {
     server.closeAllConnections?.();
   });
   const host = options.wsHost || '127.0.0.1';
-  console.log(host);
+  const scheme = options.tls ? 'wss' : 'ws';
   server.listen(options.wsPort || 0, host, () => {
     const port = server.address().port;
     const token = options.token || null;
@@ -449,7 +521,8 @@ function startBridge(options, push) {
       cmd: 'connected',
       port,
       token,
-      url: 'ws://' + host + ':' + port + (token ? '/' + token : '')
+      secure: !!options.tls,
+      url: scheme + '://' + host + ':' + port + (token ? '/' + token : '')
     });
   });
   return {server, close};
@@ -480,6 +553,13 @@ const USAGE = [
   '  --ws-host HOST       host to listen on (default 127.0.0.1)',
   '  --ws-port N          port to listen on (default 0 = random)',
   '  --token TOKEN        URL path token (default: a random one is generated)',
+  '  --tls                listen for wss:// (TLS on the WS side)',
+  '  --cert FILE          TLS cert PEM (default: self-signed, generated on',
+  '                       demand into --cert-dir)',
+  '  --key FILE           TLS key PEM (must be given together with --cert)',
+  '  --cert-dir DIR       where to store generated certs (default ./certs)',
+  '  --san EXTRA          extra cert SANs, comma-separated (e.g.',
+  '                       IP:192.168.200.10,DNS:myhost.local)',
   '  --allow-self-signed  default for open frames without allowSelfSigned',
   '  --quiet              suppress per-frame logging',
   '  -h, --help'
@@ -501,6 +581,11 @@ function cli(argv) {
     wsPort: parseInt(value('--ws-port', '0'), 10) || 0,
     // random token when not provided: the printed ws:// url is the only way in
     token: value('--token', '') || crypto.randomUUID(),
+    tls: flag('--tls'),
+    cert: value('--cert', null),
+    key: value('--key', null),
+    certDir: value('--cert-dir', null),
+    san: value('--san', null),
     allowSelfSigned: flag('--allow-self-signed'),
     debug: true // connection/dial logs are always on for the CLI (--quiet filters)
   };
