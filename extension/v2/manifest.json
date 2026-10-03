@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "name": "Libre Email Client",
   "description": "A powerful in-browser IMAP email client",
   "permissions": [
