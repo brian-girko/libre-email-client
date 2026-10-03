@@ -141,6 +141,7 @@ async function reconstruct(run) {
   logger.begin({
     id: run.rid,
     kind: 'sync',
+    account: run.id || run.slug,
     label: 'sync · ' + (run.name || run.id),
     doneLabel: 'sync finished'
   });
@@ -163,6 +164,7 @@ function pinRun(run) {
   logger.begin({
     id: run.rid,
     kind: 'sync',
+    account: run.id || run.slug,
     label: 'sync · ' + (run.name || run.id) + scope,
     doneLabel: 'sync finished'
   });
@@ -242,6 +244,7 @@ function mirrorExternal(meta) {
     logger.begin({
       id: run.entryId,
       kind: 'sync',
+      account: meta.accountId || meta.accountSlug || null,
       label: labelFor(run),
       doneLabel: 'sync finished'
     });
@@ -490,6 +493,7 @@ export async function requestSync(accountId, {dir} = {}) {
     logger.begin({
       id: errRid,
       kind: 'sync',
+      account: accountId,
       label: 'sync · ' + accountId,
       doneLabel: 'sync finished'
     });
@@ -502,6 +506,7 @@ export async function requestSync(accountId, {dir} = {}) {
   logger.begin({
     id: rid,
     kind: 'sync',
+    account: registry.id || registry.slug,
     label: 'sync · ' + (registry.name || registry.id) + scope,
     doneLabel: 'sync finished'
   });

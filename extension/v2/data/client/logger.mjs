@@ -9,8 +9,11 @@
 // Two kinds of output:
 //   - `entries`: transient operation lines (queued/running/done/failed), with
 //     an optional {done, total} progress counter and an optional cancel/dismiss
-//     affordance. Done lines self-remove after a short delay; failed lines stay
-//     until dismissed.
+//     affordance. Done lines self-remove after a short delay. Failed lines
+//     stay until dismissed, but carry an optional `account` key: the store
+//     keeps ONE failed line per account — a newer failure replaces the older
+//     one and a success clears it — so repeated failures (an offline
+//     periodic sync re-arming itself, say) never stack a red row per attempt.
 //   - `status`: one persistent cross-panel line. No current source feeds it;
 //     the plumbing stays available for future use.
 
@@ -74,6 +77,7 @@ export function begin({
   id,
   source = 'action',
   kind = '',
+  account = null,
   label = '',
   doneLabel = '',
   cancelable = false,
@@ -85,6 +89,9 @@ export function begin({
     id,
     source,
     kind,
+    // the one-failure-per-account key: whichever account (or registry id)
+    // this entry belongs to, null when the entry has no account slot
+    account: account == null || account === '' ? null : String(account),
     label: String(label ?? kind),
     doneLabel: String(doneLabel ?? label ?? kind),
     state: 'queued',
@@ -141,6 +148,11 @@ export function done(id, label) {
     entry.doneLabel = String(label);
   }
   entry.detail = null;
+  // a successful run of this account clears its failure slot (quiet entries
+  // are never rendered and stay out of the account rule entirely)
+  if (!entry.quiet) {
+    clearAccountFailures(entry.account, id);
+  }
   if (entry.quiet) {
     remove(id);
     return entry;
@@ -158,6 +170,11 @@ export function fail(id, error) {
   entry.state = 'failed';
   entry.error = error == null ? 'failed' : String(error);
   entry.detail = null;
+  // the one-failure-per-account rule: a newer failure for the same account
+  // discards the older one (quiet entries never touch the slot at all)
+  if (!entry.quiet) {
+    clearAccountFailures(entry.account, id);
+  }
   if (entry.quiet) {
     remove(id);
     return entry;
@@ -194,13 +211,33 @@ function scheduleRemove(id) {
   }, DONE_TTL);
 }
 
-// Keep the store bounded: drop the oldest finished lines when over the cap.
+// One error per account: a newer failure for the same account discards the
+// older one, and a successful run of that account clears it. Repeated
+// periodic-sync failures while offline therefore collapse to one line
+// instead of stacking a red row per attempt. Quiet entries are never
+// rendered, so they participate in neither direction; entries without an
+// `account` key have no slot and behave exactly as before.
+function clearAccountFailures(account, keepId) {
+  if (!account) {
+    return;
+  }
+  for (const [id, entry] of entries) {
+    if (id !== keepId && entry.account === account && entry.state === 'failed') {
+      remove(id);   // Map iteration tolerates deleting the current entry's neighbor
+    }
+  }
+}
+
+// Keep the store bounded: drop the oldest non-live lines when over the cap.
+// Failed lines now evict too — a burst of failures (periodic sync offline,
+// say) must never grow the store without bound; live queued/running lines
+// are always spared.
 function trim() {
   if (entries.size < MAX_ENTRIES) {
     return;
   }
   for (const [id, entry] of entries) {
-    if (entry.state === 'done') {
+    if (entry.state === 'done' || entry.state === 'failed') {
       remove(id);
       if (entries.size < MAX_ENTRIES) {
         return;

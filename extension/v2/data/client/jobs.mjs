@@ -90,6 +90,7 @@ function enqueue({
     id,
     source: 'action',
     kind,
+    account: accountId,
     label: job.label,
     doneLabel: job.doneLabel,
     quiet: job.quiet,

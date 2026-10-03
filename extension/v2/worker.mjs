@@ -131,8 +131,6 @@ chrome.action.onClicked.addListener(async tab => {
   });
   const ready = Array.isArray(accounts) && accounts.length > 0;
 
-  console.log(ready, accounts, wsMode);
-
   // The reason rides on the welcome page URL (?reason=…) so the wizard
   // can head straight at the step that needs the user's attention.
   if (!ready) {
