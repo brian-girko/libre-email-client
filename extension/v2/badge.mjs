@@ -36,7 +36,7 @@
 
 import {ensure} from '/core/offscreen.mjs';
 import {loadAccounts} from '/data/sync/client/accounts.mjs';
-import {runAllAccounts} from '/sync-scheduler.mjs';
+import {syncBadgeDirs} from '/sync-scheduler.mjs';
 
 const COALESCE_MS = 3000;   // an edit burst → one check, not one per rename
 
@@ -108,19 +108,6 @@ async function buildJob() {
 }
 
 // ---------------------------------------------------------------- dispatch
-
-/** the badge-enabled account ids — the Check-now sweep syncs exactly the
- *  accounts the count reads (one source of truth with buildJob) */
-async function badgeAccountIds() {
-  const storage = await chrome.storage.local.get(null);
-  if (storage['badge.enabled'] === false) {
-    return [];
-  }
-  const registry = await loadAccounts(null, {decrypt: false}).catch(() => []);
-  return registry
-    .filter(acc => storage['email.badge.' + acc.id] !== false)
-    .map(acc => acc.id);
-}
 
 /**
  * The sweep only ENQUEUES jobs — wait for the engine's serial queue to
@@ -286,17 +273,20 @@ function checkNow() {
 }
 
 function chase(respond) {
-  // Check now acts like the client's "Sync account" segment first: a
-  // filtered full run per badge-enabled account, the engine queue
-  // drained, THEN the count — the badge shows server truth. The
-  // scheduler owns the runs ('...' while going out, '🔑' when a master
-  // password is missing) and every settled run's 'sync-refresh' the
-  // badge reactions below already consume.
+  // Check now acts like the context menu's 'Update Badge Now' first: a
+  // folder-scoped pass over the badge counter's own scope (one
+  // 'sync-dirs' job per badge-enabled account — the badge folder, or the
+  // dirty-store dirs in query mode), the engine queue drained when
+  // anything went out, THEN the count — the badge shows server truth.
+  // The scheduler owns the runs ('...' while going out, '🔑' when a
+  // master password is missing) and every settled run's 'sync-refresh'
+  // the badge reactions below already consume. The drain has to stay:
+  // the sweep's submissions resolve on ENQUEUE — the queue emptying is
+  // the server-truth moment.
   chain = chain
     .then(async () => {
-      const ids = await badgeAccountIds();
-      if (ids.length) {
-        await runAllAccounts('badge check', ids);
+      const accepted = await syncBadgeDirs('badge check');
+      if (accepted) {
         await waitDrain();
       }
       return runCheck();

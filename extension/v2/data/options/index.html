@@ -135,9 +135,9 @@
         </label>
         <p class="hint">After a local edit, the changed folders are re-synced with the server after this delay (coalescing bursts of edits; minimum 10 seconds, the default 60). Note that Chrome delays alarm delivery below ~30s, so a 10–29s setting effectively fires at ~30s. The marks are kept and covered by a manual or the next full sync.</p>
         <label class="check">
-          <input type="checkbox" id="f-sync-idle-enabled" checked> Sync on return from idle
+          <input type="checkbox" id="f-sync-idle-enabled" checked> Update badge on return from idle
         </label>
-        <p class="hint">Runs the same full sweep as the browser start whenever the computer becomes active again after being idle or locked (a transition is detected after ~10 minutes away). When off, nothing syncs on the wake-up — the regular cadence continues on its own.</p>
+        <p class="hint">Whenever the computer becomes active again after being idle or locked (a transition is detected after ~10 minutes away), the badge counter's folders are synced with the server (the defined badge folder, or the dirty-store folders in query mode) and the badge recount follows. When off, nothing syncs on the wake-up — the regular cadence continues on its own.</p>
       </fieldset>
       <fieldset>
         <legend>Badge counter</legend>

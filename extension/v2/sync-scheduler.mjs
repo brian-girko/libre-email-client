@@ -71,11 +71,13 @@
 // the account's dirty alarm, so dirs left holding pending moves resync on
 // the dirty cadence.
 // The context menu adds two more: a full sweep ('Sync Now') and a badge
-// dirty sweep ('Update Badge Now' — syncBadgeDirs, one 'sync-dirs' job per
-// badge-enabled account over its badge-defined folder, or over the account's
-// dirty-store dirs for query-mode badges, submitted at once with no alarm).
-// The idle-end full sweep can be switched off on its own
-// ('sync.auto.idleEnabled').
+// sweep ('Update Badge Now' — syncBadgeDirs, one 'sync-dirs' job per
+// badge-enabled account over its badge-defined folder, or over the
+// account's dirty-store dirs for query-mode badges, submitted at once
+// with no alarm). Two more triggers use that same badge sweep: the
+// options page's badge 'Check now' and the wake from idle/locked
+// ('sync.auto.idleEnabled') — a return from idle counts the badge
+// folders instead of running a full account sweep.
 
 'use strict';
 
@@ -449,31 +451,24 @@ async function runFullAccountForSweep(acc, cfg, tag) {
 }
 
 /**
- * One full run per account — the trigger-driven path shared by startup,
- * idle-end, the context menu and the badge's Check now. Already
- * serialized inside the chain, so the raw bodies run directly (chaining
- * from INSIDE a chain task would deadlock: the sweep would await tasks
- * that only resolve once the sweep itself does). One skipped account
- * does not stop the sweep — a retry-next-alarm schedule stays honest
-  * for it; the armed cadences land one interval after their run, so the
-  * full rhythm recovers by itself.
- * @param {string} cause what asked for the runs ('startup', 'idle end',
- *   'menu', 'badge check')
- * @param {string[]|null} [accountIds] ONLY these registry accounts
- *   (id or slug; the badge check passes its badge-enabled set which is
- *   id-keyed); null/empty = every registered account
+ * One full run per account — the trigger-driven path shared by the
+ * startup sweep, the master-password sweep and the context menu's
+ * 'Sync Now'. Already serialized inside the chain, so the raw bodies run
+ * directly (chaining from INSIDE a chain task would deadlock: the sweep
+ * would await tasks that only resolve once the sweep itself does). One
+ * skipped account does not stop the sweep — a retry-next-alarm schedule
+ * stays honest for it; the armed cadences land one interval after their
+ * run, so the full rhythm recovers by itself.
+ * @param {string} cause what asked for the runs ('startup',
+ *   'master pass confirmed', 'menu')
  */
-function runAllAccounts(cause, accountIds = null) {
+function runAllAccounts(cause) {
   const task = chain.then(async () => {
     const cfg = await settings();
     if (!cfg.enabled || !cfg.fullEnabled) {
       return;
     }
-    let list = await registry();
-    if (Array.isArray(accountIds) && accountIds.length) {
-      const wanted = new Set(accountIds);
-      list = list.filter(acc => wanted.has(acc.id) || wanted.has(acc.slug));
-    }
+    const list = await registry();
     if (!list.length) {
       return;
     }
@@ -491,11 +486,14 @@ function runAllAccounts(cause, accountIds = null) {
 }
 
 /**
- * A sync pass over exactly the folders the badge counter counts — the
- * context menu's 'Update Badge Now'. Like runAllAccounts it submits to the
- * engine directly, but as ONE 'sync-dirs' job per badge-enabled account,
- * fired immediately (no alarm, no delay). What each account contributes
- * follows its badge preference:
+ * A sync pass over exactly the folders the badge counter counts — one
+ * 'sync-dirs' job per badge-enabled account, submitted to the engine
+ * directly and fired immediately (no alarm, no delay). Like runAllAccounts
+ * it never touches the full cadence. Three triggers share it: the context
+ * menu's 'Update Badge Now', the options page's badge 'Check now' and a
+ * wake from idle/locked ('sync.auto.idleEnabled').
+ *
+ * What each account contributes follows its badge preference:
  *
  *   folder mode — the defined badge folder, or the engine-side INBOX
  *                 default when none is set; synced unconditionally (a
@@ -506,19 +504,25 @@ function runAllAccounts(cause, accountIds = null) {
  *                 landed in are exactly the dirs on record; with no marks
  *                 the all-folder scan is already server truth
  *
+ * Gates: 'sync.auto.enabled' and the badge switches only — the dirty
+ * switch governs the dirty alarm (jobDirty), not an explicit badge pass.
+ *
  * The badge recounts by itself: every settled run broadcasts
  * 'sync-refresh', which /badge.mjs consumes.
- * @param {string} cause what asked for the runs ('menu')
+ * @param {string} cause what asked for the runs ('menu', 'badge check',
+ *   'idle end')
+ * @returns {Promise<number>} how many jobs the engine accepted (0 when
+ *   nothing was worth syncing or something failed before any job went out)
  */
 function syncBadgeDirs(cause) {
   const task = chain.then(async () => {
     const cfg = await settings();
-    if (!cfg.enabled || !cfg.dirtyEnabled) {
-      return;
+    if (!cfg.enabled) {
+      return 0;
     }
     const storage = await chrome.storage.local.get(null);
     if (storage['badge.enabled'] === false) {
-      return;   // badge off: its folders are not a scope worth syncing
+      return 0;   // badge off: its folders are not a scope worth syncing
     }
     const registryAccounts = await registry();
     const jobs = [];
@@ -547,11 +551,12 @@ function syncBadgeDirs(cause) {
     if (!jobs.length) {
       dlog('scheduler', '[scheduler]', cause,
         '— no badge folders / dirty marks to sync');
-      return;
+      return 0;
     }
     dlog('scheduler', '[scheduler]', cause, '— dirty badge runs for',
       jobs.length, 'account(s)');
     await badgeBusy();
+    let accepted = 0;
     for (const {acc, dirs} of jobs) {
       let passValue;
       try {
@@ -576,6 +581,7 @@ function syncBadgeDirs(cause) {
           ...(prefs ? {prefs} : {})
         });
         if (res.started !== false) {
+          accepted++;
           await clearDirs(accountKeys(acc), dirs)
             .catch(e => dlog('scheduler', '[scheduler]', cause,
               ': dir clear failed —', e?.message || e));
@@ -587,11 +593,14 @@ function syncBadgeDirs(cause) {
       }
     }
     await logNextRuns(cause);
+    return accepted;
   });
   chain = task.catch(() => {});
-  return task.catch(e =>
+  return task.catch(e => {
     dlog('scheduler', '[scheduler]', cause, 'badge sweep failed:',
-      e?.message || e));
+      e?.message || e);
+    return 0;
+  });
 }
 
 // -------------------------------------------------------------- reconcile
@@ -721,10 +730,12 @@ chrome.runtime.onStartup.addListener(() => {
       dlog('scheduler', '[scheduler] startup sync failed:', e?.message || e));
 });
 
-// the computer came back from idle/locked: a full sweep on the
-// transition only. The previous idle state lives in chrome.storage.session
-// (a service worker restarts lose memory); with no recorded state the
-// event is just noted — a fresh worker must not guess a transition.
+// the computer came back from idle/locked: a badge sweep ('Update Badge
+// Now') on the transition only — the badge folders resync, the full
+// cadence keeps its own rhythm (no re-arm here). The previous idle state
+// lives in chrome.storage.session (a service worker restarts lose memory);
+// with no recorded state the event is just noted — a fresh worker must
+// not guess a transition.
 const IDLE_STATE = 'sync.auto.idleState';
 
 chrome.idle.onStateChanged.addListener(state => {
@@ -741,7 +752,7 @@ chrome.idle.onStateChanged.addListener(state => {
       return;   // idle syncs disabled since the wake: no sweep
     }
     await booting;
-    await runAllAccounts('idle end');
+    await syncBadgeDirs('idle end');
   })().catch(e =>
     dlog('scheduler', '[scheduler] idle transition failed:', e?.message || e));
 });
