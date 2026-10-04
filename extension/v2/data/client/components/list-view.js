@@ -76,12 +76,13 @@ function newestUid(thread, desc) {
   return desc ? -uid : uid;
 }
 
-// Display path for folder pickers: server names join hierarchy levels with
-// the server delimiter (usually "."), shown uniformly as "/" instead.
-function formatDirPath(name, delimiter) {
-  const d = String(delimiter || '');
-  return d ? String(name).split(d).join('/') : String(name);
-}
+// Display path for folder pickers: the raw server-spelled name, no
+// translation. Folder names spell hierarchy with the account's own
+// delimiter everywhere (the sync combo, the engine logs, the dirty
+// report list) — showing 'Silent.Broken Links' rather than a prettified
+// "Silent/Broken Links" keeps one spelling on screen, and a literal '.'
+// inside a name on a '/'-delimiter server ("Notes 1.2") never displays a
+// wrong path ("Notes 1/2").
 
 class ListView extends HTMLElement {
   #rows = [];
@@ -1236,7 +1237,7 @@ class ListView extends HTMLElement {
       this.#moveTarget.replaceChildren(...list.map(dir => {
         const opt = document.createElement('option');
         opt.value = dir.name;
-        opt.textContent = formatDirPath(dir.name, dir.delimiter);
+        opt.textContent = dir.name;
         if (dir.name === current) {
           opt.disabled = true;
           opt.textContent += ' (current)';

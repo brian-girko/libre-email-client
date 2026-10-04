@@ -78,6 +78,11 @@ async function buildJob() {
     const folder = String(storage['email.badgeFolder.' + acc.id] ?? '').trim();
     const mode = storage['email.badgeMode.' + acc.id] === 'query' ? 'query' : 'folder';
     const query = String(storage['email.badgeQuery.' + acc.id] ?? '').trim();
+    // the stored delimiter stamp rides the job too: the badge offscreen
+    // has no chrome.storage, and its maildir reads must spell folder
+    // names the exact way the engine's mirror does ('Zoo.Test', not the
+    // '/' default spelling)
+    const delimiterStamp = storage['sync.delimiter.' + acc.id];
     accounts.push({
       id: acc.id,
       label: acc.name,
@@ -86,6 +91,10 @@ async function buildJob() {
       // folder '' = the engine-side INBOX default (the badge's default scope)
       folder: mode === 'folder' ? folder : '',
       query: mode === 'query' ? query : '',
+      delimiter: typeof delimiterStamp === 'string' &&
+        delimiterStamp.length === 1 && delimiterStamp !== '%'
+        ? delimiterStamp
+        : null,
       // the tooltip's "last synced" line reads the same stamp the client's
       // status line shows (worker-stamped on 'sync-synced', ISO or null)
       lastSyncAt: storage['sync.lastSyncAt.' + acc.id] ?? null

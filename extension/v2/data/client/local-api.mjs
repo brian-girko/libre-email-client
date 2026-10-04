@@ -40,7 +40,9 @@ import {prepare, joinPath} from '/core/fs.mjs';
 import {
   MaildirStore,
   dirNameFor,
+  normalizeFolderPath,
 } from '../sync/maildir.mjs';
+import {delimiterFor} from '../sync/client/delimiter.mjs';
 import {loadSnapshot} from '../sync/snapshot.mjs';
 import {messageMeta} from './headers.mjs';
 import {groupThreads} from './threads.mjs';
@@ -215,7 +217,16 @@ export function dropLocalApi(accountId) {
 }
 
 async function buildApi(accountId) {
-  return apiForStore(new MaildirStore(await getRootHandle(), accountId), accountId);
+  // the account's engine-discovered hierarchy delimiter (delimiterFor() —
+  // the same stamp the sync panel and the options page read): folder names
+  // everywhere here — tree display, dir composition and the dirty reports
+  // (srcDir/destDir to the worker's dirty store) — must be spelled the way
+  // the engine and the server spell them, never the '/' default
+  const delimiter = await delimiterFor(accountId);
+  return apiForStore(
+    new MaildirStore(await getRootHandle(), accountId, {delimiter: delimiter ?? '/'}),
+    accountId
+  );
 }
 
 /**
@@ -257,25 +268,32 @@ export function apiForStore(store, accountId) {
     },
 
     async listDirs() {
-      // every local Maildir of this account, as the tree expects it
+      // every local Maildir of this account, as the tree expects it —
+      // names spelled in the account's own hierarchy delimiter so the
+      // tree's parent composition (parent + delimiter + name) builds
+      // server-spelled names the sync engine resolves
       const folders = await store.listFolders();
       return folders.filter(name => upper(name) !== 'EXPORTS').map(name => ({
         name,
-        delimiter: '/',
+        delimiter: store.delimiter,
         attrs: [],
       }));
     },
 
     async openDir(name) {
-      const exists = (await store.listFolders()).some(f => f === name);
+      // '/'-typed names (a saved tree state from before the delimiter
+      // stamp, or a hand-typed path) map onto the account's hierarchy
+      // spelling — 'Zoo/Test' opens the mirror of server 'Zoo.Test'
+      const wanted = normalizeFolderPath(name, store.delimiter);
+      const exists = (await store.listFolders()).some(f => f === wanted);
       if (!exists) {
         const err = new Error('no such mailbox: ' + name);
         err.code = 'mirror';
         throw err;
       }
-      selected = name;
-      const rows = (await folderRows(store, accountId, name)).rows;
-      const uidvalidity = Number(await store.readUidValidity(name)) || 0;
+      selected = wanted;
+      const rows = (await folderRows(store, accountId, wanted)).rows;
+      const uidvalidity = Number(await store.readUidValidity(wanted)) || 0;
       const unseen = rows.filter(r => !r.flags.includes('\\Seen')).length;
       return {
         exists: rows.length,

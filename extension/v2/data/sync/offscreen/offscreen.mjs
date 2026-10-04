@@ -856,7 +856,17 @@ async function withSession(job) {
       slug: account.slug,
       bridgeUrl: bridgeRes.url
     });
-    store = new MaildirStore(fs, account.slug);
+    // The account's stored hierarchy delimiter rides the job (the worker
+    // and the scheduler tag it): the offscreen has no chrome.storage, and
+    // without a seeded delimiter a run that dies before its survey
+    // completes (survey's folder-not-found, a dead connection…) would
+    // report its leftover dirs through the '/' default — "Zoo.Test"
+    // spelled "Zoo/Test" to the worker's dirty store, a mark the next run
+    // can never match. The engine's own survey refreshes per folder later.
+    store = new MaildirStore(fs, account.slug,
+      {delimiter: typeof account.delimiter === 'string' && account.delimiter
+        ? account.delimiter
+        : '/'});
     await store.open();
     if (job.kind === 'discard') {
       engineLog('discard', 'wiping the local copy…');

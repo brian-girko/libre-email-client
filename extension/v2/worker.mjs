@@ -32,6 +32,7 @@ import {acquire, release} from '/core/bridge.mjs';
 import {ensure, closeNow, activeGen} from '/core/offscreen.mjs';
 import {detectNativeClient} from '/core/native/native-client.mjs';
 import {markSynced, clearSynced, loadGatePrefs} from '/data/sync/client/accounts.mjs';
+import {delimiterFor} from '/data/sync/client/delimiter.mjs';
 import {loadFilters} from '/data/sync/filters/route.mjs';
 import {dlog} from '/core/debug-log.mjs';
 // side-effect imports: /dirty.mjs registers its own runtime listener — the
@@ -216,11 +217,20 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         : loadFilters().then(list =>
             (Array.isArray(list) && list.length) ? list : null)
           .catch(() => null);
+      // the offscreen has no chrome.storage: the account's stored
+      // hierarchy delimiter rides the job too (fresh MaildirStore default
+      // is '/', so a run that dies before its survey completes would
+      // otherwise report its dirs in the wrong spelling)
+      const withDelimiter = delimiterFor(msg?.account ?? null)
+        .catch(() => null);
       ensure('sync')
-        .then(() => Promise.all([withFilters, loadGatePrefs().catch(() => null)]))
-        .then(([filters, prefs]) => chrome.runtime.sendMessage({
+        .then(() => Promise.all([withFilters, withDelimiter, loadGatePrefs().catch(() => null)]))
+        .then(([filters, delimiter, prefs]) => chrome.runtime.sendMessage({
           ...msg,
           type: 'sync-job',
+          account: msg.account && typeof msg.account === 'object'
+            ? {...msg.account, ...(delimiter ? {delimiter} : {})}
+            : msg.account,
           ...(filters ? {filters} : {}),
           ...(prefs ? {prefs} : {})
         }))

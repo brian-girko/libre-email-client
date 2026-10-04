@@ -660,8 +660,9 @@ class DirectoryView extends HTMLElement {
 
   // Compact single-line mode: the select mirrors the tree's selectable nodes
   // (non-selectable \Noselect parents are skipped) and shows each folder's
-  // full path with the delimiter as "/" (raw names use the server delimiter,
-  // usually "."). Options are rebuilt only when
+  // raw server-spelled name — the same spelling every other view uses (the
+  // sync combo, the engine logs); no delimiter prettify.
+  // Options are rebuilt only when
   // the folder set changes so an open dropdown survives unrelated re-renders;
   // the value follows #selected on every render.
   #syncSelect() {
@@ -672,9 +673,7 @@ class DirectoryView extends HTMLElement {
       const els = rows.map(({node}) => {
         const opt = document.createElement('option');
         opt.value = node.name;
-        opt.textContent = node.delimiter
-          ? node.name.split(node.delimiter).join('/')
-          : node.name;
+        opt.textContent = node.name;
         return opt;
       });
       this.#dirSelect.replaceChildren(...els);

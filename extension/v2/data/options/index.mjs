@@ -10,6 +10,7 @@ import {
 import {reencryptStoredPasswords} from '/tools/passwords.mjs';
 import {detectNativeClient} from '/core/native/native-client.mjs';
 import {loadAccounts} from '../sync/client/accounts.mjs';
+import {delimiterFor} from '../sync/client/delimiter.mjs';
 import {
   MODE_EXTERNAL,
   getStorageMode,
@@ -419,6 +420,15 @@ formEl.addEventListener('submit', async e => {
     else {
       writes[id] = input.value.trim();
     }
+  }
+  // the badge folder takes '/'-typed paths exactly like the filter editor
+  // does: map the typed separators onto the account's stored hierarchy
+  // delimiter so the badge offscreen's reads (and the badge-triggered
+  // sync-dirs job) use the server's own spelling
+  const badgeFolderKey = key('email.badgeFolder', selectedId);
+  if (writes[badgeFolderKey]) {
+    const delimiter = await accountDelimiter(selectedId);
+    writes[badgeFolderKey] = normalizeFolderPath(writes[badgeFolderKey], delimiter);
   }
   if (passDirty) {
     const pass = FIELDS['user.pass'].value;
@@ -1202,14 +1212,11 @@ function describeFilter(filter) {
 // by the service worker), so typed separators are mapped onto it here —
 // 'Work/Projects' lands as 'Work.Projects' on '.'-delimiter servers.
 // Without a known delimiter (all-accounts filters, never-synced accounts)
-// the input is stored exactly as typed.
+// the input is stored exactly as typed. delimiterFor() is the shared
+// resolver: the same single stamp the sync interface and the mail client
+// read — one delimiter everywhere.
 async function accountDelimiter(accountId) {
-  if (!accountId) {
-    return null;
-  }
-  const res = await chrome.storage.local.get('sync.delimiter.' + accountId)
-    .catch(() => ({}));
-  return res['sync.delimiter.' + accountId] || null;
+  return delimiterFor(accountId);
 }
 
 function normalizeFolderPath(path, delimiter) {

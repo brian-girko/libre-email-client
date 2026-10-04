@@ -298,6 +298,21 @@ function delimiterOf(survey) {
   return (inbox ?? folders.find(F => F.delimiter))?.delimiter ?? null;
 }
 
+/** Resolve a scoped dir name onto the server's own folder spelling. Dir
+ *  scopes (dirty marks, badge folders, dir combos) may arrive '/'-typed
+ *  ('Zoo/Test') while a '.'-delimiter server lists 'Zoo.Test' — the
+ *  mirror's dirs and the engine's snapshot are all server-spelled, so the
+ *  scope must canonicalize before ANY of the pipeline's strict
+ *  `x.name === only` comparisons run (survey filter, scoped extras, the
+ *  apply/snapshot rewrites). Raw server listing in, exact folder name out
+ *  (null when nothing matches). */
+function resolveOnly(all, wanted) {
+  const delim = (all.find(f => (f.name ?? '').toUpperCase() === 'INBOX' && f.delimiter) ??
+    all.find(f => f.delimiter))?.delimiter ?? null;
+  const norm = delim && delim !== '/' ? String(wanted).replaceAll('/', delim) : wanted;
+  return all.find(f => f.name === norm)?.name ?? null;
+}
+
 // When `only` names one folder, the whole pipeline (survey, plan, apply,
 // snapshot) is scoped to that single dir: the rest of the account keeps its
 // snapshot untouched and only that dir's entry is rewritten.
@@ -372,10 +387,20 @@ async function rowsFor(name, uidnext) {
     const snap = await store.loadState();
     const all = (await mail.folders())
       .filter(f => !(f.attrs ?? []).includes('\\Noselect'));
-    const selectable = only ? all.filter(f => f.name === only) : all;
-    if (only && !selectable.length) {
-      throw new Error(`survey: folder "${only}" not found on the server`);
+    // canonicalize the scope onto the server's own spelling BEFORE any
+    // comparison: a '/'-typed dir scope on a '.'-delimiter server must
+    // match its 'Zoo.Test' listing (`f.name === only` is exact everywhere
+    // else, so the scope itself has to become an exact server name)
+    if (only != null) {
+      const resolved = resolveOnly(all, only);
+      if (!resolved) {
+        throw new Error(`survey: folder "${only}" not found on the server`);
+      }
+      if (resolved !== only) {
+        only = resolved;
+      }
     }
+    const selectable = only ? all.filter(f => f.name === only) : all;
     const folders = new Map();
     const localCache = new Map();   // folder → listing (avoids double disk reads)
     async function listLocalCached(name) {

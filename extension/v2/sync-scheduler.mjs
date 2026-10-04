@@ -84,6 +84,7 @@
 import {ensure} from '/core/offscreen.mjs';
 import {dlog} from '/core/debug-log.mjs';
 import {loadAccounts, decryptPassword, loadGatePrefs} from '/data/sync/client/accounts.mjs';
+import {delimiterFor} from '/data/sync/client/delimiter.mjs';
 import {loadFilters} from '/data/sync/filters/route.mjs';
 import {getNeeded, clearDirs, clearAccount} from '/dirty.mjs';
 
@@ -320,11 +321,14 @@ function jobDirty(alarm) {
     }
     const list = await filters();
     const prefs = await loadGatePrefs().catch(() => null);
+    // the delimiter rides along too (no chrome.storage offscreen-side):
+    // the engine seeds its store with the server's hierarchy spelling
+    const delimiter = await delimiterFor(acc).catch(() => null);
     const res = await submitJob({
       type: 'sync-job',
       rid: rid('dirs'),
       kind: 'sync-dirs',
-      account: {...acc, pass: passValue},
+      account: {...acc, pass: passValue, ...(delimiter ? {delimiter} : {})},
       dirs,
       // filter parity: the stored list rides along like every other
       // non-interface run — the engine's dirty branch runs the pass over
@@ -368,8 +372,13 @@ async function submitFull(acc, cfg, tag, passValue) {
     type: 'sync-job',
     rid: rid('full'),
     kind: 'sync',
-    account: {...acc, pass: passValue}
+    account: {...acc, pass: passValue},
   };
+  // the delimiter rides along (no chrome.storage offscreen-side)
+  const delimiter = await delimiterFor(acc).catch(() => null);
+  if (delimiter) {
+    payload.account.delimiter = delimiter;
+  }
   const [list, prefs] = await Promise.all([
     filters(),
     loadGatePrefs().catch(() => null)
@@ -571,11 +580,13 @@ function syncBadgeDirs(cause) {
       try {
         const list = await filters();
         const prefs = await loadGatePrefs().catch(() => null);
+        // the delimiter rides along (no chrome.storage offscreen-side)
+        const delimiter = await delimiterFor(acc).catch(() => null);
         const res = await submitJob({
           type: 'sync-job',
           rid: rid('badge-dirs'),
           kind: 'sync-dirs',
-          account: {...acc, pass: passValue},
+          account: {...acc, pass: passValue, ...(delimiter ? {delimiter} : {})},
           dirs,
           ...(list.length ? {filters: list} : {}),
           ...(prefs ? {prefs} : {})

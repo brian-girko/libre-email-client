@@ -46,6 +46,7 @@ import {bootSilent} from '../disk.mjs';
 import {getRootHandle} from '../../client/local-api.mjs';
 import {loadFilters} from '../filters/route.mjs';
 import {runAllFilters, runFilter} from '../filters/run.mjs';
+import {delimiterFor} from './delimiter.mjs';
 
 /**
  * Wires one <sync-view> element to the offscreen sync engine.
@@ -373,19 +374,19 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
   /**
    * Opens the account's MaildirStore with the engine-discovered hierarchy
    * delimiter stamped in (sync.delimiter.<id>, persisted by the service
-   * worker after every engine survey). Folder names must be spelled exactly
-   * like the engine does: listFolders() maps local Maildir names back to
-   * server names and filter-run moves must land in engine-compatible
-   * Maildirs — the constructor's '/' default is only right for
-   * '/'-delimiter servers.
+   * worker after every engine survey) — read through delimiterFor() (the
+   * shared resolver), the same single stamp the options page's filter
+   * editor normalizes typed paths with. Folder names must be spelled
+   * exactly like the engine does: listFolders() maps local Maildir names
+   * back to server names and filter-run moves must land in
+   * engine-compatible Maildirs — the constructor's '/' default is only
+   * right for '/'-delimiter servers.
    */
   async function openStore(fs, slug, accountId) {
     const store = new MaildirStore(fs, slug);
     await store.open();
-    const res = await chrome.storage.local.get('sync.delimiter.' + accountId)
-      .catch(() => ({}));
-    const delimiter = res['sync.delimiter.' + accountId];
-    if (typeof delimiter === 'string' && delimiter) {
+    const delimiter = await delimiterFor(accountId);
+    if (delimiter) {
       store.delimiter = delimiter;
     }
     return store;

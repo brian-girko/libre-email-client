@@ -34,7 +34,8 @@ import {
   maildirOf,
   folderDir,
   folderFor,
-  listLocal
+  listLocal,
+  normalizeFolderPath
 } from '../sync/maildir.mjs';
 import {messageMeta} from '../client/headers.mjs';
 
@@ -141,13 +142,13 @@ function outsideWindow(meta, maxAgeAt) {
 // ---------------------------------------------------------------- scanner
 
 /** Every local Maildir of an account, as server folder names. */
-async function accountFolders(fs, accountPath) {
+async function accountFolders(fs, accountPath, delimiter = '/') {
   const out = [];
   for (const entry of await fs.reader.list(accountPath)) {
     if (entry.kind === 'directory') {
       const md = await maildirOf(fs, accountPath + '/' + entry.name);
       if (md) {
-        out.push(folderFor(entry.name, '/'));
+        out.push(folderFor(entry.name, delimiter));
       }
     }
   }
@@ -179,8 +180,14 @@ async function countAccount(fs, spec, maxAgeAt) {
       detail: 'no local copy synced yet', error: null, hasMaildir: false};
   }
   const folderSel = String(spec.folder ?? '').trim() || 'INBOX';
+  // the account's engine-discovered hierarchy delimiter rides the job
+  // (badge.mjs) — the maildir paths and names spell it the engine's way;
+  // a '/'-typed badge folder (stored before normalization) maps onto it
+  const delimiter = typeof spec.delimiter === 'string' && spec.delimiter
+    ? spec.delimiter
+    : '/';
   const folders = spec.mode === 'query'
-    ? (await accountFolders(fs, account))
+    ? (await accountFolders(fs, account, delimiter))
     : [folderSel];
   if (spec.mode === 'query') {
     folders.sort((a, b) => (a === 'INBOX' ? -1 : b === 'INBOX' ? 1 : 0));
@@ -192,7 +199,9 @@ async function countAccount(fs, spec, maxAgeAt) {
   let scanned = 0;
   let remaining = false;   // budget dry / list cap: count kept, subject not shown
   for (const folder of folders) {
-    const md = await folderDir(fs, account, folder, {create: false, delimiter: '/'});
+    const md = await folderDir(fs, account,
+      normalizeFolderPath(folder, delimiter),
+      {create: false, delimiter});
     if (!md) {
       continue;
     }

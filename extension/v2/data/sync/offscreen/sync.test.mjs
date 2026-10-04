@@ -556,4 +556,62 @@ function dirState(uidvalidity, uidnext, rows) {
     JSON.stringify(plan.ops.map(describeOp)));
 }
 
+// `only` resolved onto the server's own spelling: a '/'-typed dir scope
+// ('Zoo/Test' — the spelling the dirty marks carry from the client's
+// tree, or a user-typed badge folder) on a '.'-delimiter server whose
+// folder is 'Zoo.Test' must run against that folder, not throw.
+{
+  const m1 = await idOf('m1');
+  const server = new Map([
+    ['INBOX', dirState(1000, 10, [[1, 'm1']])],
+    ['Zoo.Test', dirState(2000, 20, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 10, messages: {}},
+      'Zoo.Test': {uidvalidity: 2000, uidnext: 20, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Zoo.Test', listing([])]
+  ]);
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings),
+    {log: quietLog, only: 'Zoo/Test'});
+  // the plan itself is the assertion: a strict `f.name === only` survey
+  // would have thrown "survey: folder "Zoo/Test" not found on the server"
+  // BEFORE resolving; a resolved plan returns cleanly
+  const {plan} = await engine.plan();
+  assert.ok(Array.isArray(plan.ops), "the '/'-typed scope resolved to 'Zoo.Test': plan ran");
+
+  // resolution runs how the sync-dirs path consumes it: the whole scoped
+  // diff runs against the RESOLVED folder — INBOX's new mail stays out
+  {
+    const m2 = await idOf('m2');
+    const server = new Map([
+      ['INBOX', dirState(1000, 10, [[1, 'm1']])],
+      ['Zoo.Test', dirState(2000, 20, [[2, 'm2']])]
+    ]);
+    const snapshotZoo = structuredClone(snapshot);
+    snapshotZoo.folders['INBOX'].messages = {1: {msgid: m1, flags: []}};   // INBOX is clean
+    const engine = createSync(mockMail(server), mockStore(snapshotZoo, listings),
+      {log: quietLog, only: 'Zoo/Test'});
+    const {plan} = await engine.plan();
+    const described = plan.ops.map(describeOp);
+    assert.deepEqual(described.filter(op => op.includes('INBOX')), [],
+      'INBOX stays out of the resolved scoped run: ' + JSON.stringify(described));
+    assert.ok(described.some(op => op.includes('Zoo.Test')),
+      "the pull runs in the resolved 'Zoo.Test': " + JSON.stringify(described));
+  }
+
+  // and a scope that matches NO spelling (before or after normalization)
+  // still reports the not-found error
+  const missing = createSync(mockMail(server), mockStore(snapshot, listings),
+    {log: quietLog, only: 'Nowhere/None'});
+  await assert.rejects(() => missing.plan(),
+    /survey: folder "Nowhere\/None" not found on the server/,
+    'an unmatched dir scope still fails loudly');
+}
+
 console.log('sync.test: all scenarios pass');

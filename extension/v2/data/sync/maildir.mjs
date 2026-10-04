@@ -645,11 +645,17 @@ export async function wipeFolder(fs, maildir) {
 const PREFS_FILE = '.sync-prefs.json';
 
 export class MaildirStore {
-  constructor(fs, slug) {
+  /**
+   * @param {string} [opts.delimiter] the account's known server hierarchy
+   *   delimiter (delimiterFor() — the shared resolver): the spelling every
+   *   folder name read/write assumes until the engine's survey refreshes it
+   *   per folder. Default '/' for never-synced accounts (flat servers).
+   */
+  constructor(fs, slug, {delimiter = '/'} = {}) {
     this.fs = fs;          // {reader, writer} — the prepare() facade
     this.slug = slug;
     this.account = slug;   // account dir path, root-relative (open() confirms it)
-    this.delimiter = '/';  // server delimiter; the engine refreshes per survey
+    this.delimiter = delimiter || '/';  // server delimiter; the engine refreshes per survey
   }
 
   async open() {
