@@ -162,6 +162,19 @@ class StarToggle extends HTMLElement {
       + `<div id="pop" popover="auto" role="menu"></div>`;
     this.#btn = root.querySelector('button');
     this.#pop = root.querySelector('#pop');
+    // The open-state mirror for filters.mjs: a PERSISTENT state-driven
+    // listener (never {once: true} — the first toggle of a showPopover() is
+    // the OPEN transition, so a once-listener would consume it, count the
+    // open and be gone before any close could decrement — the wedge that
+    // left the mails view unreconciled until a manual refresh).
+    this.#pop.addEventListener('toggle', e => {
+      if (e.newState === 'open') {
+        openCount++;
+      }
+      else if (e.newState === 'closed') {
+        openCount = Math.max(0, openCount - 1);
+      }
+    });
     const swatches = document.createElement('div');
     swatches.style.display = 'contents';
     for (let i = 1; i < STAR_COLORS.length; i++) {
@@ -231,14 +244,6 @@ class StarToggle extends HTMLElement {
   #open() {
     const swatches = [...this.#pop.querySelectorAll('.swatch')];
     (this.#pop.querySelector('.swatch[aria-checked="true"]') ?? swatches[0])?.focus();
-    this.#pop.addEventListener('toggle', e => {
-      if (e.newState === 'open') {
-        openCount++;
-      }
-      else if (e.newState === 'closed') {
-        openCount = Math.max(0, openCount - 1);
-      }
-    }, {once: true});
     this.#pop.showPopover();
   }
 

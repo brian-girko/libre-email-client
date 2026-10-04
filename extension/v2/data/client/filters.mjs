@@ -8,62 +8,24 @@
 //     reconciles rows by key and a star-color change reaches exactly the
 //     starred row — rebuilding its host element would detach the popover;
 //     the optimistic applyFlags already shows the right state).
-// Deferral, not dropping: a guard that merely swallowed the reconcile with
-// nothing to re-arm it left the mails view stale until a manual refresh
-// (the star-palette popover outliving its folder's only move/delete event).
+// The deferral state machine (latched deferral, bounded retry, forced
+// flush) lives in list-reconcile.mjs — injectable and unit-tested there.
 // The search guard stays a plain drop — search mode clears through
 // clearSearch() → load(), which re-renders the folder from disk in full.
 
 import {isSearching, syncCurrent} from './list.mjs';
 import {starPickerOpen} from './components/star-toggle.js';
-
-const RETRY_MS = 250;
-
-let deferred = false;   // a reconcile is owed once the popover closes
-let retryTimer = null;
-
-function flushDeferred() {
-  clearTimeout(retryTimer);
-  retryTimer = null;
-  if (!deferred) {
-    return;
-  }
-  if (starPickerOpen()) {
-    scheduleRetry();   // palette still open — keep owing, keep retrying
-    return;
-  }
-  deferred = false;
-  syncCurrent();   // list.mjs's own guards absorb stale folder targets
-}
-
-function scheduleRetry() {
-  if (!retryTimer) {
-    retryTimer = setTimeout(flushDeferred, RETRY_MS);
-  }
-}
+import {createReconciler} from './list-reconcile.mjs';
 
 // ---- folder sync decisions --------------------------------------------------
 
-function reconcileOpenFolder() {
-  if (starPickerOpen()) {
-    // deferred: the row this delta would touch may host the open popover;
-    // flush once it closes (bounded retry while it stays open)
-    if (!deferred) {
-      console.log('[filters] list reconcile deferred — star picker open');
-    }
-    deferred = true;
-    scheduleRetry();
-    return;
-  }
-  if (isSearching()) {
-    return;   // self-healing: clearSearch() → load() re-renders from disk
-  }
-  // a latched deferral rides along on this flush — identical folder re-diff
-  deferred = false;
-  clearTimeout(retryTimer);
-  retryTimer = null;
-  syncCurrent();
-}
+const {reconcile} = createReconciler({
+  syncCurrent,   // list.mjs's own guards absorb stale folder targets
+  starOpen: starPickerOpen,
+  searching: isSearching,
+  log: note => console.log('[filters] ' + note)
+});
+const reconcileOpenFolder = reconcile;
 
 // ---- wiring -----------------------------------------------------------------
 
