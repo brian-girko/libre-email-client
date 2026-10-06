@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "name": "Libre Email Client",
   "description": "A powerful in-browser IMAP email client",
+  "homepage_url": "https://webextension.org/listing/libre-email-client.html",
   "permissions": [
     "nativeMessaging",
     "storage",
