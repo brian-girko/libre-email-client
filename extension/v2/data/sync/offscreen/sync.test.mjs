@@ -52,8 +52,9 @@ const idOf = async msgid => await msgidOf(rawOf(msgid));
 
 // ---- mock mail (IMAP facade) + store (MaildirStore) ------------------------
 
-function mockMail(server) {
+function mockMail(server, {failMove = false} = {}) {
   return {
+    fetches: 0,      // raw downloads (readMail/readMails)
     current: null,
     async folders() {
       return [...server.keys()].map(name => ({name, delimiter: '.', attrs: []}));
@@ -72,22 +73,35 @@ function mockMail(server) {
       return rows.sort((a, b) => a.uid - b.uid);
     },
     async readMails(uids) {
+      this.fetches++;
       const dir = server.get(this.current);
       return uids.map(uid => ({uid, raw: dir.raws.get(uid)}));
     },
     async readMail(uid) {
+      this.fetches++;
       const dir = server.get(this.current);
       return {uid, folder: this.current, size: dir.raws.get(uid).length, raw: dir.raws.get(uid)};
     },
     async moveMail(uid, mailbox) {
+      if (failMove) {
+        throw new Error('mock-fs: move failed');
+      }
       const dir = server.get(this.current);
       const raw = dir.raws.get(uid);
       const row = dir.rows.get(uid);
       dir.rows.delete(uid);
       dir.raws.delete(uid);
       const dst = server.get(mailbox);
-      dst.raws.set(20, raw);
-      dst.rows.set(20, {flags: row.flags, subject: row.subject ?? null, from: null, date: null, size: raw.length});
+      // MOVE assigns a FRESH uid in the destination: the next value in the
+      // dest folder's uid space — the post-apply survey sees the arrival
+      const newUid = dst.status.uidnext;
+      dst.status.uidnext += 1;
+      dst.raws.set(newUid, raw);
+      dst.rows.set(newUid, {
+        flags: row.flags, subject: row.subject ?? null,
+        from: null, date: null, size: raw.length
+      });
+      return newUid;
     },
     /**
      * APPEND: the local-born upload path (`append` op). The server assigns
@@ -106,7 +120,7 @@ function mockMail(server) {
   };
 }
 
-function mockStore(snapshot, listings, delimiter = '/') {
+function mockStore(snapshot, listings, delimiter = '/', failRenames = false) {
   const saved = [];
   return {
     delimiter,
@@ -115,6 +129,11 @@ function mockStore(snapshot, listings, delimiter = '/') {
     // fmd5|null}: pull-time routing lands in the DESTINATION dir with the
     // SOURCE folder's md5, unrouted pulls land in their folder unmarked
     written: [],
+    // every moveMessage call — {srcFolder, dstFolder, uid, keepFmd5,
+    // flags}: the kept-copy rename of a replayed server move is a
+    // same-folder call with keepFmd5 false, the fresh uid and the fresh
+    // server row's flags
+    moves: [],
     async loadState() {
       return structuredClone(snapshot);
     },
@@ -138,6 +157,18 @@ function mockStore(snapshot, listings, delimiter = '/') {
     },
     async removeMessage() {
       return false;   // the wedged-FS failure mode
+    },
+    async moveMessage(srcFolder, entry, dstFolder, uid, opts) {
+      if (failRenames) {
+        throw new Error('mock-fs: rename failed');
+      }
+      this.moves.push({
+        srcFolder,
+        dstFolder,
+        uid: Number(uid),
+        keepFmd5: !!opts?.keepFmd5,
+        flags: opts?.flags ?? null
+      });
     },
     async writeMessage(folder, uid, flags, raw, opts) {
       this.written.push({
@@ -382,10 +413,12 @@ function dirState(uidvalidity, uidnext, rows) {
     'no "left unmatched" warning: ' + JSON.stringify(plan.warnings));
 }
 
-// ---- scenario D: moveServer whose marker removal fails must not commit -----
-// The replay lands on the server (moveMail ok) but the marker file cannot
-// be removed: the op counts as failed, the snapshot stays uncommitted, and
-// the next run re-detects the state instead of orphaning the file forever.
+// ---- scenario D: a failed server MOVE keeps the marker, never commits -----
+// The replay fails on the IMAP side (moveMail throws — the mock's fail path
+// replaces the old failing-removeMarker shape, which no longer exists: the
+// op keeps the file for the post-apply pairing). The op counts as failed,
+// the snapshot stays uncommitted, and the next run re-detects the whole
+// state instead of orphaning the file forever.
 {
   const m5 = await idOf('m5');
   const server = new Map([
@@ -410,13 +443,13 @@ function dirState(uidvalidity, uidnext, rows) {
   ]);
 
   const store = mockStore(snapshot, listings);
-  const engine = createSync(mockMail(server), store, {log: quietLog});
+  const engine = createSync(mockMail(server, {failMove: true}), store, {log: quietLog});
   const {summary} = await engine.run({dry: false});
 
   assert.equal(summary.failed, 1, 'the moveServer op failed');
   assert.equal(summary.moveServer, 0, 'the moveServer op was not counted as done');
   assert.equal(store.saved.length, 0, 'snapshot NOT committed');
-  assert.ok(true);
+  assert.deepEqual(store.moves, [], 'no local rename happened on a failed MOVE');
 }
 
 // ---- scenario F: duplicate-uid, same message → purge, no rename -----------
@@ -933,6 +966,188 @@ const emptyFolders = () => ({
     "the '/'-typed destination is written in the account delimiter's spelling");
   assert.ok(!routeLogs.some(l => l.content.includes('not a folder of this server')),
     'no missing-destination warning for an existing folder');
+}
+// ---- scenario K1: a replayed server move KEEPS the local copy -------------
+// The marker survives the move; the post-apply survey pairs it with the
+// message's FRESH destination uid (unique byte size) and renames it in
+// place — msgid from the local file, ZERO re-download.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])],
+    ['Work', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}
+      }},
+      'Work': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  const moveLogs = [];
+  const store = mockStore(snapshot, listings);
+  const mail = mockMail(server);
+  const engine = createSync(mail, store, {log: l => moveLogs.push(l)});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.equal(summary.serverMoves, 1, 'the server move landed');
+  assert.equal(summary.keptLocalMoves, 1, 'the local copy was kept');
+  assert.equal(mail.fetches, 0,
+    'no re-download: the moved bytes were already on disk');
+  assert.deepEqual(store.moves, [{
+    srcFolder: 'Work', dstFolder: 'Work', uid: 11, keepFmd5: false, flags: []
+  }], 'the copy was renamed in place: fresh uid, dest FMD5, server flags');
+  const snap = store.saved[0];
+  assert.equal(snap.folders['Work'].messages[11].msgid, m5,
+    'the snapshot carries the kept copy\'s identity under the fresh uid');
+  assert.ok(!snap.folders['INBOX'].messages?.[5],
+    'the source uid left the snapshot with the move');
+  assert.ok(moveLogs.some(l => l.content.includes('moved copy kept: INBOX/5 → Work/11 (no refetch)')),
+    'the kept-copy narration line is logged');
+}
+
+// ---- scenario K2: ambiguous byte size → drop + refetch (today's shape) ----
+// Two replayed moves whose copies have EQUAL byte sizes cannot be paired by
+// size alone: both markers are dropped and the fresh uids are re-fetched.
+{
+  const m7 = await idOf('m7');
+  const m8 = await idOf('m8');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[7, 'm7'], [8, 'm8']])],
+    ['Work', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        7: {msgid: m7, flags: []}, 8: {msgid: m8, flags: []}
+      }},
+      'Work': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([], [
+      fileEntry('i7', 7, md5hex('INBOX'), rawOf('m7')),
+      fileEntry('i8', 8, md5hex('INBOX'), rawOf('m8'))
+    ])]
+  ]);
+
+  const moveLogs = [];
+  const store = mockStore(snapshot, listings);
+  const mail = mockMail(server);
+  const engine = createSync(mail, store, {log: l => moveLogs.push(l)});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean (fallback refetch)');
+  assert.equal(summary.keptLocalMoves, 0, 'nothing was kept: sizes are ambiguous');
+  assert.deepEqual(store.moves, [], 'no blind rename under ambiguity');
+  assert.equal(mail.fetches, 2, 'both fresh uids were re-fetched instead');
+  const snap = store.saved[0];
+  assert.equal(snap.folders['Work'].messages[11].msgid, m7,
+    'the fetched copies restore the right identities');
+  assert.ok(moveLogs.some(l => l.cls === 'warn' &&
+      l.content.includes('2 fresh uid(s) match its byte size')),
+    'the ambiguity warns and explains the refetch');
+}
+
+// ---- scenario K3: a failed rename falls back to drop + refetch ------------
+// The move replayed, the copy kept, but the rename throws: the fallback
+// warns, drops the marker (best effort) and the fresh uid is re-fetched.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])],
+    ['Work', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}
+      }},
+      'Work': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  const moveLogs = [];
+  const store = mockStore(snapshot, listings, '/', true);
+  const mail = mockMail(server);
+  const engine = createSync(mail, store, {log: l => moveLogs.push(l)});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the rename failure never fails the run');
+  assert.equal(summary.keptLocalMoves, 0, 'the rename failed — nothing kept, no count');
+  assert.equal(mail.fetches, 1, 'the fresh uid was re-fetched');
+  const snap = store.saved[0];
+  assert.equal(snap.folders['Work'].messages[11].msgid, m5,
+    'the snapshot carries the identity from the fetched raw');
+  assert.ok(moveLogs.some(l => l.cls === 'warn' && l.content.includes('the keep failed')),
+    'the failed rename warns');
+}
+
+// ---- scenario K4: the heal path (lost-snapshot replay) also keeps ---------
+// healLostMove plans the same moveServer op: verification mined the raw,
+// the move replayed and the kept copy is renamed to the fresh uid with no
+// additional download.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])],
+    ['Work', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {}},
+      'Work': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  const moveLogs = [];
+  const store = mockStore(snapshot, listings);
+  const mail = mockMail(server);
+  const engine = createSync(mail, store, {log: l => moveLogs.push(l)});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.equal(summary.serverMoves, 1, 'the healed move replayed');
+  assert.equal(summary.keptLocalMoves, 1, 'the local copy was kept');
+  assert.equal(mail.fetches, 1,
+    'the only download is the heal-verification mining raw — no post-pull');
+  assert.deepEqual(
+    store.moves,
+    [{srcFolder: 'Work', dstFolder: 'Work', uid: 11, keepFmd5: false, flags: []}],
+    'the healed copy was renamed in place too');
+  assert.equal(store.saved[0].folders['Work'].messages[11].msgid, m5,
+    'the sweep-kept copy\'s identity reaches the snapshot');
+  assert.ok(moveLogs.some(l => l.content.includes('moved copy kept: INBOX/5 → Work/11 (no refetch)')),
+    'the heal replay keeps the copy with the same narration');
 }
 
 console.log('sync.test: all scenarios pass');

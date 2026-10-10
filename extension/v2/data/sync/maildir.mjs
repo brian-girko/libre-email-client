@@ -560,33 +560,21 @@ export async function renameFile(fs, maildir, entry, patch) {
  * the source file's own FMD5 survives the rename instead: the file then
  * sits in the destination as an interloper — offlineimap's marker for a
  * locally moved message that has not been confirmed server-side yet and
- * must replay as a server MOVE at the next sync.
+ * must replay as a server MOVE at the next sync. `{flags}` overrides the
+ * filename's flag letters (a kept copy is renamed to its new server uid
+ * with the fresh server row's flags — same spelling the post-pull write
+ * uses); absent, the entry's own flags ride along.
  * @param {FileSystemFileHandle} file
  * @param {object} entry source listLocal() entry
  * @param {object} dstMaildir folderDir() of the destination (create:true)
  * @param {string} dstFolder destination server folder name
  * @param {number} uid the message's UID in the destination
- * @param {{keepFmd5?: boolean}} [options] keep the source FMD5 marker
+ * @param {{keepFmd5?: boolean, flags?: string[]}} [options] keep the source
+ *   FMD5 marker / override the flag letters
  * @returns {Promise<string>} new filename
  */
-/**
- * Moves a message file into another folder's Maildir. By default the file
- * is stamped with the destination folder's FMD5 and the uid the server
- * assigned over there (server-directed relocation). With {keepFmd5: true}
- * the source file's own FMD5 survives the rename instead: the file then
- * sits in the destination as an interloper — offlineimap's marker for a
- * locally moved message that has not been confirmed server-side yet and
- * must replay as a server MOVE at the next sync.
- * @param {object} fs an fs gateway facade
- * @param {object} entry source listLocal() entry (carries its own path)
- * @param {object} dstMaildir folderDir() paths of the destination
- * @param {string} dstFolder destination server folder name
- * @param {number} uid the message's UID in the destination
- * @param {{keepFmd5?: boolean}} [options] keep the source FMD5 marker
- * @returns {Promise<string>} new filename
- */
-export async function moveBetweenFolders(fs, entry, dstMaildir, dstFolder, uid, {keepFmd5 = false} = {}) {
-  const letters = flagsToLetters(entry.flags);
+export async function moveBetweenFolders(fs, entry, dstMaildir, dstFolder, uid, {keepFmd5 = false, flags = null} = {}) {
+  const letters = flagsToLetters(flags ?? entry.flags);
   const fmd5 = keepFmd5 ? (entry.fmd5 ?? md5hex(dstFolder)) : md5hex(dstFolder);
   const name = letters
     ? `${entry.unique},U=${uid},FMD5=${fmd5},I=2,${letters}`
@@ -780,13 +768,16 @@ export class MaildirStore {
    * Moves a message between folders. Default (destination FMD5) is for
    * server-directed relocations; the client's local moves pass
    * {keepFmd5: true} to keep the source folder's marker so the sync
-   * engine classifies the file as a pending server-side move.
-   * @param {{keepFmd5?: boolean}} [options]
+   * engine classifies the file as a pending server-side move. `{flags}`
+   * overrides the filename's flag letters (the kept-copy rename of a
+   * replayed move adopts the fresh server row's flags).
+   * @param {{keepFmd5?: boolean, flags?: string[]}} [options]
    * @returns {Promise<string>} new filename
    */
-  async moveMessage(srcFolder, entry, dstFolder, uid, {keepFmd5 = false} = {}) {
+  async moveMessage(srcFolder, entry, dstFolder, uid, {keepFmd5 = false, flags = null} = {}) {
     const dst = await this.folder(dstFolder, {create: true});
-    return moveBetweenFolders(this.fs, entry, dst, dstFolder, uid ?? entry.uid, {keepFmd5});
+    return moveBetweenFolders(this.fs, entry, dst, dstFolder, uid ?? entry.uid,
+      {keepFmd5, flags});
   }
 
   /** removes one local file; missing files succeed silently */

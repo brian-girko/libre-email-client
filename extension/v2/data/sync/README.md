@@ -551,7 +551,22 @@ plan for that run, so the server copy is kept and the questions re-ask
 on the next sync. Local Trash moves stay unaffected: a rename inside the
 handle keeps the SOURCE folder's FMD5 in the filename
 (`moveMessage(..., {keepFmd5: true})`), producing the foreign-FMD5
-interloper the engine replays as a single server MOVE, never a purge.
+interloper the engine replays as a single server MOVE (filter moves are
+identical — pull-time routing writes that same marker file directly).
+
+**A replayed MOVE keeps the bytes.** A server MOVE assigns a fresh UID, so
+the pending-move file can't simply be re-used — but the bytes are already
+on disk. After the MOVE lands, the post-apply survey pairs every kept copy
+with its fresh destination UID — the pairing is valid only when exactly
+ONE new row matches the copy's byte size — and renames the file in place
+(`store.moveMessage(dest, entry, dest, newUid, {flags})`: dest FMD5, new
+UID, the fresh server row's flags), the snapshot msgid coming from the
+local copy. No re-download — the standard two-way-mirror behavior
+(isync/mbsync rewrite their filename the same way). A pairing that is
+ambiguous (equal sizes, no row, unreadable copy, failed rename) falls back
+to the old shape — the marker is dropped and the fresh UID pulled — and a
+kept-but-unremoved marker can never wedge the next run either: the final
+sweep purges it by msgid once the message is served in its destination.
 Flag renames preserve a filename's own FMD5 too (`renameFile` no longer
 recomputes it), so marking a moved-but-unsynced message read cannot
 erase the pending-move marker. Server-directed relocations (`relocate`

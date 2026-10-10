@@ -26,7 +26,12 @@
 //                             with no foreign-FMD5 file anywhere in the
 //                             handle the delete asks the user first
 //                             (confirmPurge gate, sync page)
-//   L file with foreign FMD5 X → local move out of X, pushed as server move
+//   L file with foreign FMD5 X → local move out of X, pushed as server move;
+//                             the kept copy is PAIRED with the fresh
+//                             destination uid in the post-apply survey
+//                             (unique byte size) and renamed in place —
+//                             no re-download; ambiguity falls back to a
+//                             drop + refetch
 //   S−K                    → new mail: pull — unless a pending-move file
 //                             claims the uid while its snapshot record is
 //                             gone (lost-snapshot shape): verified by msgid
@@ -149,6 +154,7 @@ function blankSummary() {
   return {
     added: 0, removed: 0, droppedDirs: 0, localFlagChanges: 0, localMoves: 0,
     serverFlagChanges: 0, serverDeletes: 0, serverFolderDeletes: 0, serverFolderCreates: 0, serverMoves: 0,
+    keptLocalMoves: 0,
     resyncs: 0, adopted: 0, skipped: 0, failed: 0,
     ops: {}, conflicts: 0, warnings: 0, folders: {}
   };
@@ -1470,9 +1476,15 @@ async function rowsFor(name, uidnext) {
     for (const key of Object.values(KIND2KEY)) {
       summary[key] = 0;
     }
+    summary.keptLocalMoves = 0;
     const folderOf = (name) => summary.folders[name] ?? (summary.folders[name] = blankCounts());
     const recMsgid = new Map();   // `${folder}/${uid}` → msgid (this run)
     const deadFolders = new Set(); // folders deleted on the server this run
+    // pending-move files SURVIVING a replayed server MOVE (see the
+    // moveServer case): the post-apply survey pairs each with the message's
+    // fresh destination uid and renames it in place — the copy stays local,
+    // no re-download
+    const movedKeeps = [];
     // pull order follows the survey's INBOX-first, smallest-first ranking;
     // the round-robin scheduler below gives each folder a fair quantum.
     const folderRank = new Map([...survey.folders.keys()].map((name, i) => [name, i]));
@@ -1874,14 +1886,18 @@ async function rowsFor(name, uidnext) {
           case 'moveServer': {
             await select(op.folder, {force: true});
             await mail.moveMail(Number(op.uid), op.toFolder);
-            if (!await store.removeMessage(op.entry)) {
-              // the server move landed but the marker survives: committing
-              // the snapshot would orphan the file forever (its claimed uid
-              // is expunged from the source once the MOVE lands) — fail the
-              // op so the snapshot stays uncommitted and the next run
-              // re-detects the whole shape
-              throw new Error(`pending-move file could not be removed: ${op.entry.fileName}`);
-            }
+            // keep the pending-move file: the server assigned the message a
+            // NEW uid in the destination, and the post-apply pass below
+            // pairs the kept copy with it and renames the file in place —
+            // the bytes are already on disk, no re-download. The record
+            // only feeds this run; an op that fails here leaves no record,
+            // the marker stays a pending move and the next run replays it.
+            movedKeeps.push({
+              from: op.folder,
+              to: op.toFolder,
+              oldUid: Number(op.uid),
+              entry: op.entry
+            });
             emitLog('apply', `server move ${op.folder}/${op.uid} → ${op.toFolder}`);
             break;
           }
@@ -1900,6 +1916,81 @@ async function rowsFor(name, uidnext) {
           emitLog('apply', 'run aborted — the wedged pipe is torn down; the next run re-detects this diff', 'warn');
           throw e;
         }
+      }
+    }
+
+    // Local copies kept across replayed server MOVEs (the moveServer case
+    // keeps each marker file): pair them with the messages' fresh
+    // destination uids and rename them in place — the bytes are already on
+    // disk, so a replayed move costs no re-download. Pairing is per file:
+    // exactly ONE unclaimed post row of equal byte size. Anything else
+    // (no match, ambiguous size, unreadable copy, failed rename) falls
+    // back to today's shape — the marker is dropped here and the arrival
+    // branch below re-pulls the fresh uid. A kept-but-unremoved marker can
+    // never wedge the next run either: the final sweep purges it by msgid
+    // (the message is served in its destination once the MOVE landed).
+    let pairedMoves = 0;
+    async function pairMovedKeeps(F, post) {
+      const pend = movedKeeps.filter(m => m.to === F.name);
+      if (!pend.length) {
+        return;
+      }
+      // the folder's fresh uids ONCE (post rows the pre-survey did not
+      // know, minus any key this run already recored) — each pending copy
+      // looks for its unique partner in here
+      const fresh = [...post]
+        .filter(([uid]) => !F.server.has(uid) && !recMsgid.has(`${F.name}/${uid}`))
+        .map(([uid, row]) => ({uid, size: row.size != null ? Number(row.size) : null, used: false}));
+      for (const m of pend) {
+        const fallback = async why => {
+          emitLog('apply',
+            `moved ${m.from}/${m.oldUid} → ${F.name}: ${why} — ` +
+            'copy dropped, the fresh uid is re-fetched', 'warn');
+          if (!await store.removeMessage(m.entry)) {
+            // best effort: the stale marker rides to the next run, where
+            // the final sweep purges it by msgid (the message is served
+            // in its destination once the MOVE landed)
+            emitLog('apply',
+              `moved ${m.from}/${m.oldUid}: the kept copy could not be removed — ` +
+              'the next run resolves it by msgid', 'warn');
+          }
+        };
+        let size = null;
+        try {
+          size = await store.fileSize(m.entry);
+        }
+        catch {}
+        if (size == null) {
+          await fallback('the copy is unreadable (no byte size)');
+          continue;
+        }
+        const matches = fresh.filter(c => !c.used && c.size === size);
+        if (matches.length !== 1) {
+          await fallback(matches.length > 1
+            ? `${matches.length} fresh uid(s) match its byte size`
+            : 'no fresh uid matches its byte size');
+          continue;
+        }
+        const hit = matches[0];
+        hit.used = true;
+        let id = null;
+        try {
+          // identity from the local copy FIRST — a read failure must not
+          // leave a renamed file without a snapshot msgid
+          id = await msgidOf(await store.readFile(m.entry));
+          await store.moveMessage(F.name, m.entry, F.name, hit.uid,
+            {flags: knownFlags(post.get(hit.uid)?.flags ?? [])});
+        }
+        catch (e) {
+          await fallback(`the keep failed (${e?.message || e})`);
+          continue;
+        }
+        // the arrival branch below skips keys already in recMsgid
+        recMsgid.set(`${F.name}/${hit.uid}`, id);
+        summary.keptLocalMoves++;
+        pairedMoves++;
+        emitLog('apply',
+          `moved copy kept: ${m.from}/${m.oldUid} → ${F.name}/${hit.uid} (no refetch)`);
       }
     }
 
@@ -1927,6 +2018,9 @@ async function rowsFor(name, uidnext) {
       if (!restricted) {
         await store.writeUidValidity(F.name, uidvalidity);
       }
+      // pair the run's replayed moves BEFORE the arrival branch: paired
+      // uids land in recMsgid, so only UNPAIRED new uids are re-fetched
+      await pairMovedKeeps(F, post);
       const messages = restricted ? null : {};
       for (const [uid, row] of post) {
         const key = `${F.name}/${uid}`;
@@ -2002,6 +2096,10 @@ async function rowsFor(name, uidnext) {
         (routeStats.failed
           ? `, ${routeStats.failed} UNROUTED (landed in INBOX — the post-sync pass retries them)`
           : ''));
+    }
+    // and the replayed moves whose local copies survived (pairing summary)
+    if (pairedMoves) {
+      emitLog('sync', `moved copies kept local: ${pairedMoves} (no refetch)`);
     }
     snapOut.lastSyncAt = new Date().toISOString();
     summary.finishedAt = snapOut.lastSyncAt;
