@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Regression tests for the sync engine's foreign-FMD5 (interloper) handling,
-// plus the moveServer marker-removal hardening.
+// plus the moveServer marker-removal hardening — and the pull-time filter
+// routing (route-finder writes INTO the destination Maildir).
 // Run: node data/sync/offscreen/sync.test.mjs
 //
 // The bugs these pin down:
@@ -22,6 +23,15 @@
 //    left on disk with the warning, which re-marked the dir dirty forever.
 //    It is now uploaded to the folder it sits in (append) so the move
 //    completes and the marker becomes resolvable.
+//
+// Pull-time routing (the `route` finder): a pulled INBOX message whose
+// first matching filter is a MOVE is written STRAIGHT into the destination
+// dir with the SOURCE folder's FMD5 (the pending-move marker the next run
+// replays as a server MOVE) — the same end state the old
+// write-into-INBOX-then-rename pass reached, minus the rename. Stop
+// windows, self-targeted moves and no-matches keep landing in INBOX with
+// their own FMD5, marked routed so the post-sync pass never re-filters
+// them; a throwing finder leaves the message unrouted (INBOX, own FMD5).
 
 import {register} from 'node:module';
 register('./root-loader.mjs', import.meta.url);
@@ -29,6 +39,9 @@ register('./root-loader.mjs', import.meta.url);
 const {md5hex, makeFilename} = await import('../maildir.mjs');
 const {msgidOf} = await import('../snapshot.mjs');
 const {createSync, describeOp} = await import('./sync.mjs');
+// the pull-time routing tests drive the real filter walk (route.mjs — the
+// postal-mime specifier resolves through the loader registered above)
+const {routeMessage} = await import('../filters/route.mjs');
 
 import assert from 'node:assert/strict';
 
@@ -75,15 +88,33 @@ function mockMail(server) {
       const dst = server.get(mailbox);
       dst.raws.set(20, raw);
       dst.rows.set(20, {flags: row.flags, subject: row.subject ?? null, from: null, date: null, size: raw.length});
+    },
+    /**
+     * APPEND: the local-born upload path (`append` op). The server assigns
+     * the next uid — mocked via status.uidnext so the post-apply survey
+     * sees the arrival (uid beyond the pre-surveyed space) — and stores
+     * the raw for the post-pull FETCH.
+     */
+    async uploadMail(mailbox, raw, flags = []) {
+      const dst = server.get(mailbox);
+      const uid = dst.status.uidnext;
+      dst.status.uidnext += 1;
+      dst.raws.set(uid, raw);
+      dst.rows.set(uid, {flags: flags ?? [], subject: null, from: null, date: null, size: raw.length});
+      return true;
     }
   };
 }
 
-function mockStore(snapshot, listings) {
+function mockStore(snapshot, listings, delimiter = '/') {
   const saved = [];
   return {
-    delimiter: '/',
+    delimiter,
     saved,
+    // every writeMessage call the engine makes — {folder, uid, flags, bytes,
+    // fmd5|null}: pull-time routing lands in the DESTINATION dir with the
+    // SOURCE folder's md5, unrouted pulls land in their folder unmarked
+    written: [],
     async loadState() {
       return structuredClone(snapshot);
     },
@@ -108,7 +139,15 @@ function mockStore(snapshot, listings) {
     async removeMessage() {
       return false;   // the wedged-FS failure mode
     },
-    async writeMessage() {},
+    async writeMessage(folder, uid, flags, raw, opts) {
+      this.written.push({
+        folder,
+        uid: Number(uid),
+        flags: flags ?? [],
+        bytes: raw?.byteLength ?? null,
+        fmd5: opts?.fmd5 ?? null
+      });
+    },
     async writeUidValidity() {},
     async saveState(snap) {
       saved.push(snap);
@@ -612,6 +651,288 @@ function dirState(uidvalidity, uidnext, rows) {
   await assert.rejects(() => missing.plan(),
     /survey: folder "Nowhere\/None" not found on the server/,
     'an unmatched dir scope still fails loudly');
+}
+
+// ---- helpers for the pull-time routing scenarios ---------------------------
+
+// a raw message with a DISTINCT subject (routing matches on subject:)
+const rawOfSubject = (msgid, subject) => enc.encode(
+  `From: a@b.c\r\nSubject: ${subject}\r\nMessage-Id: <${msgid}>\r\n\r\nbody\r\n`);
+
+// like dirState, but the rows carry custom raw bytes (subject matters for
+// the filter walk; the engine routes on the raw, never on the row)
+function dirRawState(uidvalidity, uidnext, rows) {
+  return {
+    status: {folder: 'x', exists: true, uidvalidity, uidnext},
+    rows: new Map([...rows].map(([uid, raw]) =>
+      [uid, {flags: [], subject: null, from: null, date: null, size: raw.length}])),
+    raws: new Map(rows)
+  };
+}
+
+const MOVE_TO_WORK = {id: 'f1', enabled: true, accountId: '', action: 'move',
+  query: 'subject: routed', folder: 'Work', description: 'to Work'};
+const STOP_FILTER = {id: 's1', enabled: true, accountId: '', action: 'stop',
+  query: 'subject: stop', folder: '', description: 'guard'};
+
+const emptyFolders = () => ({
+  INBOX: {uidvalidity: 1000, uidnext: 7, messages: {}},
+  Work: {uidvalidity: 2000, uidnext: 2, messages: {}}
+});
+
+// ---- routing scenario 1: a matching MOVE lands in the destination dir ------
+// The old shape wrote every pull into INBOX and renamed it afterwards; the
+// routed pull must be written into "Work" carrying the SOURCE folder's
+// FMD5 (the pending-move marker), INBOX must get NOTHING for it, and the
+// snapshot must still describe the server row (INBOX/uid). The un-matched
+// message keeps landing in INBOX, marked routed (no-match ends the walk).
+{
+  const server = new Map([
+    ['INBOX', dirRawState(1000, 7, new Map([
+      [5, rawOfSubject('r5', 'routed')],
+      [6, rawOfSubject('r6', 'plain news')]
+    ]))],
+    ['Work', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {version: 2, lastSyncAt: null, folders: emptyFolders()};
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([])]
+  ]);
+  const routeLogs = [];
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store,
+    {log: (l) => routeLogs.push(l), route: raw => routeMessage(raw, {
+      filters: [MOVE_TO_WORK], accountId: null
+    })});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.equal(store.saved.length, 1, 'the snapshot committed');
+  assert.deepEqual(
+    store.written.map(w => [w.folder, w.uid, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['Work', 5, 'SOURCE'], ['INBOX', 6, 'own']],
+    'routed uid 5 lands in Work with the SOURCE FMD5, uid 6 stays INBOX: ' +
+      JSON.stringify(store.written));
+  const snap = store.saved[0];
+  assert.deepEqual(Object.keys(snap.folders['INBOX'].messages), ['5', '6'],
+    'the snapshot still describes the server rows (INBOX/uid)');
+  assert.equal(snap.folders['INBOX'].messages[5].msgid, await idOf('r5'),
+    'the routed message keeps its INBOX identity in the snapshot');
+  assert.deepEqual([...engine.landedInboxUids()].sort((a, b) => a - b), [5, 6],
+    'both pulls are "received"');
+  assert.deepEqual([...engine.routedInboxUids()].sort((a, b) => a - b), [5, 6],
+    'both routings were evaluated (a no-match is final too)');
+  assert.deepEqual(engine.routeStats(), {moved: 1, kept: 0, unmatched: 1, failed: 0},
+    'route counters: 1 move, 1 unmatched');
+  assert.ok(routeLogs.some(l => l.type === 'filter' && l.content.includes('-> Work')),
+    'the match narration line is logged: ' + JSON.stringify(routeLogs));
+  assert.ok(routeLogs.some(l => l.content.includes('filter routing: 2 message(s) evaluated — 1 moved, 0 kept, 1 unmatched')),
+    'the end-of-apply route summary is logged');
+}
+
+// ---- routing scenario 2: a stop filter shields a message from later moves --
+// stop-above-move: the stop match keeps uid 5 in INBOX (no rename, later
+// filters skipped) and the move filter still routes uid 6 into Work.
+{
+  const server = new Map([
+    ['INBOX', dirRawState(1000, 7, new Map([
+      [5, rawOfSubject('r5', 'stop me')],
+      [6, rawOfSubject('r6', 'routed')]
+    ]))],
+    ['Work', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {version: 2, lastSyncAt: null, folders: emptyFolders()};
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([])]
+  ]);
+  const routeLogs = [];
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store,
+    {log: (l) => routeLogs.push(l), route: raw => routeMessage(raw, {
+      filters: [STOP_FILTER, MOVE_TO_WORK], accountId: null
+    })});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.deepEqual(
+    store.written.map(w => [w.folder, w.uid, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['INBOX', 5, 'own'], ['Work', 6, 'SOURCE']],
+    'the stop match stays INBOX (own FMD5), the move match lands in Work: ' +
+      JSON.stringify(store.written));
+  assert.deepEqual(engine.routeStats(), {moved: 1, kept: 1, unmatched: 0, failed: 0},
+    'route counters: 1 move, 1 stop-anchored');
+  assert.ok(routeLogs.some(l => l.type === 'filter' && l.content.includes('stop filters (message stays in INBOX')),
+    'the stop narration line is logged');
+}
+
+// ---- routing scenario 3: a throwing finder leaves the message unrouted ----
+// A finder failure must degrade to today's behavior: the message lands in
+// INBOX with its OWN FMD5, is NOT marked routed, and the post-sync pass
+// (which is readonly-notified via the landed set plus routed set) re-tries.
+{
+  const server = new Map([
+    ['INBOX', dirRawState(1000, 7, new Map([
+      [5, rawOfSubject('r5', 'boom me')]]))],
+    ['Work', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {version: 2, lastSyncAt: null, folders: emptyFolders()};
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([])]
+  ]);
+  const routeLogs = [];
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store, {
+    log: (l) => routeLogs.push(l),
+    route: async () => {
+      throw new Error('boom');
+    }
+  });
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the pull itself still succeeds');
+  assert.deepEqual(
+    store.written.map(w => [w.folder, w.uid, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['INBOX', 5, 'own']],
+    'the pull lands in INBOX with its own FMD5: ' + JSON.stringify(store.written));
+  assert.deepEqual([...engine.landedInboxUids()], [5], 'the pull is received');
+  assert.equal(engine.routedInboxUids().size, 0,
+    'the finder never decided — nothing is marked routed');
+  assert.deepEqual(engine.routeStats(), {moved: 0, kept: 0, unmatched: 0, failed: 1},
+    'the finder failure is counted, never turned into a failed pull');
+  assert.ok(routeLogs.some(l => l.cls === 'warn' && l.content.includes('routing INBOX/5 FAILED')),
+    'the failure is warned');
+}
+
+// ---- routing scenario 4: a destination folder the server does not have ----
+// Warn once, still land locally: the file is a pending move the next run
+// replays once the folder exists (the engine's localOnly/create machinery
+// already covers the "local dir without a server folder" case).
+{
+  const server = new Map([
+    ['INBOX', dirRawState(1000, 7, new Map([
+      [5, rawOfSubject('r5', 'routed')]]))],
+    ['Work', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {version: 2, lastSyncAt: null, folders: emptyFolders()};
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([])]
+  ]);
+  const routeLogs = [];
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store, {
+    log: (l) => routeLogs.push(l),
+    route: raw => routeMessage(raw, {
+      filters: [{...MOVE_TO_WORK, folder: 'Ghost'}], accountId: null
+    })
+  });
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.deepEqual(
+    store.written.map(w => [w.folder, w.uid, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['Ghost', 5, 'SOURCE']],
+    'the message lands in the missing destination anyway');
+  assert.ok(routeLogs.some(l => l.cls === 'warn' &&
+      l.content.includes('destination "Ghost" is not a folder of this server')),
+    'the missing-destination warning is logged');
+}
+
+// ---- routing scenario 5: a message arriving DURING the run also routes ----
+// The local-born dup upload (append op) lands a fresh uid; the post-apply
+// survey fetches it ("arrived during the run") and the finder routes it
+// into Work with the INBOX marker — the snapshot still records INBOX/uid.
+{
+  const winner = rawOfSubject('r9', 'already mine');
+  const loser = rawOfSubject('ap', 'routed');
+  const server = new Map([
+    ['INBOX', dirRawState(1000, 10, new Map([[9, winner]]))],
+    ['Work', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      INBOX: {uidvalidity: 1000, uidnext: 10, messages: {}},
+      Work: {uidvalidity: 2000, uidnext: 2, messages: {}}
+    }
+  };
+  const dupName = makeFilename('INBOX', 9, [], {unique: 'dup1', fmd5: md5hex('INBOX')});
+  const loserEntry = fileEntry(dupName, 9, md5hex('INBOX'), loser);
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f9', 9, md5hex('INBOX'), winner)])],
+    ['Work', listing([])]
+  ]);
+  listings.get('INBOX').excluded.push(loserEntry);
+
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store, {
+    log: quietLog,
+    route: raw => routeMessage(raw, {filters: [MOVE_TO_WORK], accountId: null})
+  });
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  // uid 9 is size-ADOPTED (winner matches the server size): no pull, no
+  // write — the loser joins the ordinary local-born classification as an
+  // `append` op; its fresh server uid (10) becomes the mid-run arrival
+  assert.ok(!store.written.some(w => w.folder === 'INBOX' && w.uid === 9),
+    'the winner is adopted (no write)');
+  const arrival = store.written.filter(w => w.uid === 10);
+  assert.deepEqual(
+    arrival.map(w => [w.folder, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['Work', 'SOURCE']],
+    'the mid-run arrival was uploaded (uid 10) and routed into Work: ' +
+      JSON.stringify(store.written.filter(w => w.uid === 10)));
+  assert.ok(engine.landedInboxUids().has(10), 'the arrival counts as received');
+  assert.ok(engine.routedInboxUids().has(10), 'the arrival counts as routed');
+  assert.equal(store.saved.length, 1, 'the snapshot committed');
+  assert.deepEqual(Object.keys(store.saved[0].folders['INBOX'].messages).sort(), ['10', '9'],
+    'the snapshot records the arrival under its INBOX uid');
+}
+
+// ---- routing scenario 6: a '/'-typed destination on a '.'-delimiter server
+// The filter's folder is spelled with '/' (the options page normalizes on
+// save; already-stored rows defend here): normalizeFolderPath maps it onto
+// the account delimiter BEFORE the survey comparison or the write, so the
+// write targets the SERVER spelling and no missing-destination warning
+// fires for a folder that does exist.
+{
+  const server = new Map([
+    ['INBOX', dirRawState(1000, 7, new Map([
+      [5, rawOfSubject('r5', 'routed')]]))],
+    ['Work.Test', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      INBOX: {uidvalidity: 1000, uidnext: 7, messages: {}},
+      'Work.Test': {uidvalidity: 2000, uidnext: 2, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work.Test', listing([])]
+  ]);
+  const routeLogs = [];
+  const store = mockStore(snapshot, listings, '.');
+  const engine = createSync(mockMail(server), store, {
+    log: (l) => routeLogs.push(l),
+    route: raw => routeMessage(raw, {
+      filters: [{...MOVE_TO_WORK, folder: 'Work/Test'}], accountId: null
+    })
+  });
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.deepEqual(
+    store.written.map(w => [w.folder, w.uid, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['Work.Test', 5, 'SOURCE']],
+    "the '/'-typed destination is written in the account delimiter's spelling");
+  assert.ok(!routeLogs.some(l => l.content.includes('not a folder of this server')),
+    'no missing-destination warning for an existing folder');
 }
 
 console.log('sync.test: all scenarios pass');

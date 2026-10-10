@@ -113,6 +113,9 @@ export async function routeMessage(raw, {filters, accountId = null} = {}) {
         folder: stop ? null : String(filter.folder ?? ''),
         createFolder: stop ? false : !!filter.createFolder,
         filter: {id: filter.id ?? null, description: filter.description ?? ''},
+        // the winner's subject, for pull-time narration lines shaped like
+        // the filter runner's ("subject" -> Line n of Filter N -> dest)
+        subject: String(parsed.msg.subject ?? ''),
         detail
       };
     }

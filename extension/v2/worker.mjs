@@ -200,11 +200,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     //
     // Post-sync filters are DEFAULT-ON here: the engine cannot read
     // chrome.storage, so the stored filter list rides in every forwarded
-    // job and the engine applies it to the run's new INBOX pulls — the
-    // only opt-out is the sync interface's own submissions (bare: true;
-    // its filter row stays manual). Non-INBOX scopes / dry runs / discard
-    // harmlessly carry filters: the engine's guard never runs the pass
-    // for them.
+    // job. The engine routes the run's new INBOX pulls into their filter
+    // destinations WHILE they land and keeps the post-sync pass as the
+    // fallback for unrouted leftovers — the only opt-out is the sync
+    // interface's own submissions (bare: true; its filter row stays
+    // manual). Non-INBOX scopes / dry runs / discard harmlessly carry
+    // filters: the engine's guard never routes or filters for them.
     //
     // The stored gate preferences (sync-ui.purge / sync-ui.drop) ride
     // along the same way: when the run's gates are answered headless

@@ -541,10 +541,13 @@ export async function requestSync(accountId, {dir} = {}) {
     if (scope) {
       payload.dir = dir;
       // an INBOX-scoped dir run behaves like the account sync for
-      // filters: the pass targets the run's own new INBOX pulls. The
-      // stored filter list travels from the WORKER's default-on attach
-      // (nothing to load here) — the engine only ever applies it to the
-      // INBOX scope, other folders sync bare, no filters run.
+      // filters: the run's new INBOX pulls are ROUTED at pull time
+      // (written straight into the matching filter's destination dir;
+      // the post-sync pass stays a fallback) and the pass targets the
+      // run's own landed pulls. The stored filter list travels from the
+      // WORKER's default-on attach (nothing to load here) — the engine
+      // only ever applies it to the INBOX scope, other folders sync
+      // bare, no filters run.
     }
     const res = await chrome.runtime.sendMessage(payload);
     if (!res?.ok || res?.started === false) {

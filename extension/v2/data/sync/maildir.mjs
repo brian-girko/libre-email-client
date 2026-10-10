@@ -491,12 +491,16 @@ export async function listLocal(fs, maildir, folder) {
  * @param {number} uid
  * @param {string[]} flags
  * @param {Uint8Array|Blob} raw RFC822 bytes
+ * @param {{fmd5?: string}} [opts] FMD5 stamp override — the default is the
+ *   folder's own md5; a routed pull passes the SOURCE folder's md5, so the
+ *   file written into the destination carries the pending-move marker
+ *   (the interloper the sync engine replays as a server MOVE)
  * @returns {Promise<{fileName:string}>}
  */
-export async function writeMessage(fs, maildir, folder, uid, flags, raw) {
+export async function writeMessage(fs, maildir, folder, uid, flags, raw, opts = {}) {
   const now = Date.now();
   const unique = uniquePart(now);
-  const fmd5 = md5hex(folder);
+  const fmd5 = opts.fmd5 ?? md5hex(folder);
   const letters = flagsToLetters(flags);
   const bare = !letters;
   const name = makeFilename(folder, uid, flags, {unique, fmd5});
@@ -754,10 +758,12 @@ export class MaildirStore {
     return out;
   }
 
-  /** delivers raw bytes; the message lands in new/ or cur/ by flags */
-  async writeMessage(folder, uid, flags, raw) {
+  /** delivers raw bytes; the message lands in new/ or cur/ by flags.
+   *  `{fmd5}` overrides the stamp (a routed pull writes into the
+   *  destination dir while keeping the SOURCE folder's marker). */
+  async writeMessage(folder, uid, flags, raw, opts = {}) {
     const maildir = await this.folder(folder, {create: true});
-    return writeMessage(this.fs, maildir, folder, uid, flags, raw);
+    return writeMessage(this.fs, maildir, folder, uid, flags, raw, opts);
   }
 
   /**

@@ -176,10 +176,16 @@ const BOTH = message({from: 'x@example.com', subject: 'guardme and shipme'});
   assert.equal(res.action, 'stop');
   assert.equal(res.folder, null);
   assert.equal(res.createFolder, false);
+  // the winner's subject: pull-time narration lines reuse the filter
+  // runner's shape ("subject" -> Line n of Filter N -> dest), so the
+  // result must carry it
+  assert.equal(res.subject, 'guardme please');
 
   const moved = await routeMessage(GUARDED, {filters: [MOVE_BOTH, STOP]});
   assert.equal(moved.action, 'move');
   assert.equal(moved.folder, 'Zoo');
+  assert.equal(moved.subject, 'guardme please',
+    'the subject rides a move result too');
 
   const none = await routeMessage(FREE, {filters: [STOP]});
   assert.equal(none.matched, false);

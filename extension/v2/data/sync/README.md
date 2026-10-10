@@ -495,18 +495,34 @@ re-detects whatever the dead run already landed. A settled failure never
 holds the queue: the drain loop moves on, `sync-close` goes out and the
 offscreen document can go idle again.
 
-**Filters run on failed runs too.** The post-sync filter pass (a
-non-interface job's landed INBOX pulls — the engine's `landedInboxUids()`
-set, `runPostSyncFilters` in offscreen.mjs) fires on CLEAN **and** FAILED
-runs alike: the messages the run actually received — post-apply
-arrivals included — are matched against the job's filters even when the
-sync aborted mid-apply, and every match's keepFmd5 rename is reported via
-the `sync-pending-dirs` dirty report so the scheduler re-arms the resync
-alarm for the server move. The case that made passes run only on clean
-syncs (a network issue silently skipping every filter) is gone. Two
-edges stay obvious: a pull the run never landed has nothing on disk to
-filter (correctly absent from the pass), and the pass touches the local
-mirror only — a wedged bridge never takes part in it.
+**Routing happens while the message lands.** A run whose job carries
+the options-page filter list routes INBOX pulls on the spot: the engine's
+`route` finder (the offscreen builds it around `routeMessage` — the bundled
+postal-mime parse + first-match-wins walk in the filters' stored order)
+decides each new message's destination while its raw bytes are still in
+hand, and the message is written STRAIGHT into the destination Maildir
+carrying the SOURCE folder's FMD5 (`{fmd5}` on `store.writeMessage`). That
+file is the pending-move interloper exactly like the old
+write-into-INBOX-then-rename pass produced, so nothing about the
+classifier, the snapshot or the next run changes — the destination folder
+still receives its server MOVE on the next sync, the dirty report still
+re-arms the scheduler. Also routed: a message arriving mid-run ("arrived
+during the run"). Dry runs route nothing (their apply phase never runs),
+and destinations missing on the server warn once and land locally anyway
+(the existing local-only-dir machinery creates the folder later).
+
+**Filter fallback pass runs on failed runs too.** The post-sync filter
+pass (`runPostSyncFilters` in offscreen.mjs) is now a FALLBACK: it sees
+only the landed messages the pull-time router could NOT place (a finder
+throw, mostly — `landedInboxUids()` minus `routedInboxUids()`), so a
+healthy run's pass is a single narration line, and it fires on CLEAN
+**and** FAILED runs alike: the messages the run actually received —
+post-apply arrivals included — are matched against the job's filters even
+when the sync aborted mid-apply, and every match's keepFmd5 rename is
+reported via the `sync-pending-dirs` dirty report so the scheduler re-arms
+the resync alarm for the server move. A pull the run never landed has
+nothing on disk to filter (correctly absent from the pass), and the pass
+touches the local mirror only — a wedged bridge never takes part in it.
 
 **Stop filters.** Each stored filter carries an optional `action` field:
 `move` (the default, absent on every pre-existing row) renames the match

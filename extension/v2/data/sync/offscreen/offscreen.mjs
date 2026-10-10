@@ -20,12 +20,17 @@
 //                   sync per dir in its dirs array (one session, per-dir
 //                   failures logged and skipped; lastSyncAt stamps only
 //                   when every dir finished clean). A full 'sync' job may
-//                   carry the options-page filter list: after it lands,
-//                   the LANDED INBOX messages are filtered on the spot —
-//                   CLEAN OR FAILED RUN ALIKE (runPostSyncFilters; a
-//                   failed run filters the messages it received anyway
-//                   and reports the renamed dirs dirty) — interface jobs
-//                   never carry filters, their behavior is unchanged
+//                   carry the options-page filter list: INBOX pulls are
+//                   ROUTED while they land — the first matching filter
+//                   decides the destination Maildir each message is
+//                   written into (routeMessage, passed to the engine as
+//                   the `route` finder) — and the post-sync pass
+//                   (runPostSyncFilters) stays as the fallback only for
+//                   messages the finder could not place — CLEAN OR
+//                   FAILED RUN ALIKE (a failed run filters the messages
+//                   it received anyway and reports the destination dirs
+//                   dirty) — interface jobs never carry filters, their
+//                   behavior is unchanged
 //   sync-job-drop  {rid} → {ok, dropped} — removes ONE pending job from
 //                   the queue (the running one refuses; use sync-stop)
 //   sync-stop                       → the kill path: drops the queued jobs,
@@ -80,6 +85,7 @@ import {prepare} from '/core/fs.mjs';
 import {MaildirStore} from '../maildir.mjs';
 import {createSync} from './sync.mjs';
 import {runAllFilters} from '../filters/run.mjs';
+import {routeMessage} from '../filters/route.mjs';
 
 // Everything that needs restricted chrome.* APIs lives elsewhere:
 //   - account configs arrive IN the job (the client page resolves them;
@@ -646,6 +652,40 @@ function reportDelimiter(account, summary) {
 }
 
 /**
+ * The pull-time filter finder for one job: the options-page filter list
+ * rides in the job (the offscreen has no chrome.storage), so routeMessage
+ * receives it as a parameter. The returned finder is what sync.mjs calls
+ * while a pulled INBOX message's raw bytes are still in hand — the FIRST
+ * matching filter decides the destination dir the message is written
+ * into, so a run with filters never lands in INBOX just to be renamed
+ * afterwards. A non-null `no` (the filter's 1-based position in the
+ * stored list) rides along for the 'of Filter N' narration line.
+ * Null when the job carries no runnable filter list — the engine then
+ * writes every pull into INBOX and the post-sync pass filters as before.
+ * Dry runs are unaffected naturally: their apply phase never runs.
+ * @param {object} job the sync job (job.filters: the stored filter list)
+ * @param {object} account the job's account ({id})
+ * @returns {((raw: Uint8Array) => Promise<object>) | null} the finder
+ */
+function pullRouteOf(job, account) {
+  const stored = Array.isArray(job.filters) ? job.filters : [];
+  const filters = stored.filter(f => f && f.enabled !== false &&
+    typeof f.query === 'string' &&
+    (f.action === 'stop' || f.folder));
+  if (!filters.length) {
+    return null;
+  }
+  return async raw => {
+    const res = await routeMessage(raw, {filters, accountId: account.id});
+    if (!res.matched) {
+      return res;
+    }
+    const i = stored.findIndex(g => g && g.id === res.filter?.id);
+    return {...res, no: i >= 0 ? i + 1 : null};
+  };
+}
+
+/**
  * The mail client's syncs carry the options-page filter list in the job
  * (the offscreen has no chrome.storage). A settled run — CLEAN OR FAILED —
  * filters the INBOX messages it RECEIVED on the store the run just wrote;
@@ -665,9 +705,15 @@ function reportDelimiter(account, summary) {
  * when the run is the INBOX itself; other folders sync bare. Interface-
  * submitted jobs carry no filters: the sync interface keeps its own
  * behavior — its filter row stays fully manual.
+ *
+ * Since pull-time routing this pass is a FALLBACK: the engine's
+ * `route` finder already decided INBOX pulls with a runnable filter list
+ * while they were written (engine.routedInboxUids()), so only messages
+ * the finder could not place — a finder throw, mostly — still show up
+ * here, and a healthy run's pass is a no-op narration line.
  * A pass failure logs a warn and never fails the sync itself.
  */
-async function runPostSyncFilters(job, store, account, uids, {dirty = false} = {}) {
+async function runPostSyncFilters(job, store, account, uids, {dirty = false, routed = null} = {}) {
   const stored = Array.isArray(job.filters) ? job.filters : [];
   const filters = stored.filter(f => f && f.enabled !== false &&
     typeof f.query === 'string' &&
@@ -682,8 +728,21 @@ async function runPostSyncFilters(job, store, account, uids, {dirty = false} = {
   if (!filters.length || !(uids instanceof Set)) {
     return;
   }
-  const newUids = [...uids].map(Number).filter(Number.isFinite);
+  const all = [...uids].map(Number).filter(Number.isFinite);
+  const routedSet = routed instanceof Set ? routed : null;
+  const routedCount = routedSet ? all.filter(uid => routedSet.has(uid)).length : 0;
+  const newUids = routedSet
+    ? all.filter(uid => !routedSet.has(uid))
+    : all;
   if (!newUids.length) {
+    if (routedCount) {
+      if (!dirty) {
+        engineLog('filter',
+          `no unrouted INBOX messages — filter pass skipped ` +
+          `(${routedCount} routed at pull time)`, 'hint');
+      }
+      return;
+    }
     if (!dirty) {
       engineLog('filter', 'no new INBOX messages — filter pass skipped', 'hint');
     }
@@ -697,7 +756,8 @@ async function runPostSyncFilters(job, store, account, uids, {dirty = false} = {
   }
   engineLog('filter',
     `— filters · ${account.name || account.id} · INBOX — ` +
-    `${newUids.length} new message(s)`, 'system');
+    `${newUids.length} new message(s)` +
+    (routedCount ? ` (${routedCount} already routed at pull time)` : ''), 'system');
   try {
     const res = await runAllFilters(store, {
       dir: 'INBOX',
@@ -892,6 +952,10 @@ async function withSession(job) {
       for (const dir of dirs) {
         engineLog('system', `— ${label} · ${dir} —`, 'system');
         try {
+          // an INBOX member dir filters like a full run (either INBOX
+          // spelling); any other dir syncs bare. A dry run never calls
+          // the finder — its apply phase does not run.
+          const dirInbox = String(dir || '').toUpperCase() === 'INBOX';
           engine = createSync(mail, store, {
             account: `${account.user}@${account.host}`,
             log: engineLog,
@@ -900,7 +964,8 @@ async function withSession(job) {
             pullBatch,
             pullQuantum,
             miningBatch,
-            only: dir
+            only: dir,
+            route: dirInbox ? pullRouteOf(job, account) : null
           });
           const {plan, summary} = await engine.run({dry});
           reportDelimiter(account, summary);
@@ -918,13 +983,16 @@ async function withSession(job) {
           }
           // an INBOX member dir filters like every other non-interface
           // sync — kind-shimmed to the full-run filter pass over this
-          // run's LANDED pulls; a failed dir is filtered too ({dirty}):
-          // the received messages match their filters even then (failure
-          // logs, never fails the sync — see runPostSyncFilters)
+          // run's LANDED pulls (pull-time routing already placed the
+          // routed ones: the pass sees only the unrouted leftovers);
+          // a failed dir is filtered too ({dirty}): the received
+          // messages match their filters even then (failure logs, never
+          // fails the sync — see runPostSyncFilters)
           if (!dry) {
             await runPostSyncFilters({...job, kind: 'sync-dir', dir},
               store, account, engine.landedInboxUids(),
-              {dirty: !(summary.finishedAt && !summary.failed)});
+              {dirty: !(summary.finishedAt && !summary.failed),
+                routed: engine.routedInboxUids()});
           }
         }
         catch (e) {
@@ -936,7 +1004,8 @@ async function withSession(job) {
           // never re-fail this catch.
           try {
             await runPostSyncFilters({...job, kind: 'sync-dir', dir},
-              store, account, engine?.landedInboxUids?.(), {dirty: true});
+              store, account, engine?.landedInboxUids?.() ?? null,
+              {dirty: true, routed: engine?.routedInboxUids?.() ?? null});
           }
           catch (e2) {
             engineLog('warn',
@@ -975,7 +1044,11 @@ async function withSession(job) {
         pullBatch,
         pullQuantum,
         miningBatch,
-        only
+        only,
+        // the job's filter list routes INBOX pulls into their destination
+        // Maildir WHILE they land (null for interface jobs: no filters ride
+        // the sync interface's own buttons — see pullRouteOf)
+        route: pullRouteOf(job, account)
       });
       const dry = job.kind.startsWith('dry');
       const {plan, summary} = await engine.run({dry});
@@ -998,14 +1071,17 @@ async function withSession(job) {
           });
           engineLog('sync', 'lastSyncAt handed to the service worker');
         }
-        // the mail client's syncs carry the filter list: the new INBOX
-        // messages are filtered right here, before the job settles — on a
-        // failed run too ({dirty} narrates): the pass matches exactly the
-        // pulls the run LANDED (post-apply arrivals included), never the
-        // plan's leftovers — "received messages are filtered, error or not"
+        // the mail client's syncs carry the filter list: pull-time routing
+        // has already placed the new INBOX messages whose filters matched,
+        // so this pass sees only the UNROUTED leftovers (a finder throw,
+        // mostly) — on a failed run too ({dirty} narrates): it matches
+        // exactly the pulls the run LANDED (post-apply arrivals included),
+        // never the plan's leftovers — "received messages are filtered,
+        // error or not"
         await runPostSyncFilters(job, store, account,
           engine.landedInboxUids(),
-          {dirty: !(summary.finishedAt && !summary.failed)});
+          {dirty: !(summary.finishedAt && !summary.failed),
+            routed: engine.routedInboxUids()});
       }
     }
     // the state the store is left in decides the next resync: whatever
@@ -1030,7 +1106,8 @@ async function withSession(job) {
     // settle: both steps are guarded.
     try {
       await runPostSyncFilters(job, store, account,
-        engine?.landedInboxUids?.(), {dirty: true});
+        engine?.landedInboxUids?.() ?? null,
+        {dirty: true, routed: engine?.routedInboxUids?.() ?? null});
       if (store && job.kind !== 'discard') {
         await reportPendingMoves(store, account);
       }

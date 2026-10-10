@@ -44,9 +44,9 @@
 // ones need master.pass in chrome.storage.session (cached by whoever
 // last confirmed it in a page). A missing master = one logged skip:
 // dirty marks stay, the full timer keeps its cadence and retries.
-// Scheduled full runs carry the stored filter list, so the engine
-// filters the run's new INBOX pulls on the spot — like the mail
-// client's own full syncs.
+// Scheduled full runs carry the stored filter list, so the engine routes
+// the run's new INBOX pulls straight into their filter destinations while
+// they land — like the mail client's own full syncs.
 //
 // Bookkeeping: a service worker never hears its own runtime messages,
 // so the scheduler's submissions pass dirty.mjs's 'sync-request'

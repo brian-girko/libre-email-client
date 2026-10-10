@@ -31,13 +31,21 @@
 //                             claims the uid while its snapshot record is
 //                             gone (lost-snapshot shape): verified by msgid
 //                             and replayed as a server MOVE (self-heal)
+//                             with a `route` finder configured, a pulled
+//                             INBOX message is WRITTEN straight into its
+//                             filter's destination dir (first match wins):
+//                             the source FMD5 stamps the file, so the
+//                             routed pull is a pending move the next run
+//                             replays as a server MOVE — the post-sync
+//                             filter pass only re-filters unrouted
+//                             leftovers
 //   flag deltas vs K       → local edit pushes to server; server edit
 //                             rewrites the local name (server wins on both)
 //   uidvalidity mismatch   → resync: wipe the folder locally, re-pull all
 
 'use strict';
 
-import {KNOWN_FLAG_NAMES, knownFlags, md5hex, sameFlags, STAR_COLOR_KEYWORDS} from '../maildir.mjs';
+import {KNOWN_FLAG_NAMES, knownFlags, md5hex, normalizeFolderPath, sameFolder, sameFlags, STAR_COLOR_KEYWORDS} from '../maildir.mjs';
 import {msgidOf, validateMail} from '../snapshot.mjs';
 
 // server flags that never mean anything outside their session — never
@@ -68,6 +76,13 @@ function humanBytes(bytes) {
   }
   return Math.max(1, Math.round(bytes / 1024)) + ' KB';
 }
+
+/** log-line truncation for subjects (same rule as filters/run.mjs) */
+const ROUTE_SUBJECT_MAX = 80;
+const truncSubject = text => {
+  const s = String(text ?? '');
+  return s.length > ROUTE_SUBJECT_MAX ? s.slice(0, ROUTE_SUBJECT_MAX - 1) + '…' : s;
+};
 
 /**
  * One message fetch under a hard ceiling: a wedged FETCH never resolves and
@@ -316,7 +331,7 @@ function resolveOnly(all, wanted) {
 // When `only` names one folder, the whole pipeline (survey, plan, apply,
 // snapshot) is scoped to that single dir: the rest of the account keeps its
 // snapshot untouched and only that dir's entry is rewritten.
-export function createSync(mail, store, {account = null, log = console.log, onProgress = null, only = null, confirmPurge = null, confirmDropDirectory = null, pullBatch = 8, pullQuantum = 10, miningBatch = 100} = {}) {
+export function createSync(mail, store, {account = null, log = console.log, onProgress = null, only = null, confirmPurge = null, confirmDropDirectory = null, pullBatch = 8, pullQuantum = 10, miningBatch = 100, route = null} = {}) {
   pullQuantum = Math.max(1, Math.floor(Number(pullQuantum) || 10));
   miningBatch = Math.max(1, Math.floor(Number(miningBatch) || 100));
   const emitLog = (type, content, cls = '') =>
@@ -331,6 +346,13 @@ export function createSync(mail, store, {account = null, log = console.log, onPr
   // correctly absent; a run that died after landing pulls leaves them here
   // for the pass. A copy leaves the engine via landedInboxUids().
   const landedInbox = new Set();
+  // INBOX uids whose ROUTING was already decided while landing (a move into
+  // the filter's destination dir, a stop anchor or a no-match): the
+  // post-sync pass skips them — it is only a fallback for pulls the
+  // pull-time router could not place. Exposed via routedInboxUids().
+  const routedInbox = new Set();
+  // run-level route counters for the end-of-apply summary line
+  const routeStats = {moved: 0, kept: 0, unmatched: 0, failed: 0};
 
   async function select(name, {force = false} = {}) {
     if (selected !== name || force) {
@@ -1505,10 +1527,86 @@ async function rowsFor(name, uidnext) {
       emitLog('apply', `FAILED ${op.kind} ${op.folder}/${op.fileName ?? op.uid ?? '*'}: ${message}`, 'warn');
       onProgress?.({phase: 'apply', op: op.kind, folder: op.folder, done: ++done, total: ops.length});
     };
+    /**
+     * Filter routing at landing time: the caller's `route` finder decides
+     * a pulled INBOX message's destination while its raw bytes are still
+     * in hand. Returns the destination folder (a file written there
+     * carries the SOURCE folder's FMD5 — the pending-move marker the next
+     * run replays as a server MOVE), or null when the message lands in
+     * INBOX. An evaluated routing (move, stop anchor, self-target or no
+     * match) marks the uid routed so the post-sync pass never re-filters
+     * it; a null result from the finder itself, a finder throw or a
+     * non-INBOX pull is simply absent — those stay INBOX pulls.
+     */
+    const warnMissingDest = new Set();
+    const routeLanding = async (raw, folder, uid) => {
+      if (!route || String(folder || '').toUpperCase() !== 'INBOX') {
+        return null;
+      }
+      let res = null;
+      try {
+        res = await route(raw);
+      }
+      catch (e) {
+        routeStats.failed++;
+        emitLog('filter', `routing ${folder}/${uid} FAILED (${e?.message || e}) — the message lands in INBOX`, 'warn');
+        return null;
+      }
+      if (!res) {
+        return null;
+      }
+      if (!res.matched) {
+        routeStats.unmatched++;
+        routedInbox.add(Number(uid));    // the walk ran to its end: nothing
+        return null;                     // matches — INBOX is the final place
+      }
+      const subj = res.subject ? `"${truncSubject(res.subject)}" ` : '';
+      const nums = (res.detail?.lines ?? []).filter(l => l.hit).map(l => l.n).join(', ');
+      const lines = res.no != null && Number.isFinite(Number(res.no))
+        ? `Line ${nums} of Filter ${Number(res.no)}`
+        : `Line ${nums}`;
+      if (res.action === 'stop') {
+        routeStats.kept++;
+        routedInbox.add(Number(uid));
+        emitLog('filter',
+          `${subj}-> ${lines} -> stop filters (message stays in INBOX — later filters skipped)`);
+        return null;
+      }
+      const dest = normalizeFolderPath(res.folder, store.delimiter);
+      if (!dest) {
+        // not runnable (no destination): defer to the post-sync pass
+        return null;
+      }
+      routedInbox.add(Number(uid));
+      if (sameFolder(dest, folder, store.delimiter)) {
+        routeStats.kept++;
+        emitLog('filter',
+          `${subj}-> ${lines} -> stays in "${folder}" (destination equals source — later filters skipped)`);
+        return null;
+      }
+      if (!warnMissingDest.has(dest)) {
+        warnMissingDest.add(dest);
+        if (!survey.folders.has(dest)) {
+          emitLog('filter',
+            `destination "${dest}" is not a folder of this server — landing locally anyway; ` +
+            'the next sync pushes the move once the folder exists', 'warn');
+        }
+      }
+      routeStats.moved++;
+      emitLog('filter', `${subj}-> ${lines} -> ${dest}`);
+      return dest;
+    };
+
     /** write one landed pull op (the narration is per chunk, see pullLine) */
     const pullRow = async (op, raw) => {
       const row = survey.folders.get(op.folder)?.server.get(op.uid);
-      await store.writeMessage(op.folder, op.uid, knownFlags(row?.flags ?? []), raw);
+      // the finder decides the destination on the spot: a routed message
+      // is written STRAIGHT into its destination dir with the SOURCE
+      // folder's FMD5 (the pending-move marker) — the same end state the
+      // old write-into-INBOX-then-rename pass reached, minus the rename
+      const dest = (await routeLanding(raw, op.folder, Number(op.uid))) ?? op.folder;
+      await store.writeMessage(dest, op.uid, knownFlags(row?.flags ?? []), raw,
+        dest === op.folder ? {} : {fmd5: md5hex(op.folder)});
       recMsgid.set(`${op.folder}/${op.uid}`, await msgidOf(raw));
       if (String(op.folder || '').toUpperCase() === 'INBOX') {
         landedInbox.add(Number(op.uid));
@@ -1838,7 +1936,12 @@ async function rowsFor(name, uidnext) {
             const raw = (await guardedFetch(mail.readMail(uid),
               `post-pull ${F.name}/${uid}`)).raw;
             recMsgid.set(key, await msgidOf(raw));
-            await store.writeMessage(F.name, uid, knownFlags(row.flags), raw);
+            // arrivals route like the run's own pulls: the finder picks the
+            // destination while the bytes are in hand (the snapshot keeps
+            // describing the SERVER row — INBOX/uid — either way)
+            const dest = (await routeLanding(raw, F.name, uid)) ?? F.name;
+            await store.writeMessage(dest, uid, knownFlags(row.flags), raw,
+              dest === F.name ? {} : {fmd5: md5hex(F.name)});
             if (F.name.toUpperCase() === 'INBOX') {
               landedInbox.add(uid);
             }
@@ -1889,6 +1992,16 @@ async function rowsFor(name, uidnext) {
       }
       snapOut.folders[F.name] = {uidvalidity, uidnext, messages};
       emitLog('post', `${F.name}: ${Object.keys(messages).length} message(s), uidvalidity=${uidvalidity}, uidnext=${uidnext}`);
+    }
+    // the run's pull-time routing, as one line (arrivals included; a run
+    // with no `route` finding or nothing landed stays silent)
+    if (routeStats.moved || routeStats.kept || routeStats.unmatched || routeStats.failed) {
+      emitLog('filter',
+        `filter routing: ${routeStats.moved + routeStats.kept + routeStats.unmatched} message(s) evaluated — ` +
+        `${routeStats.moved} moved, ${routeStats.kept} kept, ${routeStats.unmatched} unmatched` +
+        (routeStats.failed
+          ? `, ${routeStats.failed} UNROUTED (landed in INBOX — the post-sync pass retries them)`
+          : ''));
     }
     snapOut.lastSyncAt = new Date().toISOString();
     summary.finishedAt = snapOut.lastSyncAt;
@@ -2017,6 +2130,13 @@ async function rowsFor(name, uidnext) {
      *  arrivals) — handed to the caller's post-sync filter pass so the
      *  RECEIVED messages match their filters even when the run failed; a
      *  copy, the caller may mutate freely */
-    landedInboxUids: () => new Set(landedInbox)
+    landedInboxUids: () => new Set(landedInbox),
+    /** the subset that is already done: uids whose ROUTING was decided
+     *  while the message was written (a move into the filter's destination
+     *  dir, a stop anchor, a self-target or a no-match). The post-sync
+     *  pass skips them — it only sees the UNROUTED leftovers. A copy. */
+    routedInboxUids: () => new Set(routedInbox),
+    /** route counters for the run: {moved, kept, unmatched, failed} */
+    routeStats: () => ({...routeStats})
   };
 }
