@@ -303,6 +303,12 @@ body {
 
 #preview {
   grid-area: preview;
+  scrollbar-width: thin;
+  padding-inline: 5px;
+
+  email-view:not(:first-of-type) {
+    margin-top: 10px;
+  }
 }
 
 #preview:empty {

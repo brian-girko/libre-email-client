@@ -116,8 +116,6 @@ class EmailView extends HTMLElement {
           display: flex;
           flex-direction: column;
           min-width: 0;
-          min-height: 0;
-          max-height: var(--email-view-max-height, 100%);
           background: var(--pane-bg, #ffffff);
           border: 1px solid var(--line, #d9dce1);
           border-radius: var(--radius, 10px);
@@ -280,9 +278,8 @@ class EmailView extends HTMLElement {
           overflow-wrap: anywhere;
         }
         .body {
-          flex: 1 1 auto;
+          flex: none;
           min-height: 0;
-          overflow: auto;
         }
         iframe {
           display: block;
@@ -509,14 +506,23 @@ class EmailView extends HTMLElement {
       doc.head.append(style);
       // resize
       const measure = () => {
-        iframe.style.height = Math.max(120, doc.documentElement.scrollHeight) + 'px';
+        // hide the scrollbar while measuring so the height doesn't feed
+        // back into the content's width/layout and oscillate
+        doc.documentElement.style.overflow = 'hidden';
+        const h = Math.max(120, doc.scrollingElement?.scrollHeight ?? doc.documentElement.scrollHeight);
+        iframe.style.height = h + 'px';
+        doc.documentElement.style.overflow = '';
       };
       measure();
+      doc.fonts?.ready?.then(measure);
       if (this.#observer) {
         this.#observer.disconnect();
       }
       this.#observer = new ResizeObserver(measure);
       this.#observer.observe(doc.documentElement);
+      if (doc.body) {
+        this.#observer.observe(doc.body);
+      }
     });
     iframe.srcdoc = content;
     this.#body.append(iframe);
