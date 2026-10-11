@@ -17,6 +17,7 @@
       <button type="button" role="tab" id="tab-accounts" aria-controls="panel-accounts" aria-selected="false" tabindex="-1">Accounts</button>
       <button type="button" role="tab" id="tab-actions" aria-controls="panel-actions" aria-selected="false" tabindex="-1">Actions</button>
       <button type="button" role="tab" id="tab-filters" aria-controls="panel-filters" aria-selected="false" tabindex="-1">Filters</button>
+      <button type="button" role="tab" id="tab-storage" aria-controls="panel-storage" aria-selected="false" tabindex="-1">Storage</button>
     </div>
 
     <div id="panel-global" role="tabpanel" aria-labelledby="tab-global">
@@ -380,6 +381,25 @@ from:news@example.com'></text-viewer>
       </fieldset>
     </section>
     </div>
+
+    <div id="panel-storage" role="tabpanel" aria-labelledby="tab-storage" hidden>
+    <section id="storage-area">
+      <fieldset>
+        <legend>Filter list storage</legend>
+        <label class="check">
+          <input type="radio" name="storage-type-filters" id="storage-type-filters-local" value="local" checked>
+          Local (chrome.storage.local)
+        </label>
+        <label class="check">
+          <input type="radio" name="storage-type-filters" id="storage-type-filters-sync" value="sync">
+          Sync (chrome.storage.sync)
+        </label>
+        <p class="hint" id="storage-type-filters-status"></p>
+        <p class="hint">Local storage keeps the filter list in this browser profile only — it is the default. Sync storage lets the browser upload the list to your signed-in profile's cloud sync, so it follows the profile across machines; it is limited by the browser's sync quota (about 100 KB total), very large lists may fail to sync.</p>
+      </fieldset>
+    </section>
+    </div>
+
   </main>
   <prompt-view id="prompt" hidden></prompt-view>
   <dialog id="choice-dialog">

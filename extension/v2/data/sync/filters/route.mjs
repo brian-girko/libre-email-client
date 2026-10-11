@@ -1,7 +1,9 @@
 // route.mjs — filter routing: one raw email in, its destination folder out.
 //
-// The bridge between the options-page filter list (chrome.storage.local,
-// key 'filters') and the matcher in query.mjs. routeMessage(raw, opts)
+// The bridge between the options-page filter list (chrome.storage.local
+// or chrome.storage.sync — the area is chosen by the 'storage.type.filters'
+// pref in chrome.storage.local, 'local' by default; see getFiltersArea
+// below) and the matcher in query.mjs. routeMessage(raw, opts)
 // parses the message with the bundled postal-mime parser, walks the filter
 // list in stored order (first match wins — the options page's rule) and
 // reports WHAT matched: a move filter's destination folder (plus its
@@ -124,13 +126,51 @@ export async function routeMessage(raw, {filters, accountId = null} = {}) {
 }
 
 /**
- * The filter list as the options page stores it. Interface-side only —
+ * Which chrome.storage area holds the filter list right now. The pref
+ * 'storage.type.filters' is 'local' | 'sync' and always lives in
+ * chrome.storage.local (it has to be readable before we know where to
+ * look for anything else). Anything other than 'sync' falls back to
+ * 'local', so old installs without the pref keep working as before.
+ * @returns {Promise<'local'|'sync'>}
+ */
+export async function getFiltersArea() {
+  const res = await chrome.storage.local
+    .get({'storage.type.filters': 'local'})
+    .catch(() => ({'storage.type.filters': 'local'}));
+  return res['storage.type.filters'] === 'sync' ? 'sync' : 'local';
+}
+
+/**
+ * Reads the filter list of one specific area (no mode lookup — used for
+ * migration on a mode switch). Unknown shapes are dropped, like the
+ * options page does.
+ * @param {'local'|'sync'} area
+ * @returns {Promise<Array<object>>}
+ */
+export async function getFiltersFrom(area) {
+  const res = await chrome.storage[area].get({filters: []});
+  return (Array.isArray(res.filters) ? res.filters : [])
+    .filter(f => f && typeof f === 'object');
+}
+
+/**
+ * Writes the filter list to one specific area.
+ * @param {'local'|'sync'} area
+ * @param {Array<object>} list
+ * @returns {Promise<void>} rejects with the write error (the options
+ *   page surfaces quota failures to the user)
+ */
+export async function saveFiltersTo(area, list) {
+  await chrome.storage[area].set({filters: list});
+}
+
+/**
+ * The filter list as the options page stores it, read from the active
+ * area ('local' or 'sync' per getFiltersArea). Interface-side only —
  * the offscreen document has no chrome.storage and receives the list as
  * a parameter instead.
  * @returns {Promise<Array<object>>}
  */
 export async function loadFilters() {
-  const stored = await chrome.storage.local.get({filters: []});
-  return (Array.isArray(stored.filters) ? stored.filters : [])
-    .filter(f => f && typeof f === 'object');
+  return getFiltersFrom(await getFiltersArea());
 }

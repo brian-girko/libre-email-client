@@ -43,7 +43,6 @@ class EmailsView extends HTMLElement {
           display: flex;
           justify-content: flex-end;
           padding: calc(8px * var(--font-scale, 1));
-          background: var(--pane-bg, #ffffff);
         }
         .clear {
           min-height: calc(26px * var(--font-scale, 1));

@@ -218,7 +218,8 @@ button:disabled {
 }
 
 #native-status.error,
-#filters-native-status.error {
+#filters-native-status.error,
+#storage-type-filters-status.error {
   color: var(--danger);
 }
 

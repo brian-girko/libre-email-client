@@ -21,6 +21,11 @@ import {
 import '/data/components/prompt-view.js';
 import './components/text-viewer.js';
 import {initTheme} from '/data/client/theme.mjs';
+import {
+  getFiltersArea,
+  getFiltersFrom,
+  saveFiltersTo
+} from '/data/sync/filters/route.mjs';
 
 const MASTER_HASH = 'master.hash';
 const MASTER_PASS = 'master.pass';
@@ -80,7 +85,7 @@ const deleteBtn = document.getElementById('delete-account');
 const savedEl = document.getElementById('saved');
 
 const tabsEl = document.getElementById('tabs');
-const TAB_NAMES = ['global', 'accounts', 'actions', 'filters'];
+const TAB_NAMES = ['global', 'accounts', 'actions', 'filters', 'storage'];
 
 // tabs: vertical list beside the panels on wide screens, horizontal row on top
 // when narrow; the active tab is mirrored to the url hash so reloads and
@@ -795,18 +800,148 @@ function externalStorageReady() {
   })();
 }
 
-// ---- Preferences backup: export / import chrome.storage.local ----
+// ---- Storage type: which chrome.storage area holds each list ----
 
-// The whole extension state lives in chrome.storage.local (accounts, per-
-// account fields, ui.* prefs, ws/badge settings and action overrides).
-// Exports wrap it in a versioned envelope; imports either merge (overwrite
-// the keys present in the file) or replace (clear storage first), and reload
-// the page afterwards so every panel re-reads the new values.
+// Fieldset per preference type (filters today, more later). The mode
+// 'storage.type.filters' itself always lives in chrome.storage.local —
+// it has to be readable before anything knows where else to look.
+// Switching asks via the choice dialog: copy the list over from the old
+// area, or flip the mode without copying.
+
+const filtersTypeStatusEl = document.getElementById('storage-type-filters-status');
+const filtersTypeRadios = {
+  local: document.getElementById('storage-type-filters-local'),
+  sync: document.getElementById('storage-type-filters-sync')
+};
+let filtersTypeFlashTimer = null;
+let filtersTypeCurrent = 'local';
+let filtersTypeBusy = false;
+
+function storageTypeHint(area) {
+  return 'Filter list: ' + (area === 'sync' ? 'sync' : 'local');
+}
+
+function flashStorageType(message = null, error = false) {
+  filtersTypeStatusEl.textContent = message ?? storageTypeHint(filtersTypeCurrent);
+  filtersTypeStatusEl.className = error ? 'error' : '';
+  clearTimeout(filtersTypeFlashTimer);
+  filtersTypeFlashTimer = setTimeout(() => {
+    filtersTypeStatusEl.textContent = storageTypeHint(filtersTypeCurrent);
+  }, 2500);
+}
+
+filtersTypeRadios.local?.addEventListener('change', onStorageTypeChange);
+filtersTypeRadios.sync?.addEventListener('change', onStorageTypeChange);
+
+// "1 filter" / "3 filters" for the count sentences below
+function filterWord(n) {
+  return n === 1 ? '1 filter' : n + ' filters';
+}
+
+async function onStorageTypeChange() {
+  if (filtersTypeBusy) {
+    return;
+  }
+  const next = filtersTypeRadios.local?.checked ? 'local'
+    : filtersTypeRadios.sync?.checked ? 'sync' : null;
+  if (!next || next === filtersTypeCurrent) {
+    return;
+  }
+  filtersTypeBusy = true;
+  try {
+    const from = filtersTypeCurrent;
+    const fromList = await getFiltersFrom(from);
+    const nextList = await getFiltersFrom(next);
+    let choice = 'direct';
+    // the switch itself always happens; the dialog only decides what to
+    // do with the list on each side. Four shapes:
+    // 1. both empty            → no question
+    // 2. src filled, dest empty→ copy or skip
+    // 3. both filled           → overwrite the dest copy or keep it
+    // 4. src empty, dest filled→ writing "nothing" would clear it, so
+    //    that must be an explicit choice instead
+    if (fromList.length || nextList.length) {
+      let message;
+      let buttons;
+      if (fromList.length && !nextList.length) {
+        message = `Switch the filter list to ${next} storage? The current list holds ${filterWord(
+          fromList.length)}; the destination is empty.`;
+        buttons = [
+          {label: `Copy filters to ${next} storage`, value: 'copy'},
+          {label: 'Switch without copying', value: 'direct'}
+        ];
+      }
+      else if (fromList.length && nextList.length) {
+        message = `Switch the filter list to ${next} storage? The source holds ${filterWord(
+          fromList.length)}, the destination already holds ${filterWord(nextList.length)}.`;
+        buttons = [
+          {label: `Copy — overwrite the ${filterWord(nextList.length)} in ${next} storage`, value: 'copy'},
+          {label: `Switch without copying (keep the ${filterWord(nextList.length)} there)`, value: 'direct'}
+        ];
+      }
+      else {   // empty source, filled destination
+        message = `Switch the filter list to ${next} storage? The source holds no filters, the destination already holds ${filterWord(
+          nextList.length)} — copying over them would clear that list.`;
+        buttons = [
+          {label: `Copy — clear the ${filterWord(nextList.length)} in ${next} storage`, value: 'clear'},
+          {label: `Switch and keep the ${filterWord(nextList.length)} there`, value: 'direct'}
+        ];
+      }
+      choice = await askChoice(message, buttons);
+      if (choice === null) {
+        // cancelled — keep the current mode
+        filtersTypeRadios[from].checked = true;
+        return;
+      }
+    }
+    if (choice === 'copy' || choice === 'clear') {
+      // 'clear' is a copy of an empty source list over the destination
+      const payload = choice === 'copy' ? fromList : [];
+      try {
+        await saveFiltersTo(next, payload);
+      }
+      catch (e) {
+        // quota or other write failure: stay on the old area
+        filtersTypeRadios[from].checked = true;
+        flashStorageType('Copy failed: ' + storageErrorText(e), true);
+        return;
+      }
+    }
+    filtersTypeCurrent = next;
+    await chrome.storage.local.set({'storage.type.filters': next});
+    const note = choice === 'copy' ? ' — copied' : choice === 'clear' ? ' — destination cleared' : '';
+    flashStorageType(storageTypeHint(next) + note);
+  }
+  finally {
+    filtersTypeBusy = false;
+  }
+}
+
+async function initStorageType() {
+  filtersTypeCurrent = await getFiltersArea();
+  (filtersTypeRadios[filtersTypeCurrent] ?? filtersTypeRadios.local).checked = true;
+  flashStorageType();
+}
+
+// ---- Preferences backup: export / import (chrome.storage.local plus
+// the filter-list keys that may ride in chrome.storage.sync) ----
+
+// The extension state lives in chrome.storage.local (accounts, per-
+// account fields, ui.* prefs, ws/badge settings and action overrides),
+// except the filter list which may live in chrome.storage.sync per the
+// storage.type.filters pref. Exports wrap it in a versioned envelope;
+// imports either merge (overwrite the keys present in the file) or
+// replace (clear storage first), and reload the page afterwards so every
+// panel re-reads the new values.
 
 const EXPORT_APP = 'libre-email-client';
 const EXPORT_KIND = 'preferences';
 const EXPORT_VERSION = 1;
 const PASSWORD_PREFIX = 'user.pass.';
+// route targets for the filter-list keys; the mode pref always rides in
+// chrome.storage.local, the list follows the declared mode
+const FILTER_MODE_KEY = 'storage.type.filters';
+const FILTERS_KEY = 'filters';
 
 const exportPrefsBtn = document.getElementById('export-prefs');
 const importPrefsBtn = document.getElementById('import-prefs');
@@ -888,6 +1023,17 @@ exportPrefsBtn.addEventListener('click', async () => {
     }
     data[name] = value;
   }
+  // The filter list may live in chrome.storage.sync instead of local (per
+  // the storage.type.filters pref, which itself always rode in with `all`).
+  // Fill the list key from the active area so exports stay complete either
+  // way; a stale copy in the inactive area is ignored.
+  const exportMode = data[FILTER_MODE_KEY] === 'sync' ? 'sync' : 'local';
+  if (exportMode === 'sync') {
+    const syncStored = await chrome.storage.sync.get([FILTERS_KEY]).catch(() => ({}));
+    if (Array.isArray(syncStored[FILTERS_KEY])) {
+      data[FILTERS_KEY] = syncStored[FILTERS_KEY];
+    }
+  }
   const payload = {
     app: EXPORT_APP,
     kind: EXPORT_KIND,
@@ -904,6 +1050,55 @@ exportPrefsBtn.addEventListener('click', async () => {
   URL.revokeObjectURL(url);
   flashGlobal('Exported ' + Object.keys(data).length + ' settings');
 });
+
+/**
+ * Writes the imported keys into the right storage areas. Everything goes
+ * to chrome.storage.local, except the filter list which follows the mode
+ * the file declares ('storage.type.filters'); a file without the mode key
+ * (old exports) keeps the current mode and hands the list to the area
+ * that is active right now, so it stays visible after the reload. A sync
+ * write that fails (quota) falls back to local + local mode.
+ * @param {object} data parsed payload.data
+ * @param {boolean} replace true also wipes the current state first
+ */
+async function applyImportedKeys(data, replace) {
+  const declaredMode = data[FILTER_MODE_KEY];
+  const area = declaredMode === 'sync' ? 'sync'
+    : declaredMode === 'local' ? 'local'
+    : await getFiltersArea();
+  const hasMode = declaredMode === 'sync' || declaredMode === 'local';
+  const hasList = Object.prototype.hasOwnProperty.call(data, FILTERS_KEY);
+  const rest = {};
+  for (const [name, value] of Object.entries(data)) {
+    if (name !== FILTERS_KEY && name !== FILTER_MODE_KEY) {
+      rest[name] = value;
+    }
+  }
+  if (replace) {
+    await chrome.storage.local.clear();
+    // local.clear() already dropped everything here, but a leftover list
+    // in sync must not survive a "replace everything" either
+    await chrome.storage.sync.remove(FILTERS_KEY).catch(() => {});
+  }
+  await chrome.storage.local.set(rest);
+  if (hasMode) {
+    await chrome.storage.local.set({[FILTER_MODE_KEY]: area});
+  }
+  if (hasList) {
+    try {
+      await chrome.storage[area].set({[FILTERS_KEY]: data[FILTERS_KEY]});
+    }
+    catch (e) {
+      // too large for sync (quota) or another write failure: keep the
+      // whole import usable by parking the list in local
+      await chrome.storage.local.set({
+        [FILTER_MODE_KEY]: 'local',
+        [FILTERS_KEY]: data[FILTERS_KEY]
+      });
+      flashGlobal('Imported, but ' + FILTERS_KEY + ' fell back to local storage: ' + storageErrorText(e), true);
+    }
+  }
+}
 
 importPrefsBtn.addEventListener('click', () => {
   importFileEl.click();
@@ -939,10 +1134,7 @@ importFileEl.addEventListener('change', async () => {
   if (choice === null) {
     return;
   }
-  if (choice === 'replace') {
-    await chrome.storage.local.clear();
-  }
-  await chrome.storage.local.set(payload.data);
+  await applyImportedKeys(payload.data, choice === 'replace');
   // reload so every tab/panel and cached pref re-reads the new values
   location.reload();
 });
@@ -1132,7 +1324,8 @@ saveActionsBtn.addEventListener('click', async () => {
 // rows) moves a match into folder, action 'stop' leaves the matched
 // message untouched and ends the filter walk for it (folder/createFolder
 // are kept in storage but unused while stop is active). This page only
-// writes the list to chrome.storage.local ('filters') and lets the user
+// writes the list to the active storage area (chrome.storage.local or
+// chrome.storage.sync per 'storage.type.filters') and lets the user
 // reorder it with up/down buttons; matching/moving is the background
 // worker's job.
 
@@ -1236,7 +1429,9 @@ async function moveFilter(id, offset) {
     return;
   }
   [filters[index], filters[swap]] = [filters[swap], filters[index]];
-  await persistFilters();
+  // render even if the persist failed (the error is flashed by
+  // persistFilters; the row order is already changed in memory)
+  await persistFilters().catch(() => {});
   renderFilterList();
 }
 
@@ -1253,7 +1448,7 @@ function renderFilterList() {
     toggle.checked = !!filter.enabled;
     toggle.addEventListener('change', async () => {
       filter.enabled = toggle.checked;
-      await persistFilters();
+      await persistFilters().catch(() => {});
       renderFilterList();
     });
 
@@ -1306,7 +1501,7 @@ function renderFilterList() {
       if (editingFilter === filter) {
         closeFilterEditor();
       }
-      await persistFilters();
+      await persistFilters().catch(() => {});
       renderFilterList();
     });
 
@@ -1343,8 +1538,25 @@ function closeFilterEditor() {
   filterEditorEl.hidden = true;
 }
 
+// Turns a storage write failure into a user-facing sentence; quota
+// overruns get the friendly wording, everything else the raw reason.
+function storageErrorText(e) {
+  const message = String(e?.message || e || 'Unknown error');
+  if (/quota|MAX_ITEMS|QUOTABYTES/i.test(message)) {
+    return 'storage quota exceeded — the list is too large to sync';
+  }
+  return message;
+}
+
 async function persistFilters() {
-  await chrome.storage.local.set({filters});
+  try {
+    await saveFiltersTo(await getFiltersArea(), filters);
+  }
+  catch (e) {
+    // the change stays in memory; the user can hit Save again
+    flashFilter('Save failed: ' + storageErrorText(e), true);
+    throw e;
+  }
 }
 
 function flashFilter(message = 'Saved', error = false) {
@@ -1389,15 +1601,20 @@ filterFormEl.addEventListener('submit', async e => {
   if (!filters.some(f => f.id === editingFilter.id)) {
     filters.push(editingFilter);
   }
-  await persistFilters();
+  try {
+    await persistFilters();
+  }
+  catch {
+    return;   // editor stays open so the edit can be saved again
+  }
   closeFilterEditor();
   renderFilterList();
   flashFilter();
 });
 
 async function loadFiltersPrefs() {
-  const res = await chrome.storage.local.get({filters: []});
-  filters = Array.isArray(res.filters) ? res.filters : [];
+  // from the active area (local or sync per 'storage.type.filters')
+  filters = await getFiltersFrom(await getFiltersArea()).catch(() => []);
 }
 
 function flashMaster(message = 'Saved', error = false) {
@@ -1491,6 +1708,7 @@ clearMasterBtn.addEventListener('click', async () => {
   await probeNative();
   await updateMasterState();
   await refreshBadgeStatus();
+  await initStorageType();
   await loadFiltersPrefs();
   await refreshAccounts();
   if (accounts.length === 0) {
