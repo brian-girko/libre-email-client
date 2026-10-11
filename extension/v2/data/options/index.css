@@ -35,28 +35,51 @@ body {
   font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
+/* fixed-height app layout: the page itself never scrolls, only the
+   content of the active tab panel does */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
 main {
   max-width: 860px;
-  margin: 32px auto;
-  padding: 0 16px;
+  margin: 0 auto;
+  height: 100%;
+  padding: 16px;
   display: grid;
   grid-template-columns: 170px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas:
+    "header header"
+    "tabs panels";
   column-gap: 16px;
+  row-gap: 12px;
 }
 
 h1 {
   font-size: 20px;
-  margin: 0 0 20px;
+  margin: 0;
   text-align: center;
-  grid-column: 1 / -1;
+  grid-area: header;
 }
 
 #tabs {
-  position: sticky;
-  top: 16px;
+  grid-area: tabs;
+  align-self: start;
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* only the active panel scrolls; the tab bar stays fixed */
+[role="tabpanel"] {
+  grid-area: panels;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+  padding-bottom: 24px;
 }
 
 #tabs button {
@@ -333,20 +356,31 @@ prompt-view {
   main {
     max-width: 100%;
     width: 100%;
-    margin: 0;
-    padding: 12px 0;
-    display: block;
+    padding: 12px;
+    grid-template-columns: minmax(0, 1fr);
+    /* header and tabs get their content height, only the panel scrolls */
+    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-areas:
+      "header"
+      "tabs"
+      "panels";
+  }
+
+  h1 {
+    font-size: 18px;
   }
 
   #tabs {
     position: static;
     flex-direction: row;
-    margin-bottom: 16px;
+    flex-wrap: wrap;
+    row-gap: 4px;
   }
 
   #tabs button {
-    flex: 1;
+    flex: 1 1 auto;
     text-align: center;
+    padding: 7px 8px;
   }
 
   section {
