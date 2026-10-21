@@ -32,6 +32,16 @@ function injectCsp(html, csp) {
   return meta + html;
 }
 
+// opt in to responsively-sized iframes (frame-sizing: content-height); the
+// meta tag must ship with the document — adding it after load has no effect
+function injectResponsiveSizing(html) {
+  const meta = '<meta name="responsive-embedded-sizing" content="allow-origins=*">';
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head[^>]*>/i, m => m + meta);
+  }
+  return meta + html;
+}
+
 // the sandbox/CSP do not stop the iframe from navigating itself to a remote
 // url via meta refresh; once navigated, our CSP is gone and remote content loads
 function stripMetaRefresh(html) {
@@ -287,6 +297,16 @@ class EmailView extends HTMLElement {
           border: 0;
           background: #ffffff;
         }
+        /* responsively-sized iframe: the browser derives the height from the
+           embedded document's content; where frame-sizing is unsupported the
+           JS measuring fallback below keeps applying an inline height */
+        @supports (frame-sizing: content-height) {
+          iframe {
+            height: auto;
+            min-height: 120px;
+            frame-sizing: content-height;
+          }
+        }
       </style>
       <header>
         <div class="meta">
@@ -504,15 +524,20 @@ class EmailView extends HTMLElement {
       style.textContent =
         ':where(body){font-family:' + cs.fontFamily + ';font-size:15px;line-height:1.5;}';
       doc.head.append(style);
-      // resize
-      const measure = () => {
-        // hide the scrollbar while measuring so the height doesn't feed
-        // back into the content's width/layout and oscillate
-        doc.documentElement.style.overflow = 'hidden';
-        const h = Math.max(120, doc.scrollingElement?.scrollHeight ?? doc.documentElement.scrollHeight);
-        iframe.style.height = h + 'px';
-        doc.documentElement.style.overflow = '';
-      };
+      // resize: with frame-sizing support the browser owns the height and
+      // only needs a nudge after layout changes (images, fonts, dynamic
+      // content); otherwise fall back to measuring by hand
+      const win = iframe.contentWindow;
+      const measure = win && 'requestResize' in win
+        ? () => win.requestResize()
+        : () => {
+          // hide the scrollbar while measuring so the height doesn't feed
+          // back into the content's width/layout and oscillate
+          doc.documentElement.style.overflow = 'hidden';
+          const h = Math.max(120, doc.scrollingElement?.scrollHeight ?? doc.documentElement.scrollHeight);
+          iframe.style.height = h + 'px';
+          doc.documentElement.style.overflow = '';
+        };
       measure();
       doc.fonts?.ready?.then(measure);
       if (this.#observer) {
@@ -524,7 +549,7 @@ class EmailView extends HTMLElement {
         this.#observer.observe(doc.body);
       }
     });
-    iframe.srcdoc = content;
+    iframe.srcdoc = injectResponsiveSizing(content);
     this.#body.append(iframe);
   }
 
