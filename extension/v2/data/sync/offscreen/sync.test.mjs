@@ -1150,4 +1150,73 @@ const emptyFolders = () => ({
     'the heal replay keeps the copy with the same narration');
 }
 
+// ---- scenario N: native move + scoped run — mail must not return as new ----
+// The bug: done OUTSIDE this client (another device moving INBOX mail to
+// Trash, or deleting it), a native move leaves the snapshot's uid gone from
+// the server while the destination folder was never surveyed. If a SCOPED
+// run (a dirty-dir or badge sweep — only: 'INBOX') lands in between, its
+// snapshot rewrite used to drop that uid from K: the next FULL run then saw
+// no lost snapshot uids anywhere, skipped msgid mining entirely, and pulled
+// the moved copy as a plain fresh arrival — "the mail returns as new".
+// The scoped run now CARRIES lost-uid records forward, so the full run
+// still mines, matches by msgid, and reconciles destination-side with the
+// server's own flags instead of a blind re-pull.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    // uid 5 left INBOX on the server (native move); m5 lives in Trash as
+    // fresh uid 2, READ there by the client that moved it
+    ['INBOX', dirState(1000, 9, [[7, 'm7']])],
+    ['Trash', {status: {folder: 'x', exists: true, uidvalidity: 3000, uidnext: 3},
+      rows: new Map([[2, {flags: ['\\Seen'], subject: 'm5', from: null, date: null, size: rawOf('m5').length}]]),
+      raws: new Map([[2, rawOf('m5')]])}]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }},
+      'Trash': {uidvalidity: 3000, uidnext: 3, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7')),
+      fileEntry(makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')}),
+        5, md5hex('INBOX'), rawOf('m5'))
+    ])],
+    ['Trash', listing([])]
+  ]);
+
+  // run 1: a scoped run over the dirty INBOX dir
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store, {log: quietLog, only: 'INBOX'});
+  const {summary} = await engine.run({dry: false});
+  assert.equal(summary.failed, 0, 'the scoped run is clean');
+
+  // THE regression: the snapshot keeps the moved-away uid + its identity
+  const committed = store.saved[0];
+  assert.equal(committed.folders['INBOX'].messages[5].msgid, m5,
+    'the natively moved uid stays in the snapshot until a full run traces it');
+
+  // run 2: the next FULL run must mine Trash's fresh uid, match it to the
+  // carried record, and reconcile — a pull (the local copy was purged as
+  // stale) that PRESERVES the moved copy's read state, never a re-fetch
+  // without identity
+  const engine2 = createSync(mockMail(server), store, {log: quietLog});
+  store.saved.length = 0;
+  const {summary: s2} = await engine2.run({dry: false});
+  assert.equal(s2.failed, 0, 'the full run is clean');
+  assert.equal(s2.localMoves, 1,
+    'the moved copy reconcile = a relocate by msgid (no re-download): ' + JSON.stringify(s2));
+  assert.deepStrictEqual(store.moves, [
+    {srcFolder: 'INBOX', dstFolder: 'Trash', uid: 2, keepFmd5: false, flags: null}
+  ], 'the copy was renamed into Trash as its fresh uid');
+  // and the carried record is consumed: no stale entries left behind
+  assert.ok(!store.saved[0].folders['INBOX']?.messages[5],
+    'the carried record is cleaned by the full run\'s rewrite');
+}
+
 console.log('sync.test: all scenarios pass');

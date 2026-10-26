@@ -2002,6 +2002,25 @@ async function rowsFor(name, uidnext) {
     // Scoped run (only): start from the pre-sync snapshot and rewrite just
     // the synced dir's entry — untouched dirs keep their old state lines.
     const snapOut = {version: 2, lastSyncAt: null, folders: only ? structuredClone(survey.snap.folders ?? {}) : {}};
+    // In a scoped run the destination folder of a NATIVE move (done by
+    // another client — e.g. INBOX → Trash) is never surveyed, so no mining
+    // matches it and the only folder's phase-(A) diff cannot be relocated.
+    // Dropping that uid from the snapshot here would make the next FULL run
+    // see "no possible server-side moves", skip mining, and pull the moved
+    // copy as brand-new mail — the reported "moved mail returns as new"
+    // bug. Such records are therefore CARRIED until a full run can trace
+    // them by msgid; see the carry-forward block further below.
+    // settledMoves: uids this run itself moved away ON THE SERVER
+    // (moveServer) — their source record is settled, dropping it is safe.</think><tool_call>edit<arg_key>newString</arg_key><arg_value>    // uids moved away successfully ON THE SERVER by this run's own
+    // moveServer ops: their source record is settled, dropping it is safe
+    const settledMoves = new Set();
+    if (only != null) {
+      for (const op of plan.ops) {
+        if (op.__counted && op.kind === 'moveServer' && op.folder === only) {
+          settledMoves.add(Number(op.uid));
+        }
+      }
+    }
     for (const F of survey.folders.values()) {
       if (deadFolders.has(F.name)) {
         // deleted on the server by this run: a SELECT would fail and the
@@ -2083,6 +2102,28 @@ async function rowsFor(name, uidnext) {
       if (restricted) {
         emitLog('post', `${F.name}: arrivals pulled, snapshot kept (outside the scoped dir)`);
         continue;
+      }
+      // scoped run, the `only` dir itself: snapshot records of uids that
+      // left this folder on the server WITHOUT a traceable destination stay
+      // in place (carried) — see the settledMoves comment above. A later
+      // FULL run mines the fresh destination uids, matches the msgid, and
+      // either relocates/pulls the copy with its flags intact — instead of
+      // pulling it as unread "new" mail. Genuinely gone mail is cleaned
+      // naturally: a full run's rewrite drops unmatched records.
+      if (only != null && F.name === only && !F.resync) {
+        const lastMsgs = F.last?.messages ?? {};
+        let carried = 0;
+        for (const [uidTxt, rec] of Object.entries(lastMsgs)) {
+          const uid = Number(uidTxt);
+          if (uid >= uidnext || Object.prototype.hasOwnProperty.call(messages, uid) || settledMoves.has(uid)) {
+            continue;
+          }
+          messages[uid] = {msgid: rec?.msgid ?? null, flags: rec?.flags ?? []};
+          carried++;
+        }
+        if (carried) {
+          emitLog('post', `${F.name}: ${carried} message(s) left the folder on the server while other tools ran — records kept until a full run can trace the move`);
+        }
       }
       snapOut.folders[F.name] = {uidvalidity, uidnext, messages};
       emitLog('post', `${F.name}: ${Object.keys(messages).length} message(s), uidvalidity=${uidvalidity}, uidnext=${uidnext}`);
