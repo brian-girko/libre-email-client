@@ -40,6 +40,7 @@
 'use strict';
 
 import {loadSnapshot, saveSnapshot} from './snapshot.mjs';
+import {loadTombstones as loadTombstoneList, saveTombstones as saveTombstoneList, tombKey, tombstoneEntry} from './tombstones.mjs';
 
 const FLAG_LETTERS = new Map([
   ['\\Seen', 'S'],
@@ -635,6 +636,7 @@ export async function wipeFolder(fs, maildir) {
  * and every mutation emits an fs-event carrying the host's origin.
  */
 const PREFS_FILE = '.sync-prefs.json';
+// the tombstone list lives in ./tombstones.mjs (see there for why it exists)
 
 export class MaildirStore {
   /**
@@ -688,6 +690,68 @@ export class MaildirStore {
   async savePrefs(prefs) {
     await this.fs.writer.write(this.account + '/' + PREFS_FILE, JSON.stringify(prefs ?? {}, null, 1));
     return prefs;
+  }
+
+  /**
+   * The account's tombstone list (<slug>/.tombstones.json): messages deleted
+   * locally that the sync engine must never pull back. Written at the moment
+   * of deletion (client purges, the offscreen fs-event watcher), consulted by
+   * plan()/pull writers, pruned by the engine at commit time. Missing/corrupt
+   * → [] — the list is advisory memory, never worth failing a sync.
+   * @returns {Promise<object[]>}
+   */
+  async loadTombstones() {
+    return loadTombstoneList(this.fs, this.account);
+  }
+
+  /**
+   * Merges entries into the tombstone file (dedupe by folder/uid — an
+   * already-known deletion keeps its record; a fresh entry with a msgid the
+   * old one lacks fills it in, a newer `at` timestamp wins).
+   * @param {object[]} entries {folder, uid, msgid?, at?}
+   * @returns {Promise<number>} NEW entries added
+   */
+  async addTombstones(entries) {
+    const existing = await loadTombstoneList(this.fs, this.account);
+    const byKey = new Map(existing.map(e => [tombKey(e.folder, e.uid), e]));
+    let added = 0;
+    for (const raw of entries ?? []) {
+      const entry = tombstoneEntry(raw);
+      if (!entry) {
+        continue;
+      }
+      const prev = byKey.get(tombKey(entry.folder, entry.uid));
+      if (prev) {
+        if (entry.msgid && !prev.msgid) {
+          prev.msgid = entry.msgid;
+        }
+        if (entry.at && (!prev.at || entry.at > prev.at)) {
+          prev.at = entry.at;
+        }
+        continue;
+      }
+      byKey.set(tombKey(entry.folder, entry.uid), entry);
+      added++;
+    }
+    await saveTombstoneList(this.fs, this.account, [...byKey.values()]);
+    return added;
+  }
+
+  /**
+   * Removes tombstone entries. With no predicate the whole list is cleared;
+   * with one, an entry the predicate accepts is removed (the sync engine's
+   * commit-time prune keeps everything it could not resolve).
+   * @param {(entry: object) => boolean} [removeFn]
+   * @returns {Promise<number>} entries removed
+   */
+  async clearTombstones(removeFn = null) {
+    const existing = await loadTombstoneList(this.fs, this.account);
+    const kept = removeFn ? existing.filter(e => !removeFn(e)) : [];
+    const removed = existing.length - kept.length;
+    if (removed) {
+      await saveTombstoneList(this.fs, this.account, kept);
+    }
+    return removed;
   }
 
   /** {dir,tmp,new,cur} paths, created on demand */

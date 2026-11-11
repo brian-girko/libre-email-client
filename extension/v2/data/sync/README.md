@@ -554,6 +554,34 @@ handle keeps the SOURCE folder's FMD5 in the filename
 interloper the engine replays as a single server MOVE (filter moves are
 identical — pull-time routing writes that same marker file directly).
 
+**Tombstones (`.tombstones.json`):** local deletion is otherwise inferred
+purely as "in the snapshot K, missing locally", so whenever the snapshot
+loses or never had the record the deleted mail returns to the folder like
+fresh mail — a purge landing while a sync is already applying (the native
+"save to disk" override purges originals exactly then), a conflict re-pull
+("deleted locally, edited on server"), or a uidvalidity resync. Every
+client purge therefore records `{folder, uid, msgid}` in the account's
+tombstone file BEFORE the message file is removed
+(`MaildirStore.addTombstones` — the msgid is the same identity the snapshot
+carries, so a resync keeps matching it), and the offscreen's fs-event
+watcher feeds any message-file removal that lands under the active
+account's dir straight into the running engines (`noteTombstones`).
+
+The engine consults the list at three levels: the classifier turns a
+tombstoned uid into a `deleteServer` op instead of a pull (both the
+"no snapshot record" and the "deleted locally, edited on server"
+branches — the `confirmPurge` gate still asks), the pull writers re-check
+before every write (per pull chunk the file is re-read, so a mid-run
+purge is caught even without the watcher; resync pulls match by msgid
+only, since a resync invalidates uids), and the post-apply arrivals are
+checked the same way. The prune at commit time removes ONLY the entries
+the run resolved — a message no longer on the server, or a uid the
+snapshot has since handed to a different identity. Everything still on
+the server under the same identity (a declined purge gate, a mid-run
+skip, a folder a scoped run never surveyed) stays, so the next run is
+protected too and the deleted mail can never quietly return. A failed
+run never commits, and therefore never prunes.
+
 **A replayed MOVE keeps the bytes.** A server MOVE assigns a fresh UID, so
 the pending-move file can't simply be re-used — but the bytes are already
 on disk. After the MOVE lands, the post-apply survey pairs every kept copy

@@ -82,7 +82,7 @@
 
 import {createClient} from './client.mjs';
 import {prepare} from '/core/fs.mjs';
-import {MaildirStore} from '../maildir.mjs';
+import {MaildirStore, folderFor, parseFilename} from '../maildir.mjs';
 import {createSync} from './sync.mjs';
 import {runAllFilters} from '../filters/run.mjs';
 import {routeMessage} from '../filters/route.mjs';
@@ -346,6 +346,57 @@ const pullQuantum = Math.max(1,
   Math.floor(Number(globalThis.process?.env?.SYNC_PULL_QUANTUM) || DECISIONS.pullQuantum));
 const miningBatch = Math.max(1,
   Math.floor(Number(globalThis.process?.env?.SYNC_MINING_BATCH) || DECISIONS.miningBatch));
+
+// ---- tombstone watcher: deletions that land WHILE a session runs ----------
+//
+// The client's purgeMessages writes the durable tombstone entry BEFORE it
+// removes the file, and the engine re-reads the file at every pull chunk —
+// but a deletion that bypasses purgeMessages (another client page removing
+// a message file directly) would only surface at the NEXT sync. While a
+// session is live this listener watches fs-events for message-file removals
+// under the ACTIVE account dir and feeds the running engines instantly.
+// The engine's own ops emit origin 'offscreen' and never match.
+
+let watcherStore = null;      // the live session's MaildirStore (or null)
+const liveEngines = new Set(); // engines created by the current session
+
+chrome.runtime.onMessage.addListener(msg => {
+  if (!watcherStore || msg?.type !== 'fs-event') {
+    return;   // no session running, or not an fs-event — nothing to do
+  }
+  try {
+    const src = String(msg.src ?? '');
+    const account = watcherStore.account ?? watcherStore.slug;
+    if (msg.origin === 'offscreen' || msg.operation !== 'remove' ||
+        !src.startsWith(account + '/')) {
+      return;
+    }
+    // <account>/<dirName>/{new,cur,tmp}/<maildir filename>
+    const segs = src.slice(account.length + 1).split('/');
+    if (segs.length !== 3 || (segs[1] !== 'cur' && segs[1] !== 'new')) {
+      return;
+    }
+    const parsed = parseFilename(segs[2]);
+    if (!parsed) {
+      return;   // not a message file (a dropped .txt, a dotfile, …)
+    }
+    const entry = {
+      folder: folderFor(segs[0], watcherStore.delimiter),
+      uid: parsed.uid,
+      msgid: null,
+      at: new Date().toISOString()
+    };
+    for (const engine of liveEngines) {
+      try {
+        engine.noteTombstones([entry]);
+      }
+      catch {}
+    }
+    engineLog('sync',
+      `tombstoned ${entry.folder}/${entry.uid} (deleted outside the engine while syncing)`);
+  }
+  catch {}
+});
 
 // ---------------------------------------------------------------- jobs
 
@@ -928,6 +979,10 @@ async function withSession(job) {
         ? account.delimiter
         : '/'});
     await store.open();
+    // the tombstone watcher watches THIS account's dir while the session
+    // runs (see the watcher block at the module top)
+    watcherStore = store;
+    liveEngines.clear();
     if (job.kind === 'discard') {
       engineLog('discard', 'wiping the local copy…');
       const freed = await store.reset();
@@ -967,6 +1022,7 @@ async function withSession(job) {
             only: dir,
             route: dirInbox ? pullRouteOf(job, account) : null
           });
+          liveEngines.add(engine);
           const {plan, summary} = await engine.run({dry});
           reportDelimiter(account, summary);
           engineLog('summary', summary);
@@ -1050,6 +1106,7 @@ async function withSession(job) {
         // the sync interface's own buttons — see pullRouteOf)
         route: pullRouteOf(job, account)
       });
+      liveEngines.add(engine);
       const dry = job.kind.startsWith('dry');
       const {plan, summary} = await engine.run({dry});
       reportDelimiter(account, summary);   // dry runs survey too — always fresh
@@ -1126,6 +1183,9 @@ async function withSession(job) {
       catch {}
     }
     store = null;
+    // the session is over: no watcher feed, no live engines
+    watcherStore = null;
+    liveEngines.clear();
     letBridgeSleep();
     // our ref is due back: the bridge drops after this (or stays for a
     // waitlist of other jobs still holding refs)

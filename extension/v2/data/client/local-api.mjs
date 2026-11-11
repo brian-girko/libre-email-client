@@ -43,7 +43,7 @@ import {
   normalizeFolderPath,
 } from '../sync/maildir.mjs';
 import {delimiterFor} from '../sync/client/delimiter.mjs';
-import {loadSnapshot} from '../sync/snapshot.mjs';
+import {loadSnapshot, msgidOf} from '../sync/snapshot.mjs';
 import {messageMeta} from './headers.mjs';
 import {groupThreads} from './threads.mjs';
 import postalMime from '/core/parser/postal-mime.mjs';
@@ -602,6 +602,32 @@ export function apiForStore(store, accountId) {
         throw new Error('purge: messages are no longer in the local folder');
       }
       let purged = 0;
+      // Tombstones BEFORE the files go: each purge records {folder, uid,
+      // msgid} so the sync engine knows the deletion was local and can
+      // never re-add the message — the "deleted mail returns as new" race
+      // (a purge landing while a sync is applying — the native "save to
+      // disk" override purges originals exactly then — or the snapshot
+      // losing the record before the next run classifies the deletion).
+      // msgid is the identity the snapshot itself carries, so a resync
+      // (uidvalidity change) keeps matching the tombstone too.
+      const tombstones = [];
+      for (const row of candidates) {
+        try {
+          tombstones.push({
+            folder: selected,
+            uid: row.uid,
+            msgid: await msgidOf(await store.readFile(row.entry)),
+            at: new Date().toISOString()
+          });
+        }
+        catch {}
+      }
+      if (tombstones.length) {
+        try {
+          await store.addTombstones(tombstones);
+        }
+        catch {}
+      }
       for (const row of candidates) {
         // hard removal of the message file; a missing file is not an error
         if (await store.removeMessage(row.entry)) {

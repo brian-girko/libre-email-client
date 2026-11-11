@@ -26,6 +26,11 @@
 //                             with no foreign-FMD5 file anywhere in the
 //                             handle the delete asks the user first
 //                             (confirmPurge gate, sync page)
+//                             tombstones (.tombstones.json — locally
+//                             deleted mail recorded at purge time) override
+//                             the conflict rule and the S−K pull: deleted
+//                             locally means never re-added, the server
+//                             copy follows
 //   L file with foreign FMD5 X → local move out of X, pushed as server move;
 //                             the kept copy is PAIRED with the fresh
 //                             destination uid in the post-apply survey
@@ -360,6 +365,63 @@ export function createSync(mail, store, {account = null, log = console.log, onPr
   // run-level route counters for the end-of-apply summary line
   const routeStats = {moved: 0, kept: 0, unmatched: 0, failed: 0};
 
+  // ---- tombstones: locally deleted mail the snapshot inference must not
+  // resurrect --------------------------------------------------------------
+  // The client's purgeMessages writes {folder, uid, msgid} at the moment of
+  // deletion (data/client/local-api.mjs), and the offscreen's fs-event
+  // watcher feeds mid-run deletions straight in via noteTombstones(). The
+  // classifier consults the list BEFORE planning a pull, the pull writers
+  // re-check it before every write, and apply() prunes at commit time ONLY
+  // the entries it resolved — a tombstone whose message is still on the
+  // server (purge gate declined, a mid-run skip, a scoped run that never
+  // surveyed the folder) stays, so the next run cannot re-add the mail.
+  const tombByUid = new Map();   // `${folder}/${uid}` → entry
+  const tombByMsgid = new Map(); // msgid → entry (resync fallback)
+  const tombLive = new Map();    // `${folder}/${uid}` → entry, fed mid-run
+  const tombKey = (folder, uid) => `${folder}/${Number(uid)}`;
+
+  const tombIndex = entry => {
+    tombByUid.set(tombKey(entry.folder, entry.uid), entry);
+    if (entry.msgid && !tombByMsgid.has(entry.msgid)) {
+      tombByMsgid.set(entry.msgid, entry);
+    }
+  };
+
+  /** (re)load from the file — merge, never replace: a mid-run watcher feed
+   *  (tombLive) is fresher than the file and must survive the refresh
+   *  (the client's purge wrote the durable entry itself, but a deletion by
+   *  another context did not) */
+  async function loadTombstones() {
+    tombByUid.clear();
+    tombByMsgid.clear();
+    let entries = [];
+    try {
+      entries = await store.loadTombstones();
+    }
+    catch {}
+    for (const e of entries) {
+      tombIndex({folder: e.folder, uid: e.uid, msgid: e.msgid || null, at: e.at || null});
+    }
+    for (const entry of tombLive.values()) {
+      tombIndex(entry);
+    }
+  }
+
+  /**
+   * The tombstone entry that blocks folder/uid, matched by uid (safe only
+   * where uids are trustworthy — never a resync'd folder) or by msgid
+   * (folder-agnostic identity: a deleted message must not return anywhere).
+   */
+  function tombFor(folder, uid, msgid = null, {byUid = true} = {}) {
+    if (byUid) {
+      const hit = tombByUid.get(tombKey(folder, uid));
+      if (hit) {
+        return hit;
+      }
+    }
+    return msgid ? (tombByMsgid.get(msgid) ?? null) : null;
+  }
+
   async function select(name, {force = false} = {}) {
     if (selected !== name || force) {
       selected = name;
@@ -595,6 +657,14 @@ async function rowsFor(name, uidnext) {
   async function plan() {
     selected = null;
     const survey = await surveyNow();
+    // locally deleted mail the classifier must not re-pull (see the
+    // tombstone block above): loaded fresh every plan, dry runs included —
+    // only apply() ever prunes the file
+    await loadTombstones();
+    if (tombByUid.size) {
+      emitLog('plan',
+        `tombstones: ${tombByUid.size} locally deleted message(s) remembered`);
+    }
     const {snap, folders, allFolders = []} = survey;
     // Star-color keywords diff like any standard flag. Once a server proves
     // it rejects keyword STOREs (flagsServer exec records starKeywords:false
@@ -1116,6 +1186,22 @@ async function rowsFor(name, uidnext) {
           if (claim.has(`${name}/${uid}`)) {
             continue;
           }
+          const tomb = tombFor(name, uid);
+          if (tomb) {
+            // deleted locally while the snapshot had no record of it (the
+            // purge landed mid-run, or the record was lost some other way):
+            // never a pull — the server copy follows the local deletion
+            // (the confirmPurge gate still asks; a declined gate keeps the
+            // tombstone for the next run)
+            ops.push({
+              kind: 'deleteServer',
+              folder: name,
+              uid,
+              msgid: tomb.msgid ?? null,
+              tombstoned: true
+            });
+            continue;
+          }
           // a pending local move whose snapshot record vanished: verify the
           // moved file's identity and replay the move instead of pulling
           // the source copy back (a "revert" the user never asked for)
@@ -1180,6 +1266,20 @@ async function rowsFor(name, uidnext) {
           continue;
         }
         if (!sameFlags(diffFlags(row.flags), diffFlags(k.flags))) {
+          const tomb = tombFor(name, uid);
+          if (tomb) {
+            // the classifier's own conflict rule ("deleted locally, edited
+            // on server → re-pull") would resurrect exactly the mail the
+            // user deleted — the tombstone says the local deletion wins
+            ops.push({
+              kind: 'deleteServer',
+              folder: name,
+              uid,
+              msgid: k.msgid ?? null,
+              tombstoned: true
+            });
+            continue;
+          }
           conflicts.push({
             folder: name,
             uid,
@@ -1609,9 +1709,25 @@ async function rowsFor(name, uidnext) {
       return dest;
     };
 
-    /** write one landed pull op (the narration is per chunk, see pullLine) */
+    /** write one landed pull op (the narration is per chunk, see pullLine).
+     *  Returns true when written, false when a tombstone skipped it (the
+     *  skip is accounted here). */
     const pullRow = async (op, raw) => {
       const row = survey.folders.get(op.folder)?.server.get(op.uid);
+      // tombstone re-check at WRITE time: the plan was built before the
+      // user could purge — a deletion landing mid-run (the native
+      // "save to disk" override purges originals exactly then) must not be
+      // resurrected by this run's own pulls. A resync pull (`initial`)
+      // cannot trust uids: identity by msgid only.
+      const mid = await msgidOf(raw);
+      if (tombFor(op.folder, op.uid, mid, {byUid: !op.initial})) {
+        summary.skipped++;
+        op.__counted = true;
+        onProgress?.({phase: 'apply', op: op.kind, folder: op.folder, done: ++done, total: ops.length});
+        emitLog('apply',
+          `skipped pull ${op.folder}/${op.uid}: deleted locally (tombstone) — left on the server`);
+        return false;
+      }
       // the finder decides the destination on the spot: a routed message
       // is written STRAIGHT into its destination dir with the SOURCE
       // folder's FMD5 (the pending-move marker) — the same end state the
@@ -1619,10 +1735,11 @@ async function rowsFor(name, uidnext) {
       const dest = (await routeLanding(raw, op.folder, Number(op.uid))) ?? op.folder;
       await store.writeMessage(dest, op.uid, knownFlags(row?.flags ?? []), raw,
         dest === op.folder ? {} : {fmd5: md5hex(op.folder)});
-      recMsgid.set(`${op.folder}/${op.uid}`, await msgidOf(raw));
+      recMsgid.set(`${op.folder}/${op.uid}`, mid);
       if (String(op.folder || '').toUpperCase() === 'INBOX') {
         landedInbox.add(Number(op.uid));
       }
+      return true;
     };
     /** one narration line per landed chunk: 1 message keeps the old shape */
     const pullLine = (folder, pulled) => {
@@ -1654,6 +1771,11 @@ async function rowsFor(name, uidnext) {
         return;
       }
       for (const chunk of chunks(list, pullBatch)) {
+        // the client can purge while we pull: re-read the tombstone file at
+        // every chunk boundary so a mid-run deletion is seen before this
+        // chunk's writes (the fs-event watcher is the instant path; this is
+        // the boundary fallback)
+        await loadTombstones();
         const landed = new Map();
         for (const sop of chunk) {
           if (sop.raw) {
@@ -1702,9 +1824,10 @@ async function rowsFor(name, uidnext) {
             if (!raw) {
               throw new Error(`${folder}/${sop.uid}: FETCH failed`);
             }
-            await pullRow(sop, raw);
-            counted(sop);
-            pulled.push({uid: Number(sop.uid), bytes: raw.byteLength});
+            if (await pullRow(sop, raw)) {
+              counted(sop);
+              pulled.push({uid: Number(sop.uid), bytes: raw.byteLength});
+            }
           }
           catch (e) {
             failedOp(sop, e?.message || e);
@@ -2002,6 +2125,9 @@ async function rowsFor(name, uidnext) {
     // Scoped run (only): start from the pre-sync snapshot and rewrite just
     // the synced dir's entry — untouched dirs keep their old state lines.
     const snapOut = {version: 2, lastSyncAt: null, folders: only ? structuredClone(survey.snap.folders ?? {}) : {}};
+    // post-apply server rows per folder — what the tombstone prune checks
+    // against at commit time ("is the deleted message still on the server?")
+    const postServers = new Map();
     // In a scoped run the destination folder of a NATIVE move (done by
     // another client — e.g. INBOX → Trash) is never surveyed, so no mining
     // matches it and the only folder's phase-(A) diff cannot be relocated.
@@ -2034,6 +2160,7 @@ async function rowsFor(name, uidnext) {
       const uidvalidity = Number(st?.uidvalidity || 0);
       const uidnext = Number(st?.uidnext || 0);
       const post = await rowsFor(F.name, uidnext);
+      postServers.set(F.name, post);
       if (!restricted) {
         await store.writeUidValidity(F.name, uidvalidity);
       }
@@ -2048,7 +2175,17 @@ async function rowsFor(name, uidnext) {
             await select(F.name);
             const raw = (await guardedFetch(mail.readMail(uid),
               `post-pull ${F.name}/${uid}`)).raw;
-            recMsgid.set(key, await msgidOf(raw));
+            const mid = await msgidOf(raw);
+            // an arrival is checked against the tombstones like any pull —
+            // a resync'd folder has untrustworthy uids, so identity by
+            // msgid only there
+            if (tombFor(F.name, uid, mid, {byUid: !F.resync})) {
+              summary.skipped++;
+              emitLog('apply',
+                `skipped ${key} (arrived): deleted locally (tombstone) — left on the server`);
+              continue;
+            }
+            recMsgid.set(key, mid);
             // arrivals route like the run's own pulls: the finder picks the
             // destination while the bytes are in hand (the snapshot keeps
             // describing the SERVER row — INBOX/uid — either way)
@@ -2155,6 +2292,38 @@ async function rowsFor(name, uidnext) {
     }
     await store.saveState(snapOut);
     emitLog('sync', `committed state: ${Object.values(snapOut.folders).reduce((n, f) => n + Object.keys(f.messages).length, 0)} message(s) total`);
+    // tombstone prune, ONLY on a committed run: an entry is spent when its
+    // message is no longer on the server (pushed as a confirmed server
+    // delete, or gone on its own) or when the snapshot has handed its uid to
+    // a DIFFERENT identity (a resync can reuse a uid — a stale entry must go
+    // rather than block the new message). Everything still on the server
+    // under the same identity (purge gate declined, a mid-run skip, no
+    // msgid to compare) stays, and so does every folder a scoped run never
+    // surveyed: dropping any of those would let the next run re-pull the
+    // deleted mail — the bug this list exists to prevent.
+    let tombCleared = 0;
+    try {
+      tombCleared = await store.clearTombstones(entry => {
+        const post = postServers.get(entry.folder);
+        if (!post) {
+          // a full run surveys every server folder: a tombstone whose
+          // folder is gone from the server entirely protects nothing
+          return only == null;
+        }
+        if (!post.has(Number(entry.uid))) {
+          return true;
+        }
+        const kMsgid = snapOut.folders[entry.folder]?.messages
+          ?.[Number(entry.uid)]?.msgid ?? null;
+        return !!(entry.msgid && kMsgid && kMsgid !== entry.msgid);
+      });
+    }
+    catch (e) {
+      emitLog('sync', `tombstone prune FAILED: ${e?.message || e}`, 'warn');
+    }
+    if (tombCleared) {
+      emitLog('sync', `tombstones: ${tombCleared} resolved local deletion(s) cleared`);
+    }
     return summary;
   }
 
@@ -2276,6 +2445,33 @@ async function rowsFor(name, uidnext) {
      *  pass skips them — it only sees the UNROUTED leftovers. A copy. */
     routedInboxUids: () => new Set(routedInbox),
     /** route counters for the run: {moved, kept, unmatched, failed} */
-    routeStats: () => ({...routeStats})
+    routeStats: () => ({...routeStats}),
+    /**
+     * Live tombstone feed (the offscreen fs-event watcher): a message
+     * deleted locally WHILE this run applies must block its own planned and
+     * arriving pulls immediately. The client's purge already wrote the
+     * durable entry — this is the in-memory fast path (the next per-chunk
+     * loadTombstones() would pick the file up too, but only at a boundary).
+     * @param {object[]} entries {folder, uid, msgid?, at?}
+     */
+    noteTombstones(entries) {
+      let n = 0;
+      for (const e of entries ?? []) {
+        const folder = typeof e?.folder === 'string' && e.folder ? e.folder : null;
+        const uid = Number(e?.uid);
+        if (!folder || !Number.isInteger(uid) || uid <= 0) {
+          continue;
+        }
+        const entry = {folder, uid, msgid: e.msgid || null,
+          at: e.at || new Date().toISOString()};
+        const key = tombKey(folder, uid);
+        if (!tombByUid.has(key) && !tombLive.has(key)) {
+          n++;
+        }
+        tombLive.set(key, entry);
+        tombIndex(entry);
+      }
+      return n;
+    }
   };
 }
