@@ -63,11 +63,10 @@ async function showStep(step) {
     await checkMasterStatus();
   }
 
-  // On step 4, fetch the folder list from the server (the account is NOT
-  // saved yet — the probe runs straight off the form fields) and render
-  // the ignore checkboxes
+  // On step 4, ask for the sync scope first: the whole account (finish
+  // right away, no folder fetch) or an exclusion list (the folder tree)
   if (String(step) === '4') {
-    await onFoldersStepEnter();
+    showScopeChoice();
   }
 }
 
@@ -83,8 +82,50 @@ let foldersLoaded = false;
 // instead of resetting them to the stored list.
 let foldersSeeded = false;
 
-// Mode selection
-document.querySelectorAll('.card').forEach(card => {
+// Step 4 runs in two phases: 'choice' asks whether the whole account syncs
+// or folders should be excluded; 'ignore' is the folder-tree editor.
+document.body.dataset.scope = 'choice';
+
+// Phase A: the sync-scope choice (the folder tree stays untouched here)
+function showScopeChoice() {
+  document.body.dataset.scope = 'choice';
+  document.getElementById('folders-choice').hidden = false;
+  document.getElementById('folders-step').hidden = true;
+  const statusEl = document.getElementById('scope-status');
+  statusEl.textContent = '';
+  statusEl.className = '';
+}
+
+// Phase B: the ignored-folder editor (fetches the folder list on entry)
+function showFoldersStep() {
+  document.body.dataset.scope = 'ignore';
+  document.getElementById('folders-choice').hidden = true;
+  document.getElementById('folders-step').hidden = false;
+  onFoldersStepEnter();
+}
+
+// "Sync everything": no folder probe, no ignore write — the account saves
+// and the first sync starts right away.
+function chooseSyncAll() {
+  finishSetup(document.getElementById('choose-all-card'), {
+    scope: 'all',
+    statusEl: document.getElementById('scope-status')
+  }).catch(e => console.error('[welcome] finish failed:', e?.message || e));
+}
+
+// "Exclude folders": switch to the folder tree
+function chooseExcludeFolders() {
+  showFoldersStep();
+}
+
+document.getElementById('choose-all-card')
+  .addEventListener('click', chooseSyncAll);
+document.getElementById('choose-ignore-card')
+  .addEventListener('click', chooseExcludeFolders);
+
+// Mode selection (scoped to step 1 — step 4's choice cards must not route
+// through the mode switch)
+document.querySelectorAll('#step-1 .card').forEach(card => {
   card.addEventListener('click', () => {
     document.body.dataset.mode = card.dataset.mode;
     showStep(card.dataset.mode === 'remote' ? '2a' : '2b');
@@ -770,7 +811,14 @@ document.addEventListener('click', async ({target}) => {
   if (cmd === 'back') {
     const step = document.body.dataset.step;
     if (step === '4') {
-      showStep('3');
+      // from the folder tree, back re-opens the sync-scope choice; from
+      // the choice itself, back returns to the account step
+      if (document.body.dataset.scope === 'ignore') {
+        showScopeChoice();
+      }
+      else {
+        showStep('3');
+      }
     }
     else if (step === '2a' || step === '2b' || step === '3') {
       showStep(step === '3'
@@ -796,9 +844,13 @@ document.addEventListener('click', async ({target}) => {
     // both step-4 exits: Finish persists the account (+ the tree's ignore
     // selection, when the tree loaded) and starts the first sync;
     // continue-all is the same path after a failed fetch (the tree never
-    // loaded, so the stored ignore list is never overwritten)
+    // loaded, so the stored ignore list is never overwritten) — it is an
+    // explicit "sync everything", so the ignore list stays untouched
     if (document.body.dataset.step === '4') {
-      await finishSetup(target);
+      await finishSetup(target, {
+        scope: cmd === 'continue-all' ? 'all' : 'ignore',
+        statusEl: document.getElementById('folders-status')
+      });
     }
   }
   else if (cmd === 'check-bridge') {
@@ -822,22 +874,27 @@ document.addEventListener('click', async ({target}) => {
 });
 
 /**
- * Step 4's Finish (and continue-all): the whole save is postponed to here —
- * account, ignore selection (only when the tree rendered) and the first
- * sync. An unresolvable password leaves the wizard open with feedback; a
- * retry re-runs everything.
+ * Step 4's finish path (choose-all card, Finish and continue-all): the
+ * whole save is postponed to here — account, ignore selection and the
+ * first sync. `scope` decides the ignore handling: 'all' syncs everything
+ * and never writes the ignore list (nothing stored, nothing cleared),
+ * 'ignore' persists the tree's selection — only when the tree rendered.
+ * An unresolvable password leaves the wizard open with feedback; a retry
+ * re-runs everything.
  */
-async function finishSetup(button) {
+async function finishSetup(button, {scope, statusEl}) {
   if (!editingId && !validateForm()) {
     showStep('3');
     return;
   }
   button.disabled = true;
-  const statusEl = document.getElementById('folders-status');
+  // the choose-all trigger is a card, not an input: pointer-events off
+  // keeps a double click from re-entering the save while it runs
+  button.style.pointerEvents = 'none';
   let started = false;
   try {
     const id = await saveAccount();
-    if (foldersLoaded) {
+    if (scope === 'ignore' && foldersLoaded) {
       const {saveIgnores} = await import('/data/sync/ignore.mjs');
       await saveIgnores(id,
         document.getElementById('folders-tree').getIgnored());
@@ -850,6 +907,7 @@ async function finishSetup(button) {
     statusEl.textContent = 'Saving the account failed — go back and try again.';
     statusEl.className = 'error';
     button.disabled = false;
+    button.style.pointerEvents = '';
     return;
   }
   if (started) {
@@ -858,19 +916,22 @@ async function finishSetup(button) {
   else {
     // leave the wizard open with feedback: the user can retry Finish or
     // start the sync later from the client
-    statusEl.textContent =
-      'Account saved (the ignore list too), but the first sync could not ' +
-      'start. Press Finish to retry, or Sync now in the mail client.';
+    statusEl.textContent = scope === 'all'
+      ? 'Account saved, but the first sync could not start. Try again, ' +
+        'or use Sync now in the mail client.'
+      : 'Account saved (the ignore list too), but the first sync could not ' +
+        'start. Press Finish to retry, or Sync now in the mail client.';
     statusEl.className = 'error';
     button.disabled = false;
+    button.style.pointerEvents = '';
   }
 }
 
 /**
- * Step 4 entry: fetch the folder list straight off the form fields and
- * render the ignore checkboxes. A fetch failure never blocks setup — the
- * status line explains, "Continue — sync everything" finishes without
- * touching the ignore list.
+ * Phase B entry (step 4, "Exclude folders" chosen): fetch the folder list
+ * straight off the form fields and render the ignore checkboxes. A fetch
+ * failure never blocks setup — the status line explains, "Continue — sync
+ * everything" finishes without touching the ignore list.
  */
 async function onFoldersStepEnter() {
   const statusEl = document.getElementById('folders-status');
@@ -918,7 +979,7 @@ async function onFoldersStepEnter() {
     }
     foldersLoaded = true;
     statusEl.textContent =
-      'Uncheck the folders to ignore — they are never synced.';
+      'Check the folders to ignore — they are never synced.';
     statusEl.className = 'success';
     tree.hidden = false;
   }

@@ -136,23 +136,47 @@
     </div>
   </section>
 
-  <!-- Step 4: Ignored Folders (the account is saved on Finish, AFTER the
-       folder list was fetched — the ignore choices ride the first sync) -->
+  <!-- Step 4: Sync scope — phase A asks for the whole account or an
+       exclusion list; phase B (the tree) is the exclusion editor. The
+       account is saved on Finish, AFTER the folder list was fetched —
+       the ignore choices ride the first sync. -->
   <section id="step-4" class="step" hidden>
-    <h1>Ignored Folders</h1>
-    <p>Uncheck folders you do not want to sync. Ignored folders are skipped
-       by every sync — the local copy and the server copy both stay
-       untouched, and the choice can be changed later from the options page
-       or the folder pane.</p>
-    <p id="folders-status">Fetching your folders…</p>
-    <folder-tree id="folders-tree" hidden></folder-tree>
-    <p class="hint" id="folders-note" hidden></p>
-    <div class="actions">
-      <input type="button" data-cmd="continue-all" value="Continue — sync everything" hidden>
+    <!-- Phase A: sync-scope choice -->
+    <div id="folders-choice">
+      <h1>Sync Scope</h1>
+      <p>What should be synced from this account?</p>
+      <div class="choices">
+        <div class="card" id="choose-all-card">
+          <h2>Everything</h2>
+          <p>Sync the whole account &mdash; every folder, nothing excluded.</p>
+        </div>
+        <div class="card" id="choose-ignore-card">
+          <h2>Exclude folders</h2>
+          <p>Pick folders to leave out &mdash; they are never synced.</p>
+        </div>
+      </div>
+      <p id="scope-status"></p>
+      <div class="nav">
+        <input type="button" data-cmd="back" value="Back">
+      </div>
     </div>
-    <div class="nav">
-      <input type="button" data-cmd="back" value="Back">
-      <input type="button" data-cmd="finish" value="Finish">
+    <!-- Phase B: ignored-folder selection -->
+    <div id="folders-step" hidden>
+      <h1>Ignored Folders</h1>
+      <p>Check the folders you do not want to sync. Ignored folders are skipped
+         by every sync — the local copy and the server copy both stay
+         untouched, and the choice can be changed later from the options page
+         or the folder pane.</p>
+      <p id="folders-status">Fetching your folders…</p>
+      <folder-tree id="folders-tree" hidden></folder-tree>
+      <p class="hint" id="folders-note" hidden></p>
+      <div class="actions">
+        <input type="button" data-cmd="continue-all" value="Continue — sync everything" hidden>
+      </div>
+      <div class="nav">
+        <input type="button" data-cmd="back" value="Back">
+        <input type="button" data-cmd="finish" value="Finish">
+      </div>
     </div>
   </section>
 

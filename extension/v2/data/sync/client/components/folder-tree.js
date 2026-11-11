@@ -62,6 +62,9 @@ class FolderTree extends HTMLElement {
           text-decoration: line-through;
           opacity: 0.55;
         }
+        .row.checkable {
+          cursor: pointer;
+        }
         .row.disabled .label {
           color: var(--dim, #8a8f98);
         }
@@ -156,10 +159,17 @@ class FolderTree extends HTMLElement {
   }
 
   #row(node, depth) {
-    const row = document.createElement('div');
     const checkable = node.selectable && node.name.toUpperCase() !== 'INBOX';
+    // a checkable row is a <label>: clicking anywhere on it (the folder
+    // name included) toggles the checkbox, like the native association
+    const row = document.createElement(checkable ? 'label' : 'div');
     const ignored = this.#effectiveIgnored(node);
+    const self = this.#selfIgnored(node);
+    // an ancestor-ignored row's checkbox is disabled — no clickable
+    // affordance there, the label click would be a no-op
+    const clickable = checkable && !(ignored && !self);
     row.className = 'row'
+      + (clickable ? ' checkable' : '')
       + (node.selectable ? '' : ' disabled')
       + (ignored ? ' ignored' : '');
     row.style.paddingLeft = (depth * 16 + 4) + 'px';
@@ -167,15 +177,14 @@ class FolderTree extends HTMLElement {
     if (checkable) {
       const box = document.createElement('input');
       box.type = 'checkbox';
-      const self = this.#selfIgnored(node);
       const ancestor = ignored && !self;
       box.checked = ignored;
       box.disabled = ancestor;
       box.title = ancestor
         ? 'Ignored with the parent folder — uncheck the parent first'
         : self
-          ? 'Ignored — not synced (the local copy stays; check to sync again)'
-          : 'Sync this folder (uncheck to ignore it, its subfolders ignore with it)';
+          ? 'Ignored — not synced (the local copy stays; uncheck to sync again)'
+          : 'Sync this folder (check to ignore it, its subfolders ignore with it)';
       box.addEventListener('change', () => {
         if (box.checked) {
           this.#ignored.add(node.name);
