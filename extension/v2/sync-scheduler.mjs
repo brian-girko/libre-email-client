@@ -234,7 +234,15 @@ async function dirtyDirs(id, slug) {
 /** the stored filter list for full runs — the engine applies it to the
  *  run's new INBOX pulls in stored order, like the client's own syncs */
 async function filters() {
-  const list = await loadFilters().catch(() => []);
+  // one silent retry, then a logged warn: a transient storage failure
+  // must not silently strip the filters off this run (matching mail
+  // would land in INBOX with no filter pass to catch it)
+  const load = () => loadFilters().catch(e => {
+    dlog('scheduler', '[scheduler] loading the filter list FAILED — this run runs unfiltered:',
+      e?.message || e);
+    return [];
+  });
+  const list = await loadFilters().catch(() => load());
   return Array.isArray(list) ? list : [];
 }
 

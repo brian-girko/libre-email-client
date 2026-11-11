@@ -1668,6 +1668,16 @@ async function rowsFor(name, uidnext) {
         return null;
       }
       if (!res.matched) {
+        if (res.parsed === false) {
+          // a parse failure is NOT "no match": the walk never ran. The uid
+          // stays UNROUTED, so the post-sync pass retries it (and logs the
+          // warn) instead of silently anchoring the message in INBOX.
+          routeStats.failed++;
+          emitLog('filter',
+            `routing ${folder}/${uid} FAILED (${res.detail?.reason || 'unparseable'}) — the message lands in INBOX`,
+            'warn');
+          return null;
+        }
         routeStats.unmatched++;
         routedInbox.add(Number(uid));    // the walk ran to its end: nothing
         return null;                     // matches — INBOX is the final place
@@ -2137,8 +2147,7 @@ async function rowsFor(name, uidnext) {
     // bug. Such records are therefore CARRIED until a full run can trace
     // them by msgid; see the carry-forward block further below.
     // settledMoves: uids this run itself moved away ON THE SERVER
-    // (moveServer) — their source record is settled, dropping it is safe.</think><tool_call>edit<arg_key>newString</arg_key><arg_value>    // uids moved away successfully ON THE SERVER by this run's own
-    // moveServer ops: their source record is settled, dropping it is safe
+    // (moveServer) — their source record is settled, dropping it is safe.</think><tool_call>edit<arg_key>newString</arg_key><arg_value>    // (moveServer) — their source record is settled, dropping it is safe.
     const settledMoves = new Set();
     if (only != null) {
       for (const op of plan.ops) {

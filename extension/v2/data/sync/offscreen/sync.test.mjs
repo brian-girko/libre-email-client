@@ -839,6 +839,49 @@ const emptyFolders = () => ({
     'the failure is warned');
 }
 
+// ---- routing scenario 3b: a PARSE FAILURE is not a no-match ---------------
+// A finder answer of {matched: false, parsed: false} (routeMessage on an
+// unparseable message) must behave like a throwing finder: the message
+// lands in INBOX unrouted, so the post-sync pass retries it — a no-match
+// answer (parsed: true) anchors the message in INBOX as final.
+{
+  const server = new Map([
+    ['INBOX', dirRawState(1000, 7, new Map([
+      [5, rawOfSubject('r5', 'mystery mail')]]))],
+    ['Work', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {version: 2, lastSyncAt: null, folders: emptyFolders()};
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([])]
+  ]);
+  const routeLogs = [];
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store, {
+    log: (l) => routeLogs.push(l),
+    // the finder answer routeMessage produces for an unparseable message
+    route: async () => ({
+      matched: false, parsed: false, action: null, folder: null,
+      createFolder: false, filter: null, detail: {reason: 'unparseable: broken'}
+    })
+  });
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the pull itself still succeeds');
+  assert.deepEqual(
+    store.written.map(w => [w.folder, w.uid, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['INBOX', 5, 'own']],
+    'the pull lands in INBOX with its own FMD5: ' + JSON.stringify(store.written));
+  assert.deepEqual([...engine.landedInboxUids()], [5], 'the pull is received');
+  assert.equal(engine.routedInboxUids().size, 0,
+    'a parse failure is NOT "no match" — the uid stays unrouted for the post-sync pass');
+  assert.deepEqual(engine.routeStats(), {moved: 0, kept: 0, unmatched: 0, failed: 1},
+    'the parse failure is counted as failed, never as unmatched');
+  assert.ok(routeLogs.some(l => l.cls === 'warn' &&
+      l.content.includes('routing INBOX/5 FAILED (unparseable: broken)')),
+    'the parse failure is warned: ' + JSON.stringify(routeLogs));
+}
+
 // ---- routing scenario 4: a destination folder the server does not have ----
 // Warn once, still land locally: the file is a pending move the next run
 // replays once the folder exists (the engine's localOnly/create machinery

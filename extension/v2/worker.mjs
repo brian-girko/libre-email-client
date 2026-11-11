@@ -215,9 +215,19 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     case 'sync-request': {
       const withFilters = msg?.bare === true
         ? Promise.resolve(null)
-        : loadFilters().then(list =>
-            (Array.isArray(list) && list.length) ? list : null)
-          .catch(() => null);
+        : loadFilters()
+            // one silent retry, then a visible warn: a transient storage
+            // hiccup must not silently strip the filters off this run —
+            // an unfiltered run lands matching mail in INBOX with no
+            // fallback pass to catch it
+            .catch(() => loadFilters())
+            .then(list =>
+              (Array.isArray(list) && list.length) ? list : null)
+            .catch(e => {
+              console.warn('[sync] loading the filter list FAILED — this run runs unfiltered:',
+                e?.message || e);
+              return null;
+            });
       // the offscreen has no chrome.storage: the account's stored
       // hierarchy delimiter rides the job too (fresh MaildirStore default
       // is '/', so a run that dies before its survey completes would

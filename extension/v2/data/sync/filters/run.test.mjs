@@ -213,4 +213,57 @@ const BOTH = message({from: 'x@example.com', subject: 'guardme and shipme'});
   assert.equal(res.kept, 0);
 }
 
+// 7. routeMessage exposes the parse status: a walked-to-the-end no-match
+//    answers parsed:true, an unparseable message answers parsed:false —
+//    the sync engine keys its post-sync filter fallback on this flag, so
+//    a parse failure must never read as "no match" (the message would be
+//    anchored in INBOX forever)
+{
+  const none = await routeMessage(FREE, {filters: [STOP]});
+  assert.equal(none.matched, false);
+  assert.equal(none.parsed, true, 'a genuine no-match is parsed:true');
+
+  // deeply nested multipart: postal-mime throws (depth cap)
+  const broken = new TextEncoder().encode(
+    ('Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n').repeat(300));
+  const failed = await routeMessage(broken, {filters: [MOVE]});
+  assert.equal(failed.matched, false);
+  assert.equal(failed.parsed, false, 'a parse failure is NOT a no-match');
+  assert.ok(failed.detail?.reason, 'the failure reason is carried');
+}
+
+// 8. body matching on an HTML-only message: tags are stripped, so a
+//    contains-match sees words, not markup
+{
+  const html = new TextEncoder().encode(
+    'From: a@example.com\r\nTo: me@example.com\r\n' +
+    'Subject: newsletter\r\n' +
+    'Content-Type: text/html; charset=utf-8\r\n\r\n' +
+    '<html><body><p>Shipping <b>update</b></p></body></html>\r\n');
+  const res = await routeMessage(html, {filters: [
+    {...MOVE, id: 'h1', query: 'body:shipping update'}]});
+  assert.equal(res.matched, true, 'body: matches across stripped tags');
+}
+
+// 9. envelope recipients join the to: haystack: Delivered-To and List-Id
+//    are matchable even though the To/Cc headers never carry them (Bcc
+//    and mailing-list delivery spell the recipient there)
+{
+  const list = new TextEncoder().encode(
+    'From: sender@lists.example.com\r\n' +
+    'To: sender@lists.example.com\r\n' +   // list mail: To = the sender
+    'Subject: digest\r\n' +
+    'List-Id: <announce.lists.example.com>\r\n' +
+    'Delivered-To: me@example.com\r\n\r\nbody\r\n');
+  const byList = await routeMessage(list, {filters: [
+    {...MOVE, id: 'l1', query: 'to:announce.lists.example.com'}]});
+  assert.equal(byList.matched, true, 'to: matches the List-Id');
+  assert.equal(byList.filter?.id, 'l1');
+
+  const byDelivered = await routeMessage(list, {filters: [
+    {...MOVE, id: 'l2', query: 'to:me@example.com'}]});
+  assert.equal(byDelivered.matched, true, 'to: matches Delivered-To');
+  assert.equal(byDelivered.filter?.id, 'l2');
+}
+
 console.log('run.test.mjs: all filter stop-action tests passed');

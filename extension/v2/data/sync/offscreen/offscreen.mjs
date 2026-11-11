@@ -518,13 +518,36 @@ function scopeOf(job) {
   };
 }
 
+/** A job's (or request's) filter list is "runnable" when it could route
+ *  or filter anything at all. */
+function hasFilters(jobOrMsg) {
+  return Array.isArray(jobOrMsg?.filters) && jobOrMsg.filters.length > 0;
+}
+
+/** Filter parity on fold/drop: when the SURVIVING job carries no filter
+ *  list but the absorbed request does, adopt it. Every list comes from
+ *  the same storage read, so two non-empty lists never conflict — the
+ *  distinction is bare (an interface submission, no filters) vs carrying.
+ *  Without this, a bare job queued ahead of a filter-carrying one runs
+ *  the whole merged request unfiltered and matching mail lands in INBOX.
+ *  Returns true when the target gained a list. */
+function adoptFilters(target, incoming) {
+  if (!target || hasFilters(target) || !hasFilters(incoming)) {
+    return false;
+  }
+  target.filters = incoming.filters.slice();
+  return true;
+}
+
 /**
  * Queue hygiene before a fresh job joins (never touches the RUNNING job):
  * - a folder-based request is dropped when a full run of the same
  *   account+family is queued or already running (it covers every folder)
  * - folder-based requests merge their folders into the earlier pending
  *   job of the same account+family (a single-dir job spreads into the
- *   -dirs form); the earlier job keeps its rid/filters/prefs, the
+ *   -dirs form); the earlier job keeps its rid/filters/prefs, EXCEPT that
+ *   a bare survivor adopts the absorbed request's filter list
+ *   (adoptFilters — filter parity, see above), the
  *   incoming rid leaves the queue (its view unpins via the broadcast)
  * - a full request folds away every pending folder-based job of the same
  *   account+family ahead of itself, and dedupes against a queued twin
@@ -545,12 +568,24 @@ function mergeQueue(msg) {
   if (DIR_KINDS.has(kind)) {
     // a full run in flight already sweeps the whole account
     if (FULL_KINDS.has(activeJob?.kind) && sameAcc(activeJob)) {
+      // best-effort filter parity: the in-flight run's pull-time route
+      // finder is fixed, but its post-sync filter pass reads job.filters
+      // when the run settles — attaching now still filters its landed
+      // pulls ("received messages are filtered")
+      if (adoptFilters(activeJob, msg)) {
+        engineLog('queue',
+          `${describeJob(msg)} dropped — a full ${family === 'dry' ? 'dry' : 'sync'} run is in flight for this account (its filter list adopted)`);
+        return 'dropped';
+      }
       engineLog('queue',
         `${describeJob(msg)} dropped — a full ${family === 'dry' ? 'dry' : 'sync'} run is in flight for this account`);
       return 'dropped';
     }
     const fullIdx = queue.findIndex(j => j !== activeJob && FULL_KINDS.has(j.kind) && sameAcc(j));
     if (fullIdx >= 0) {
+      // the covering full job must not run bare when the dropped request
+      // carried a filter list
+      adoptFilters(queue[fullIdx], msg);
       engineLog('queue',
         `${describeJob(msg)} dropped — covered by the queued ${describeJob(queue[fullIdx])}`);
       return 'dropped';
@@ -568,6 +603,10 @@ function mergeQueue(msg) {
       target.kind = family === 'dry' ? 'dry-dirs' : 'sync-dirs';
       target.dir = null;
       target.dirs = merged;
+      // the earlier job keeps its rid — but a bare target (an interface
+      // submission) must not swallow a filter-carrying request: adopt the
+      // incoming list when the target has none
+      adoptFilters(target, msg);
       engineLog('queue',
         `${describeJob(msg)} merged into the queued ${describeJob(target)}`);
       return 'merged';
@@ -587,6 +626,14 @@ function mergeQueue(msg) {
     }
     const folded = queue.filter(j => j !== activeJob &&
       DIR_KINDS.has(j.kind) && sameAcc(j));
+    // a bare incoming full run adopts the filter list of a folded
+    // filter-carrying dir job (the lists never conflict — one is empty)
+    if (!hasFilters(msg)) {
+      const withFilters = folded.find(j => hasFilters(j));
+      if (withFilters) {
+        msg.filters = withFilters.filters.slice();
+      }
+    }
     for (const job of folded) {
       queue.splice(queue.indexOf(job), 1);
       engineLog('queue', `${describeJob(job)} dropped — the queued full run covers it`);
