@@ -1307,6 +1307,109 @@ const emptyFolders = () => ({
     'the carried record is cleaned by the full run\'s rewrite');
 }
 
+// ---- scenario O: ENVELOPE adoption — mining without raw downloads ----------
+// The survey's summaries fetch already carries each row's ENVELOPE message-id
+// (rowsFor keeps it as `msgid`). A fresh uid whose survey row has that
+// identity must be classified WITHOUT a mining download: the cross-folder
+// move detection runs on the adopted identity alone, and only headerless
+// mail (the sha256-of-raw fallback) still costs a raw fetch. Modeled on
+// scenario N's run 2 (a full run after a native move done on another
+// device) — but the moved copy's fresh uid carries its ENVELOPE messageId
+// in the survey, so the run downloads nothing.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    // uid 5 left INBOX on the server; m5 lives in Trash as fresh uid 2,
+    // READ there by the client that moved it — its ENVELOPE messageId is
+    // exactly the identity the snapshot knows
+    ['INBOX', dirState(1000, 9, [[7, 'm7']])],
+    ['Trash', {status: {folder: 'x', exists: true, uidvalidity: 3000, uidnext: 3},
+      rows: new Map([[2, {flags: ['\\Seen'], subject: 'm5', from: null, date: null, size: rawOf('m5').length, messageId: m5}]]),
+      raws: new Map([[2, rawOf('m5')]])}]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }},
+      'Trash': {uidvalidity: 3000, uidnext: 3, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7')),
+      fileEntry(makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')}),
+        5, md5hex('INBOX'), rawOf('m5'))
+    ])],
+    ['Trash', listing([])]
+  ]);
+
+  const store = mockStore(snapshot, listings);
+  const mail = mockMail(server);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {plan, summary} = await engine.plan();
+
+  const relocations = plan.ops.filter(o => o.kind === 'relocate');
+  assert.equal(relocations.length, 1,
+    'the server-side move is still detected: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(relocations[0].toFolder, 'Trash');
+  assert.equal(relocations[0].toUid, 2);
+  assert.equal(relocations[0].msgid, m5, 'the identity is the ENVELOPE-adopted one');
+  assert.equal(mail.fetches, 0,
+    'no mining raw was downloaded — the survey ENVELOPE identity sufficed');
+
+  // and apply() completes the reconcile without touching the network either
+  const {summary: s2} = await engine.run({dry: false});
+  assert.equal(s2.failed, 0, 'the run is clean: ' + JSON.stringify(s2));
+  assert.deepStrictEqual(store.moves, [
+    {srcFolder: 'INBOX', dstFolder: 'Trash', uid: 2, keepFmd5: false, flags: null}
+  ], 'the copy was renamed into Trash as its fresh uid');
+  assert.equal(mail.fetches, 0, 'apply added no raw download either');
+}
+
+// ---- scenario O2: headerless fresh mail is still raw-mined -----------------
+// A fresh uid whose ENVELOPE message-id is absent (no Message-ID header —
+// identity is the sha256-of-raw fallback) cannot be adopted from the survey:
+// it must still cost one mining download so cross-folder detection keeps
+// working for such mail.
+{
+  const m7 = await idOf('m7');
+  const headerless = enc.encode('From: a@b.c\r\nSubject: t\r\n\r\nbody\r\n');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[7, 'm7']])],
+    ['Trash', {status: {folder: 'x', exists: true, uidvalidity: 3000, uidnext: 3},
+      rows: new Map([[2, {flags: [], subject: null, from: null, date: null, size: headerless.length, messageId: null}]]),
+      raws: new Map([[2, headerless]])}]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: await idOf('m5'), flags: []}, 7: {msgid: m7, flags: []}
+      }},
+      'Trash': {uidvalidity: 3000, uidnext: 3, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7')),
+      fileEntry(makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')}),
+        5, md5hex('INBOX'), rawOf('m5'))
+    ])],
+    ['Trash', listing([])]
+  ]);
+
+  const mail = mockMail(server);
+  const engine = createSync(mail, mockStore(snapshot, listings), {log: quietLog});
+  const {plan, summary} = await engine.plan();
+  assert.equal(plan.ops.filter(o => o.kind === 'relocate').length, 0,
+    'a headerless fresh uid matches nothing: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(mail.fetches, 1,
+    'the headerless fresh uid was still raw-mined (sha256 fallback needs the bytes)');
+}
+
 // ---- scenario: the folder ignore list --------------------------------------
 // Ignored folders (job-carried `ignores`) are never surveyed, planned or
 // applied — their local mirror copies stay untouched, their snapshot entries

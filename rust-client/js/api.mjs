@@ -545,6 +545,10 @@ export async function createMailApi(cfg) {
                         from: decodeMimeWords(m.from ?? null),
                         date: m.date ?? null,
                         size: m.size ?? null,
+                        // ENVELOPE message-id (core ≥ this build): lets the
+                        // sync engine classify fresh uids without a raw
+                        // download. Older cores simply omit it (null).
+                        messageId: m.messageId ?? null,
                     }))
                     .sort((a, b) => b.uid - a.uid);
                 log(`listFiles(${JSON.stringify(opts ?? {})} uid set ${set}) -> ${out.length} rows (${Date.now() - t0}ms)`);

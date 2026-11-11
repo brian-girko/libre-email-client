@@ -467,7 +467,11 @@ async function rowsFor(name, uidnext, lo = 1) {
         subject: r.subject ?? null,
         from: r.from ?? null,
         date: r.date ?? null,
-        size: r.size ?? null
+        size: r.size ?? null,
+        // ENVELOPE message-id from the summaries fetch (null on older cores
+        // or headerless mail): lets mining classify a fresh uid with zero
+        // extra bytes — the identity already crossed the wire in the survey
+        msgid: r.messageId ?? null
       });
     }
     if (rows.length === 0) {
@@ -794,8 +798,8 @@ async function rowsFor(name, uidnext, lo = 1) {
       emitLog('plan', `${folder}: server move ${uid} → ${toFolder} planned as append+delete (no MOVE)`);
     }
 
-    // ---- mining: every uid that is new on the server gets one raw
-    // download so msgid classification works across folder changes.
+    // ---- mining: every uid that is new on the server gets its msgid
+    // identity recorded so classification works across folder changes.
     // A folder whose mirror is FULLY re-pulled this run (uidvalidity changed
     // or the local dir missing — e.g. a first sync of a new account) is
     // skipped: the plan ignores the snapshot there, so msgid classification
@@ -805,9 +809,10 @@ async function rowsFor(name, uidnext, lo = 1) {
     const raws = new Map();    // `${folder}/${uid}` → raw bytes (apply reuses)
     let budget = RAW_BUDGET;
     const mining = [];
-    // Raw mining is only needed to distinguish a new UID from a server-side
-    // move. If no snapshot message disappeared from its old folder, every
-    // fresh UID is genuinely new and can go straight to the pull scheduler.
+    // Identity mining is only needed to distinguish a new UID from a
+    // server-side move. If no snapshot message disappeared from its old
+    // folder, every fresh UID is genuinely new and can go straight to the
+    // pull scheduler.
     const moveCandidates = [...folders.values()].some(F =>
       !F.resync && !F.localMissing &&
       Object.keys(F.last?.messages ?? {}).some(uid => !F.server.has(Number(uid))));
@@ -832,19 +837,48 @@ async function rowsFor(name, uidnext, lo = 1) {
         }
       }
     }
+    let adoptedTotal = 0;
     for (const F of folders.values()) {
       const fresh = !F.resync && !F.localMissing
         ? [...F.server.keys()].filter(uid => !F.last?.messages?.[uid])
         : [];
       const heal = healUids.get(F.name);
-      const mine = moveCandidates ? fresh : [...(heal ?? [])];
+      // ENVELOPE adoption: the survey's summaries fetch already carries the
+      // ENVELOPE message-id of every row (rowsFor keeps it as `msgid`), so a
+      // fresh uid with a survey identity needs NO download at all — the
+      // classification identity is adopted straight from the survey row.
+      // Only headerless mail (no Message-ID → sha256-of-raw fallback) still
+      // requires a raw download: adopt-and-mine replaces the old mine-all.
+      const adopted = new Map();
+      const mine = (moveCandidates ? fresh : [...(heal ?? [])])
+        .filter(uid => {
+          if (!moveCandidates) {
+            return true;   // heal path always verifies against the raw bytes
+          }
+          const surveyId = F.server.get(uid)?.msgid;
+          if (surveyId) {
+            adopted.set(surveyId, uid);
+            return false;
+          }
+          return true;
+        });
       const state = {F, ids: new Map(), chunks: chunks(mine, miningBatch), total: mine.length, next: 0, done: 0, started: mine.length ? Date.now() : 0};
+      for (const [id, uid] of adopted) {
+        state.ids.set(id, uid);
+      }
       newIds.set(F.name, state.ids);
+      adoptedTotal += adopted.size;
+      if (adopted.size) {
+        emitLog('mining', `${F.name}: ${adopted.size} new message(s) classified from the survey's ENVELOPE message-ids — no download`);
+      }
       if (mine.length) {
         emitLog('mining', `${F.name}: ${mine.length} new message(s) to classify — downloading raws in batches of ${miningBatch}`);
         onProgress?.({phase: 'mining', folder: F.name, done: 0, total: mine.length});
         mining.push(state);
       }
+    }
+    if (adoptedTotal) {
+      emitLog('mining', `envelope-adopted ${adoptedTotal} new message(s) in total — raw downloads only for mail without a Message-ID header`);
     }
     if (!moveCandidates && [...folders.values()].some(F =>
       !F.resync && !F.localMissing && [...F.server.keys()].some(uid =>

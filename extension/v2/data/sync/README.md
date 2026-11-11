@@ -287,7 +287,7 @@ const info = await mail.info();  // {account, secure, dirs, status, selected}
 | `info()` | snapshot: `{account, secure, connected, selected, dirs, status}` |
 | `folders()` | every mailbox: `{name, delimiter, attrs}` |
 | `readDir(name)` | SELECT a dir for the calls below; returns `{folder, exists, uidvalidity, uidnext}` |
-| `listMails({page, pageSize, fromUid, toUid})` | summaries of the open dir, newest first |
+| `listMails({page, pageSize, fromUid, toUid})` | summaries of the open dir, newest first — each row carries `messageId` (the ENVELOPE message-id; `null` on older core builds or headerless mail) |
 | `listThreads()` | JWZ conversations of the open dir |
 | `readMail(uid)` | raw RFC822: `{uid, folder, size, raw: Uint8Array}` |
 | `markMail(uids, add, remove)` | UID STORE flags |
@@ -462,8 +462,10 @@ full during the same sync run. The default quantum can be changed in
 within-quantum concurrency setting. Cross-folder move detection is mined only
 when a previously-synced message disappeared from a folder, and uses larger
 raw batches controlled by `DECISIONS.miningBatch` (default 100, or
-`SYNC_MINING_BATCH`). Otherwise new messages skip mining and go straight to
-the pull scheduler.
+`SYNC_MINING_BATCH`) — but only for fresh uids without an ENVELOPE
+message-id (adopted straight from the survey rows; see *Mining & volume*
+below). Otherwise new messages skip mining and go straight to the pull
+scheduler.
 
 Conflict policy: **server wins**. Local deletions/moves/flag edits
 propagate (real `DELETE`+expunge, `MOVE`, flag STORE); when the server also
@@ -550,14 +552,22 @@ local copy** button does the same on demand (plus a `lastSyncAt = null`
 stamp in storage.local) — use it once if a pull was cut off by the older
 message-grammar bug or the folder layout changes.
 
-**Mining & volume, visibly:** after the survey, the plan mines msgids —
-one raw download per uid the snapshot does not know — for cross-folder
-move detection. Full re-pull folders (uidvalidity changed or the local
-dir missing; a first sync of a new account) are SKIPPED there: the plan
-ignores the snapshot for them, so mining would only double the heaviest
-downloads. The mining pass narrates itself in the log (`(mining INBOX: N
-new message(s) to classify …)` plus a progress line every 10 fetches with
-elapsed time); heavy pulls get a heads-up BEFORE apply (`[plan] INBOX: N
+**Mining & volume, visibly:** after the survey, the plan records the
+identity of every uid the snapshot does not know — for cross-folder move
+detection. Since the wasm core's summaries fetch carries the ENVELOPE
+message-id of every row (surfaced as `messageId` by `listFiles`), a fresh
+uid whose survey row already has that identity is classified with NO
+download at all (envelope adoption); only headerless mail — whose
+identity is the sha256-of-raw fallback — still costs one raw download,
+and only when a previously-synced message actually disappeared from a
+folder (a possible server-side move). Full re-pull folders (uidvalidity
+changed or the local dir missing; a first sync of a new account) are
+SKIPPED entirely: the plan ignores the snapshot for them, so mining
+would only double the heaviest downloads. The mining pass narrates
+itself in the log (`(mining INBOX: N new message(s) to classify …)`
+plus a progress line every 10 fetches with elapsed time, and one
+`envelope-adopted N new message(s) in total` line when adoption skipped
+downloads); heavy pulls get a heads-up BEFORE apply (`[plan] INBOX: N
 message(s), ~size will be fetched from the server` and a run-level
 `heavy sync` warning above ~200 messages / ~50 MB), so a first sync of a
 mailbox full of mail is announced instead of silent. Loop narration is

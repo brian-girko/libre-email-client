@@ -58,6 +58,11 @@ struct MsgSummary {
     from: Option<String>,
     date: Option<String>,
     size: Option<u32>,
+    /// RFC 5322 Message-ID exactly as the server's ENVELOPE carries it
+    /// (angle brackets preserved, surrounding whitespace trimmed). Lets the
+    /// sync engine classify fresh UIDs without downloading full raws.
+    #[serde(rename = "messageId")]
+    message_id: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -183,7 +188,9 @@ impl MailClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Fetch UID+FLAGS+ENVELOPE for a UID set (e.g. "1:500" or "3,7,9").
+    /// Fetch UID+FLAGS+ENVELOPE+SIZE for a UID set (e.g. "1:500" or "3,7,9").
+    /// Each row carries `messageId` (the ENVELOPE message-id, trimmed) so
+    /// callers can identity-match messages without a raw download.
     pub async fn fetch_summaries(&mut self, uid_set: &str) -> Result<JsValue, JsValue> {
         let s = self.session_mut()?;
         let query = "(UID FLAGS ENVELOPE RFC822.SIZE)";
@@ -204,6 +211,13 @@ impl MailClient {
                 from: env.and_then(|e| e.from.as_deref()).map(addr_list_string),
                 date: env.and_then(|e| e.date.as_deref()).map(bytes_to_string),
                 size: f.size,
+                // Same source the threader falls back to (fetch_threads) —
+                // the identity is already on the wire in every ENVELOPE, so
+                // it costs nothing extra to surface it.
+                message_id: env
+                    .and_then(|e| e.message_id.as_deref())
+                    .map(bytes_to_string)
+                    .map(|s| s.trim().to_string()),
             });
         }
         to_value(&out)

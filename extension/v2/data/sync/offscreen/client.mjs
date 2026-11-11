@@ -250,7 +250,8 @@ export function createClient(settings) {
         subject: m.subject,
         from: m.from,
         date: m.date ?? null,
-        size: m.size ?? null
+        size: m.size ?? null,
+        messageId: m.messageId ?? null   // ENVELOPE message-id (null on older cores)
       }));
     },
 
