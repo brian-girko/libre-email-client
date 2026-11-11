@@ -48,14 +48,15 @@
 // the run's new INBOX pulls straight into their filter destinations while
 // they land — like the mail client's own full syncs.
 //
-// Bookkeeping: a service worker never hears its own runtime messages,
-// so the scheduler's submissions pass dirty.mjs's 'sync-request'
-// enqueue clear UNSEEN. The scheduler clears what its jobs will resync
-// itself instead — exactly the submitted dirs after the engine accepted
-// a 'sync-dirs' run (dirty.mjs exports clearDirs for it), the whole
-// account records after a 'sync' was accepted (the same whole-account
-// wipe the enqueue path applies). Manual submissions keep clearing
-// through the eavesdropped 'sync-request'.
+// Bookkeeping: the scheduler's submissions reach the engine directly,
+// and the engine's 'sync-request-accepted' broadcast clears their marks
+// through dirty.mjs at acceptance — the same path every other submitter
+// uses (a merged/folded outcome counts as accepted: a survivor or a
+// covering full run takes the dirs over). The scheduler's own
+// clearDirs()/clearAccount() calls right after its ack stay as an
+// idempotent second wipe; a run that later fails has its marks handed
+// back by the engine's 'sync-pending-dirs' reports, which re-arm the
+// dirty alarm here.
 //
 // Alarms persist beyond the worker's lifetime; the registry does not.
 // On every boot the alarm set is reconciled against the registry and

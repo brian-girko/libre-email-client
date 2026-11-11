@@ -1315,7 +1315,7 @@ function renderBadgeStatus(result) {
     else if (a.count > 0) {
       lines.push(a.label + ': ' + a.count + (a.detail ? ' (' + a.detail + ')' : ''));
       for (const s of (a.subjects || [])) {
-        lines.push(s.subject ? cut(s.subject, 60) : '(no subject)');
+        lines.push(s ? cut(s, 60) : '(no subject)');
       }
       if (a.more > 0) {
         lines.push('… +' + a.more + ' more');
@@ -1347,7 +1347,7 @@ checkBadgeBtn.addEventListener('click', async () => {
     badgeStatusEl.textContent = 'Badge counter is disabled.';
     return;
   }
-  badgeStatusEl.textContent = 'Syncing + checking…';
+  badgeStatusEl.textContent = 'Checking…';
   try {
     const response = await chrome.runtime.sendMessage({type: 'badge-check'});
     if (response?.ok && response.result) {

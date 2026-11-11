@@ -21,7 +21,8 @@
 //                 (the engine's routine finish-of-run broadcast; a landed
 //                 sync's own file writes never report themselves, so finished
 //                 server truth is the moment to recount), and the options
-//                 page's manual {type:'badge-check'} ("Check now").
+//                 page's manual {type:'badge-check'} ("Check now") — which,
+//                 like every other trigger, is a purely local maildir read.
 //   dispatch    — acquire the shared offscreen, run the job, stamp
 //                 chrome.storage.local['badge.last'] (the options status
 //                 line renders it live via storage.onChanged).
@@ -37,14 +38,8 @@
 
 import {ensure} from '/core/offscreen.mjs';
 import {loadAccounts} from '/data/sync/client/accounts.mjs';
-import {syncBadgeDirs} from '/sync-scheduler.mjs';
 
 const COALESCE_MS = 3000;   // an edit burst → one check, not one per rename
-
-// the Check-now sync+count whole-op budget: the sync sweep enqueues into
-// the engine's serial queue, this poll waits for the queue to empty
-const DRAIN_POLL_MS = 1000;
-const DRAIN_CAP_MS = 15 * 60 * 1000;
 
 // the tooltip's subject list: subjects of the mails that contribute to the
 // count, capped with one "+N more" line (Chrome truncates huge titles)
@@ -125,42 +120,6 @@ async function buildJob() {
 }
 
 // ---------------------------------------------------------------- dispatch
-
-/**
- * The sweep only ENQUEUES jobs — wait for the engine's serial queue to
- * finish so the count below reflects server truth (and a settled run's
- * file writes have broadcast 'sync-refresh', touching the recount).
- */
-async function waitDrain() {
-  const t0 = Date.now();
-  let grace = 2;   // a just-closed doc gets a couple of re-checks
-  while (Date.now() - t0 < DRAIN_CAP_MS) {
-    let items = null;
-    try {
-      const res = await chrome.runtime.sendMessage({type: 'sync-ui-init'});
-      items = Array.isArray(res?.items) ? res.items : null;
-    }
-    catch {
-      items = null;   // no engine document (or it just died)
-    }
-    if (items && items.length) {
-      grace = 2;
-    }
-    else {
-      if (items === null) {
-        if (grace-- <= 0) {
-          return;   // document gone for good — beyond rescue here
-        }
-      }
-      else {
-        return;   // queue empty with a live engine doc
-      }
-    }
-    await new Promise(resolve => setTimeout(resolve, DRAIN_POLL_MS));
-  }
-  console.log('[badge] drain cap hit after ' +
-    (Date.now() - t0) / 1000 + 's — counting anyway');
-}
 
 async function runCheck() {
   const job = await buildJob();
@@ -290,24 +249,13 @@ function checkNow() {
 }
 
 function chase(respond) {
-  // Check now acts like the context menu's 'Update Badge Now' first: a
-  // folder-scoped pass over the badge counter's own scope (one
-  // 'sync-dirs' job per badge-enabled account — the badge folder, or the
-  // dirty-store dirs in query mode), the engine queue drained when
-  // anything went out, THEN the count — the badge shows server truth.
-  // The scheduler owns the runs ('...' while going out, '🔑' when a
-  // master password is missing) and every settled run's 'sync-refresh'
-  // the badge reactions below already consume. The drain has to stay:
-  // the sweep's submissions resolve on ENQUEUE — the queue emptying is
-  // the server-truth moment.
+  // The options page's "Check now" is a purely LOCAL read: the count comes
+  // from the maildir message files themselves, no server round-trip and no
+  // sync sweep — the same shape as the scheduled/startup checks below. It
+  // coalesces onto the settled chain so a click while another check runs
+  // never races a second run.
   chain = chain
-    .then(async () => {
-      const accepted = await syncBadgeDirs('badge check');
-      if (accepted) {
-        await waitDrain();
-      }
-      return runCheck();
-    })
+    .then(runCheck)
     .catch(e => {
       console.log('[badge] check failed: ' + (e?.message || e));
       return null;

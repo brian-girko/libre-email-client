@@ -32,10 +32,14 @@
 //                   dirty) — interface jobs never carry filters, their
 //                   behavior is unchanged
 //   sync-job-drop  {rid} → {ok, dropped} — removes ONE pending job from
-//                   the queue (the running one refuses; use sync-stop)
-//   sync-stop                       → the kill path: drops the queued jobs,
-//                   says goodbye to the sync-views (a final log broadcast
-//                   they all receive) and lets the worker close this document
+//                   the queue (the running one refuses; use sync-stop);
+//                   a dropped dir job's marks come back via
+//                   'sync-pending-dirs'
+//   sync-stop                       → the kill path: drops the queued jobs
+//                   (their dir marks come back via 'sync-pending-dirs'
+//                   too), says goodbye to the sync-views (a final log
+//                   broadcast they all receive) and lets the worker close
+//                   this document
 //   sync-confirm   {requestId, ok, reason} → answers a pending purge/drop
 //                  gate (reason:'rejected' = explicit Keep/Cancel; answers
 //                  arrive over the 'sync-confirm' port, sendMessage kept as
@@ -62,13 +66,22 @@
 // the module says so (sync-close + the manager's idle hook) and the manager
 // closes the document itself once no other module has work either.
 //
+// Every accepted job is broadcast back as 'sync-request-accepted'
+// {rid, kind, account:{id, slug}, dir?, dirs?}: the worker's dirty store
+// clears its marks AT ACCEPTANCE — a job the engine never received or
+// rejected keeps them, and the account object carries only the id/slug,
+// never the job's password.
+//
 // Every settled non-dry job ends with a 'sync-refresh' broadcast
 // {accountId, slug}: the writes happened here, so the open mail clients
 // refresh their folder tree and open folder on receipt. The same settled
 // run reports the store's leftover state as 'sync-pending-dirs': every
 // dir left holding interlopers (unclaimed keepFmd5 moves, filter-pass
 // dest dirs) — the worker's dirty store marks them and its scheduler
-// re-arms the resync alarm from that report.
+// re-arms the resync alarm from that report. The same message also hands
+// back the dirs a run FAILED to sync (gate failure, session death,
+// failed member dir) or that a dropped queued job would have synced, so
+// their acceptance clears are undone and the dirty cadence retries them.
 //
 // No session can wedge forever on a network issue: the bridge round-trip
 // at session boot rides a 30 s cap, the facade behind the engine caps
@@ -970,6 +983,47 @@ async function reportPendingMoves(store, account) {
   }
 }
 
+/**
+ * The dirs a DIR-kind job was going to resync — the re-mark feed for
+ * runs that never did their job. Full 'sync'/'discard' jobs and dry
+ * runs return []: the dirty store is dir-level (a whole account cannot
+ * be listed) and dry kinds never cleared marks in the first place.
+ */
+function dirsOfJob(job) {
+  if (job?.kind === 'sync-dirs') {
+    return (job.dirs || []).filter(d => typeof d === 'string' && d);
+  }
+  if (job?.kind === 'sync-dir' && typeof job.dir === 'string' && job.dir) {
+    return [job.dir];
+  }
+  return [];
+}
+
+/**
+ * Hand dirs BACK to the dirty store: a run that never did its job (the
+ * storage gate failed, the session died mid-run, a member dir failed)
+ * must not consume the marks its acceptance cleared. The dirs ride the
+ * regular 'sync-pending-dirs' report — the worker's dirty store re-marks
+ * them (first stamp wins) and the scheduler re-arms the dirty alarm, so
+ * the resync retries on the dirty cadence instead of waiting for the
+ * full one. While a gate stays broken this resubmits the doomed job
+ * every dirty delay: each cycle fails at the pre-network gate check,
+ * and the marks survive until the access is re-granted.
+ */
+function reportUnsynced(job, dirs) {
+  if (!Array.isArray(dirs) || !dirs.length) {
+    return;
+  }
+  broadcast({
+    type: 'sync-pending-dirs',
+    accountId: job?.account?.id,
+    slug: job?.account?.slug,
+    dirs
+  });
+  engineLog('sync', 'unsynced dirs handed back to the dirty store: ' +
+    dirs.join(', '));
+}
+
 // A hanging bridge boot (dead native host, unresponsive worker) is a
 // pre-sync network failure like any other: the round-trip rides a hard
 // cap and the job aborts as 'no-bridge' instead of stalling the drain
@@ -1024,6 +1078,13 @@ async function withSession(job) {
             : 'no granted directory (run the picker)',
         'warn'
       );
+      // nothing synced — the acceptance clears come back (the interloper
+      // scan below cannot run: the store was never opened). A listed dir
+      // that joined the ignore list since it was marked re-marks here and
+      // is skipped-with-a-line on the retry, converging in one cycle.
+      // Full 'sync'/'discard' jobs are NOT re-marked: the store is
+      // dir-level and cannot be enumerated — the full cadence bounds it.
+      reportUnsynced(job, dirsOfJob(job));
       return {started: false, reason: gate.reason};
     }
     account = job.account;    const only = job.kind.endsWith('-dir') ? job.dir : undefined;
@@ -1116,6 +1177,7 @@ async function withSession(job) {
         return {started: true};
       }
       let failed = 0;
+      const failedDirs = [];   // member dirs to hand back to the dirty store
       for (const dir of dirs) {
         engineLog('system', `— ${label} · ${dir} —`, 'system');
         try {
@@ -1149,6 +1211,7 @@ async function withSession(job) {
           }
           else {
             failed++;
+            failedDirs.push(dir);
           }
           // an INBOX member dir filters like every other non-interface
           // sync — kind-shimmed to the full-run filter pass over this
@@ -1166,6 +1229,7 @@ async function withSession(job) {
         }
         catch (e) {
           failed++;
+          failedDirs.push(dir);
           engineLog('warn', `FAILED ${dir}: ` + (e?.stack || e), 'warn');
           // the dir's landed pulls are filtered nonetheless: a run that
           // threw mid-apply may have received several — and they must
@@ -1202,6 +1266,13 @@ async function withSession(job) {
           finishedAt: Date.now()
         });
         engineLog('sync', 'lastSyncAt handed to the service worker');
+      }
+      if (!dry && failedDirs.length) {
+        // the failed member dirs' acceptance clears are undone — they
+        // resync on the dirty cadence (the pending-move scan below only
+        // covers interlopers, not a dir whose run failed). Dry runs
+        // never cleared marks, so they never re-mark either.
+        reportUnsynced(job, failedDirs);
       }
     }
     else {
@@ -1264,6 +1335,12 @@ async function withSession(job) {
           engine.landedInboxUids(),
           {dirty: !(summary.finishedAt && !summary.failed),
             routed: engine.routedInboxUids()});
+        if (!(summary.finishedAt && !summary.failed)) {
+          // the run failed: the dir's acceptance clear is undone — it
+          // resyncs on the dirty cadence (a full 'sync' job re-marks
+          // nothing: dirsOfJob returns [] for it)
+          reportUnsynced(job, dirsOfJob(job));
+        }
       }
     }
     // the state the store is left in decides the next resync: whatever
@@ -1298,6 +1375,10 @@ async function withSession(job) {
       engineLog('warn',
         'failure cleanup FAILED: ' + (e2?.stack || e2), 'warn');
     }
+    // a session-level death: the dir job's acceptance clears come back
+    // whole — over-marking a dir that did sync clean is safe (first
+    // stamp wins, and a clean resync is self-terminating)
+    reportUnsynced(job, dirsOfJob(job));
     return {started: true, reason: 'failed'};
   }
   finally {
@@ -1429,6 +1510,24 @@ function handle(msg) {
         return {ok: true, started: false, reason: 'bad-request'};
       }
       enqueueJob(msg);
+      // acceptance broadcast: the worker's dirty store clears AT
+      // ACCEPTANCE, not at enqueue — a job the engine never received
+      // (the offscreen document would not come up) or rejected above
+      // keeps its marks, and the next dirty alarm retries it. Merged/
+      // folded outcomes count as accepted too: a survivor or a covering
+      // full run takes responsibility for the dirs either way. Sent from
+      // HERE: a service worker never hears its own runtime messages, so
+      // a worker-side broadcast could not reach its own dirty.mjs
+      // listener. The account rides as id/slug only — the job's
+      // password is never re-broadcast.
+      broadcast({
+        type: 'sync-request-accepted',
+        rid: msg.rid ?? null,
+        kind: msg.kind,
+        account: {id: msg.account?.id, slug: msg.account?.slug},
+        dir: msg.dir,
+        dirs: msg.dirs
+      });
       return {ok: true, started: true, queued: queue.length};
     }
     case 'sync-stop': {
@@ -1438,6 +1537,13 @@ function handle(msg) {
       engineLog('kill',
         `sync stopped by the interface — ${queue.length} queued job(s) dropped`, 'warn'
       );
+      // the queued dir jobs' acceptance clears are undone: their marks
+      // come back so the dirty cadence re-picks them (a queued FULL job
+      // cannot be re-marked — the store is dir-level; the full cadence
+      // bounds that loss)
+      for (const job of queue) {
+        reportUnsynced(job, dirsOfJob(job));
+      }
       queue.length = 0;
       if (pendingConfirm) {
         pendingConfirm.resolve(false);
@@ -1459,6 +1565,11 @@ function handle(msg) {
       }
       engineLog('queue',
         `${describeJob(queue[idx])} dropped from the queue by the interface`);
+      // the dropped dir job's acceptance clear is undone: its marks come
+      // back (a merged job's absorbed dirs included — they were cleared
+      // when the job that absorbed them was accepted)
+      const droppedJob = queue[idx];
+      reportUnsynced(droppedJob, dirsOfJob(droppedJob));
       queue.splice(idx, 1);
       emitJobs();
       scheduleDrain();   // re-evaluates the close/idle decision on an

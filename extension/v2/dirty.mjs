@@ -13,17 +13,23 @@
 //                      resync; a dir already on record keeps its original
 //                      timestamp — repeated edits to the same folder are
 //                      no-ops, since the mark is dir-level.
-//   sync-request      {kind, account, dir} → page-sent sync jobs pass
-//                      through this worker, so the store self-clears at
-//                      enqueue: 'sync' and 'discard' wipe the whole
-//                      account, 'sync-dir' removes just that folder,
-//                      'sync-dirs' removes every folder listed in its
-//                      dirs array, and dry runs ('dry', 'dry-dir') are
-//                      ignored — a survey syncs nothing. The store keys
-//                      accounts by the client's slug while a job's
-//                      account object carries the options-page id too —
-//                      both spellings are cleared. The worker's own
-//                      listener answers these; this module only eavesdrops.
+//   sync-request-accepted {kind, account, dir?, dirs?} → the ENGINE's
+//                      acceptance broadcast (offscreen.mjs, fired when a
+//                      job joined the queue — merged/folded outcomes
+//                      included): the store clears AT ACCEPTANCE, not at
+//                      enqueue. A job the engine never received or
+//                      rejected keeps its marks, and a run that later
+//                      fails has them handed back via the engine's
+//                      'sync-pending-dirs' reports. 'sync' and 'discard'
+//                      wipe the whole account, 'sync-dir' removes just
+//                      that folder, 'sync-dirs' removes every folder
+//                      listed in its dirs array; dry kinds never arrive
+//                      (a survey syncs nothing and never broadcasts).
+//                      The store keys accounts by the client's slug
+//                      while a job's account object carries the
+//                      options-page id too — both spellings are cleared
+//                      (the broadcast carries only the account's id and
+//                      slug, never the job's password).
 //   sync-dirty-query  {accountId?} → {ok, dirs} — the read-only report of
 //                      what needs resyncing on the next call:
 //                      {[accountId]: {dir: timestamp}} (one account only
@@ -32,7 +38,9 @@
 //                      when an id is given).
 //   sync-pending-dirs {accountId, slug, dirs} → the engine's ground-truth
 //                      report after a settled sync: every local dir left
-//                      holding interlopers (pending keepFmd5 moves).
+//                      holding interlopers (pending keepFmd5 moves) —
+//                      plus the dirs a failed run or a dropped queued job
+//                      never synced, handed back so their marks survive.
 //                      State decides the mark, not the mutating agent —
 //                      the report is scanned, the listed dirs marked
 //                      (first stamp wins), an empty or unknown-account
@@ -42,9 +50,10 @@
 //
 // The auto-sync scheduler (/sync-scheduler.mjs) submits its jobs straight
 // to the engine — a service worker never hears its own runtime messages,
-// so the 'sync-request' eavesdrop below never fires for them. It clears
-// exactly the submitted dirs through the clearDirs() export instead, once
-// the engine has accepted the job.
+// but the engine's 'sync-request-accepted' broadcast reaches this module
+// from the offscreen document, so scheduled jobs clear through the same
+// acceptance path. The scheduler's own clearDirs()/clearAccount() calls
+// (fired right after its ack) stay as an idempotent second wipe.
 //
 // Records live in chrome.storage.session under one key as
 // {[accountId]: {[dirName]: timestamp}}: browser-session truth that dies
@@ -253,10 +262,14 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       }
       return false;
     }
-    // a real sync job was accepted: everything it will resync leaves the
-    // store now. Dry runs are surveys — ignored. No response: the worker's
-    // own listener owns this message.
-    case 'sync-request':
+    // a real sync job was ACCEPTED (the engine's broadcast, sent after
+    // the job joined the queue): everything it will resync leaves the
+    // store now. A job the engine never saw or rejected never clears —
+    // its marks keep their stamps, and a run that later fails has them
+    // handed back by the engine's 'sync-pending-dirs' reports. Dry runs
+    // are surveys — ignored (and never broadcast). No response: nobody
+    // awaits this.
+    case 'sync-request-accepted':
       if (CLEARABLE.has(msg.kind)) {
         update(async () => {
           const store = await readStore();
@@ -264,7 +277,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
           const cleared = clearJob(store, msg);
           if (JSON.stringify(store) !== before) {
             await writeStore(store);
-            console.log('[dirty] cleared at enqueue:',
+            console.log('[dirty] cleared at acceptance:',
               msg.kind, JSON.stringify(cleared));
           }
         }).catch(() => {});
