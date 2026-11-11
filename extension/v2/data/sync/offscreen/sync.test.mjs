@@ -55,10 +55,13 @@ const idOf = async msgid => await msgidOf(rawOf(msgid));
 function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'} = {}) {
   return {
     fetches: 0,      // raw downloads (readMail/readMails)
+    windows: 0,      // listMails calls — the UID sweeps' cost unit
     current: null,
     // every deleteMail call — {folder, uids}: the no-MOVE fallback's
     // source delete rides the same call the deleteServer op uses
     deletes: [],
+    // every markMail call — {folder, uid, add, remove}
+    marks: [],
     async folders() {
       return [...server.keys()].map(name => ({name, delimiter: '.', attrs: []}));
     },
@@ -67,6 +70,7 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
       return server.get(name).status;
     },
     async listMails({fromUid, toUid}) {
+      this.windows++;
       const rows = [];
       for (const [uid, row] of server.get(this.current).rows) {
         if (uid >= fromUid && uid <= toUid) {
@@ -104,6 +108,8 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
         flags: row.flags, subject: row.subject ?? null,
         from: null, date: null, size: raw.length
       });
+      dir.status.exists = dir.rows.size;
+      dst.status.exists = dst.rows.size;
       return newUid;
     },
     /**
@@ -118,6 +124,25 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
       dst.status.uidnext += 1;
       dst.raws.set(uid, raw);
       dst.rows.set(uid, {flags: flags ?? [], subject: null, from: null, date: null, size: raw.length});
+      dst.status.exists = dst.rows.size;
+      return true;
+    },
+    /** UID STORE flags: the mock folds add/remove into the row's flags */
+    async markMail(uid, add = [], remove = []) {
+      const dir = server.get(this.current);
+      const row = dir.rows.get(Number(uid));
+      if (!row) {
+        throw new Error('mock-fs: no such message');
+      }
+      const set = new Set(row.flags);
+      for (const f of remove ?? []) {
+        set.delete(f);
+      }
+      for (const f of add ?? []) {
+        set.add(f);
+      }
+      row.flags = [...set];
+      this.marks.push({folder: this.current, uid: Number(uid), add, remove});
       return true;
     },
     /** marks \\Deleted and purges: the mock just drops the rows */
@@ -128,6 +153,7 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
         dir.rows.delete(Number(uid));
         dir.raws.delete(Number(uid));
       }
+      dir.status.exists = dir.rows.size;
       this.deletes.push({folder: this.current, uids: list.map(Number)});
       return true;
     }
@@ -229,7 +255,7 @@ const quietLog = () => {};
 // server picture helper: uid → {flags: []}, raws uid → raw
 function dirState(uidvalidity, uidnext, rows) {
   return {
-    status: {folder: 'x', exists: true, uidvalidity, uidnext},
+    status: {folder: 'x', exists: rows.length, uidvalidity, uidnext},
     rows: new Map([...rows].map(([uid, msgid]) =>
       [uid, {flags: [], subject: msgid, from: null, date: null, size: rawOf(msgid).length}])),
     raws: new Map([...rows].map(([uid, msgid]) => [uid, rawOf(msgid)]))
@@ -715,7 +741,7 @@ const rawOfSubject = (msgid, subject) => enc.encode(
 // the filter walk; the engine routes on the raw, never on the row)
 function dirRawState(uidvalidity, uidnext, rows) {
   return {
-    status: {folder: 'x', exists: true, uidvalidity, uidnext},
+    status: {folder: 'x', exists: rows.size, uidvalidity, uidnext},
     rows: new Map([...rows].map(([uid, raw]) =>
       [uid, {flags: [], subject: null, from: null, date: null, size: raw.length}])),
     raws: new Map(rows)
@@ -1488,10 +1514,243 @@ const emptyFolders = () => ({
   }], 'the kept marker paired with the fresh uid and renamed in place');
   assert.equal(summary.keptLocalMoves, 1, 'the copy was kept (no re-download)');
   assert.equal(mail.fetches, 0, 'no message was re-fetched');
+  assert.equal(mail.windows, 2,
+    'one pre-survey window (INBOX) + ONE delta window (the destination\'s ' +
+    'fresh-uid region) — no second full sweep of either folder');
   assert.equal(summary.warnings, 0, 'no unmatched-marker warning');
   assert.equal(store.saved.length, 1, 'the snapshot committed');
   assert.equal(store.saved[0].folders['Silent.Broken Links'].messages[11].msgid, m5,
     'the snapshot carries the moved message under its fresh uid');
+}
+
+// ---- post-apply sweep derivation ------------------------------------------
+// The old shape re-swept the WHOLE uid space of every folder after apply.
+// The post pass now derives most of its state from the pre-survey rows plus
+// this run's own ops, guarded by two free SELECT counters (uidnext only
+// grows via APPEND, exists only shrinks via EXPUNGE) — either tripping
+// falls back to the honest full sweep.
+
+// ---- scenario P1: steady state — the post pass sweeps NOTHING -------------
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the steady-state run is clean');
+  assert.equal(mail.windows, 1,
+    'one pre-survey window, ZERO post-apply windows: ' + mail.windows);
+  assert.equal(mail.fetches, 0, 'nothing was re-fetched');
+  assert.equal(store.saved.length, 1, 'the snapshot committed');
+  assert.deepEqual(Object.keys(store.saved[0].folders.INBOX.messages), ['5', '7'],
+    'the snapshot is unchanged');
+}
+
+// ---- scenario P2: an append op → exactly ONE delta window ------------------
+// The uploaded message's fresh uid (server-assigned) is discovered by a
+// sweep of just the fresh-uid region, and the canonical copy is re-pulled
+// as an arrival (the same post-pull the full sweep used to trigger).
+{
+  const m9 = await idOf('m9');
+  const m20 = await idOf('m20');
+  const server = new Map([
+    ['INBOX', dirState(1000, 10, [[9, 'm9']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 10, messages: {
+        9: {msgid: m9, flags: []}
+      }}
+    }
+  };
+  const dupName = makeFilename('INBOX', 9, [], {unique: 'dup1', fmd5: md5hex('INBOX')});
+  const loser = fileEntry(dupName, 9, md5hex('INBOX'), rawOf('m20'));
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f9', 9, md5hex('INBOX'), rawOf('m9'))])]
+  ]);
+  listings.get('INBOX').excluded.push(loser);
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the append run is clean');
+  assert.equal(summary.pushed, 1, 'the upload happened');
+  assert.equal(mail.windows, 2,
+    'one pre-survey window + ONE delta window over [10, 11): ' + mail.windows);
+  assert.equal(mail.fetches, 1,
+    'the uploaded copy is re-pulled once (the canonical post-pull)');
+  const msgs = store.saved[0].folders.INBOX.messages;
+  assert.equal(msgs[9]?.msgid, m9, 'the tracked message keeps its record');
+  assert.equal(msgs[10]?.msgid, m20,
+    'the uploaded message\'s fresh uid reached the snapshot');
+}
+
+// ---- scenario P3: flagsServer — folded into the snapshot, zero windows -----
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}
+      }}
+    }
+  };
+  // the local file carries \\Seen where the snapshot says plain: a local
+  // flag edit → pushed to the server as a flagsServer op
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5'), ['\\Seen'])
+    ])]
+  ]);
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the flags run is clean');
+  assert.equal(summary.serverFlagChanges, 1, 'the STORE happened');
+  assert.deepEqual(mail.marks, [{folder: 'INBOX', uid: 5, add: ['\\Seen'], remove: []}],
+    'the server saw the flag edit');
+  assert.equal(mail.windows, 1,
+    'one pre-survey window, ZERO post-apply windows: ' + mail.windows);
+  assert.deepEqual(store.saved[0].folders.INBOX.messages[5].flags, ['\\Seen'],
+    'the snapshot folded this run\'s own STORE into the derived rows');
+}
+
+// ---- scenario P4: a third-party APPEND mid-run → honest full re-sweep ------
+// Another client appends a message between the pre-survey and the post
+// pass: uidnext moves beyond this run's own appends, the invariant trips,
+// and the post pass re-sweeps the whole folder — the arrival is pulled
+// exactly as the full-sweep shape always did.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const m10 = await idOf('m10');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+
+  const mail = mockMail(server);
+  const baseListMails = mail.listMails.bind(mail);
+  let sweeps = 0;
+  mail.listMails = async opts => {
+    const rows = await baseListMails(opts);
+    if (++sweeps === 1) {
+      // a third-party client appends right after the pre-survey sweep
+      const dir = server.get('INBOX');
+      dir.raws.set(10, rawOf('m10'));
+      dir.rows.set(10, {flags: [], subject: m10, from: null, date: null,
+        size: rawOf('m10').length});
+      dir.status.uidnext = 11;
+      dir.status.exists = dir.rows.size;
+    }
+    return rows;
+  };
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.equal(mail.windows, 2,
+    'the tripped invariant fell back to a full post sweep: ' + mail.windows);
+  assert.equal(mail.fetches, 1, 'the third-party arrival was pulled');
+  const msgs = store.saved[0].folders.INBOX.messages;
+  assert.deepEqual(Object.keys(msgs).sort(), ['10', '5', '7'],
+    'the snapshot describes all three server rows');
+  assert.equal(msgs[10].msgid, m10, 'the arrival keeps its identity');
+}
+
+// ---- scenario P5: a third-party EXPUNGE mid-run → honest full re-sweep -----
+// Another client deletes a message between the pre-survey and the post
+// pass: exists drops beyond this run's own removals, the invariant trips,
+// and the post pass re-sweeps — the snapshot drops the vanished uid exactly
+// as the full-sweep shape always did.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+
+  const mail = mockMail(server);
+  const baseListMails = mail.listMails.bind(mail);
+  let sweeps = 0;
+  mail.listMails = async opts => {
+    const rows = await baseListMails(opts);
+    if (++sweeps === 1) {
+      // a third-party client expunges uid 7 right after the pre-survey
+      const dir = server.get('INBOX');
+      dir.rows.delete(7);
+      dir.raws.delete(7);
+      dir.status.exists = dir.rows.size;
+    }
+    return rows;
+  };
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.equal(mail.windows, 2,
+    'the tripped invariant fell back to a full post sweep: ' + mail.windows);
+  assert.deepEqual(Object.keys(store.saved[0].folders.INBOX.messages), ['5'],
+    'the snapshot dropped the uid the server no longer serves');
 }
 
 console.log('sync.test: all scenarios pass');

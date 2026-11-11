@@ -407,8 +407,22 @@ files.
 
 Server surveys page the UID space with an adaptive stride: dense folders
 page 500 uids per call; an empty window means a gap of expunged uids and
-the stride quadruples (up to 16k) — windows always tile `[1, uidnext)` as a
-partition, so nothing can be skipped regardless of stride changes.
+the stride quadruples (up to 16k) — windows always tile `[lo, uidnext)` as a
+partition, so nothing can be skipped regardless of stride changes. Empty
+folders (SELECT's `EXISTS` = 0) skip the sweep entirely.
+
+The **post-apply pass no longer re-sweeps the whole UID space**. In the
+steady case its rows are *derived*: the pre-survey rows folded with this
+run's own successful ops (appends, deletions, flag STOREs), plus at most one
+small delta sweep over the fresh-uid region — where the server assigned uids
+to this run's APPENDs. The derivation is guarded by two free SELECT
+counters: `uidnext` grows only via APPEND (the engine knows its own append
+count per folder) and `EXISTS` only shrinks via EXPUNGE. Either invariant
+tripping — another client appended, expunged or moved mail mid-run — falls
+back to an honest full re-sweep, the pre-derivation behavior. The one
+invisible case is a third-party *flag-only* STORE during the run window; the
+next run's pre-survey diff heals it, the same staleness window the
+pre-survey itself accepts for the run's duration.
 
 **Keyword handling:** unencodable IMAP keywords (`$Filtered`, …) never hit
 filenames and are never "ignored": `\Recent` (a session pseudo-flag) is

@@ -446,16 +446,17 @@ export function createSync(mail, store, {account = null, log = console.log, onPr
  *  Sweeps the full UID space with an adaptive stride: 500 rows per call in
  *  dense areas; every empty window implies a gap of expunged uids, so the
  *  stride quadruples (up to UID_STRIDE_MAX) until mail shows up again.
- *  Windows always tile [1, uidnext) without overlap (next lo is always the
+ *  Windows always tile [lo, uidnext) without overlap (next lo is always the
  *  previous hi + 1), so changing stride can never skip or double-cover a
  *  range. The stride is learned per folder and reset at the 500 floor for
  *  each folder: dense folders always page small, sparse gaps are skipped
  *  logarithmically, and per-call memory stays bounded for million-mail
- *  folders. */
-async function rowsFor(name, uidnext) {
+ *  folders. Delta sweeps (the post-apply pass's fresh-uid region) start at
+ *  `lo` > 1 and pay one window for the small range instead of tiling the
+ *  whole space. */
+async function rowsFor(name, uidnext, lo = 1) {
   const out = new Map();
   const high = uidnext - 1;
-  let lo = 1;
   let stride = UID_WINDOW;
   while (lo <= high) {
     const hi = Math.min(lo + stride - 1, high);
@@ -483,7 +484,7 @@ async function rowsFor(name, uidnext) {
   /**
    * The full server+local picture in one read-only pass.
     * @returns {Promise<{snap, folders: Map<string,Folder>, localOnly: string[]}>}
-    *   Folder: {name, uidvalidity, uidnext, server, last, resync, local, localMissing}
+    *   Folder: {name, uidvalidity, uidnext, exists, server, last, resync, local, localMissing}
     */
   async function surveyNow() {
     const snap = await store.loadState();
@@ -534,7 +535,11 @@ async function rowsFor(name, uidnext) {
       const st = await select(f.name);
       const uidvalidity = Number(st?.uidvalidity || 0);
       const uidnext = Number(st?.uidnext || 0);
-      const server = await rowsFor(f.name, uidnext);
+      // SELECT's EXISTS: the live message count. Drives the empty-folder
+      // skip below (no windows at all) and anchors the post-apply pass's
+      // derived-rows invariant (postRows checks it against the sweep).
+      const exists = Number(st?.exists || 0);
+      const server = exists ? await rowsFor(f.name, uidnext) : new Map();
       const current = snap.folders[f.name] ?? null;
       const resync = !!current?.uidvalidity && Number(current.uidvalidity) !== uidvalidity;
       store.delimiter = f.delimiter || '/';
@@ -549,6 +554,7 @@ async function rowsFor(name, uidnext) {
         delimiter: f.delimiter || '/',
         uidvalidity,
         uidnext,
+        exists,
         server,
         last: current,
         resync,
@@ -1637,6 +1643,32 @@ async function rowsFor(name, uidnext) {
     // fresh destination uid and renames it in place — the copy stays local,
     // no re-download
     const movedKeeps = [];
+    // Server-row mutations THIS run made, per folder — the post-apply pass
+    // derives most of its state from these instead of re-sweeping the whole
+    // UID space (see postRows below). `appends` counts messages this run
+    // APPENDed (the server assigns the fresh uid — the delta sweep finds
+    // it), `removals` lists uids this run expunged or moved away,
+    // `flagDeltas` folds each successful STORE. Only successful ops record:
+    // a failed op leaves the snapshot uncommitted and must not shift the
+    // counters the derivation checks (a shifted counter would just fall
+    // back to the honest full sweep — safe, but pointless).
+    const serverAppends = new Map();     // folder → count
+    const serverRemovals = new Map();    // folder → Set<uid>
+    const serverFlagDeltas = new Map();  // folder → Map<uid, [{add, remove}]>
+    const serverAppend = name =>
+      serverAppends.set(name, (serverAppends.get(name) ?? 0) + 1);
+    const serverRemove = (name, uid) => {
+      const set = serverRemovals.get(name) ??
+        (serverRemovals.set(name, new Set()).get(name));
+      set.add(Number(uid));
+    };
+    const serverFlags = (name, uid, add, remove) => {
+      const byUid = serverFlagDeltas.get(name) ??
+        (serverFlagDeltas.set(name, new Map()).get(name));
+      const list = byUid.get(Number(uid)) ??
+        (byUid.set(Number(uid), []).get(Number(uid)));
+      list.push({add: add ?? [], remove: remove ?? []});
+    };
     // pull order follows the survey's INBOX-first, smallest-first ranking;
     // the round-robin scheduler below gives each folder a fair quantum.
     const folderRank = new Map([...survey.folders.keys()].map((name, i) => [name, i]));
@@ -1945,6 +1977,7 @@ async function rowsFor(name, uidnext) {
           emitLog('apply', label);
           for (const sop of seg) {
             counted(sop);
+            serverRemove(sop.folder, sop.uid);
           }
         }
         catch (e) {
@@ -1963,6 +1996,7 @@ async function rowsFor(name, uidnext) {
               await select(sop.folder, {force: true});
               await mail.deleteMail(Number(sop.uid));
               counted(sop);
+              serverRemove(sop.folder, sop.uid);
             }
             catch (e2) {
               if (fetchTimedOut(e2)) {
@@ -2028,6 +2062,7 @@ async function rowsFor(name, uidnext) {
             const raw = await store.readFile(op.entry);
             await select(op.folder, {force: true});
             await mail.uploadMail(op.folder, raw, op.flags ?? []);
+            serverAppend(op.folder);
             await store.removeMessage(op.entry);
             emitLog('apply', `uploaded ${op.folder}/${op.fileName ?? 'file'} (${raw.byteLength} bytes); canonical copy arrives with the post-pull`);
             break;
@@ -2036,6 +2071,7 @@ async function rowsFor(name, uidnext) {
             await select(op.folder, {force: true});
             try {
               await mail.markMail(Number(op.uid), op.add, op.remove);
+              serverFlags(op.folder, op.uid, op.add, op.remove);
             }
             catch (e) {
               // a server without keyword support rejects keyword STOREs:
@@ -2053,6 +2089,9 @@ async function rowsFor(name, uidnext) {
                 (op.add ?? []).filter(f => !star(f)),
                 (op.remove ?? []).filter(f => !star(f))
               );
+              serverFlags(op.folder, op.uid,
+                (op.add ?? []).filter(f => !star(f)),
+                (op.remove ?? []).filter(f => !star(f)));
               try {
                 const prefs = await store.loadPrefs();
                 if (prefs.starKeywords !== false) {
@@ -2080,6 +2119,7 @@ async function rowsFor(name, uidnext) {
               const raw = await store.readFile(op.entry);
               await select(op.toFolder, {force: true});
               await mail.uploadMail(op.toFolder, raw, op.flags ?? []);
+              serverAppend(op.toFolder);
               // the pairing must see the kept marker even when the delete
               // below fails: the message is already served in the destination
               movedKeeps.push({
@@ -2091,6 +2131,7 @@ async function rowsFor(name, uidnext) {
               emitLog('apply', `no-MOVE fallback: appended ${op.folder}/${op.uid} → ${op.toFolder} (${raw.byteLength} bytes)`);
               await select(op.folder, {force: true});
               await mail.deleteMail(Number(op.uid));
+              serverRemove(op.folder, op.uid);
               emitLog('apply', `server move ${op.folder}/${op.uid} → ${op.toFolder} (append+delete)`);
               break;
             }
@@ -2118,6 +2159,10 @@ async function rowsFor(name, uidnext) {
               }
               throw e;
             }
+            // the source uid is gone, the server assigned a fresh one in the
+            // destination — both feed the post-apply derivation
+            serverRemove(op.folder, op.uid);
+            serverAppend(op.toFolder);
             // keep the pending-move file: the server assigned the message a
             // NEW uid in the destination, and the post-apply pass below
             // pairs the kept copy with it and renames the file in place —
@@ -2226,6 +2271,74 @@ async function rowsFor(name, uidnext) {
       }
     }
 
+    /**
+     * The post-apply server rows for one folder. In the steady case this is
+     * DERIVED, not swept: the pre-survey rows folded with this run's own
+     * successful ops, plus one small delta sweep over just the fresh uid
+     * region — instead of a second full UID-space sweep per folder (the
+     * pre- and post-sweeps dominate large-mailbox runs). The derivation is
+     * proven safe by two free SELECT counters: uidnext grows only via
+     * APPEND (this run knows its own append count) and exists shrinks only
+     * via EXPUNGE — either invariant tripping (another client mutated the
+     * folder mid-run, or a failed op shifted the real counts) falls back to
+     * the honest full sweep, exactly as before. A third-party FLAG-only
+     * STORE mid-run is the one invisible case; the next run's pre-survey
+     * diff heals it (the same staleness window the pre-survey itself
+     * accepts for the run's duration).
+     */
+    async function postRows(F, st, uidnext) {
+      if (Number(st?.exists || 0) === 0) {
+        return new Map();   // nothing lives here — no windows at all
+      }
+      const nAppends = serverAppends.get(F.name) ?? 0;
+      const removed = serverRemovals.get(F.name) ?? new Set();
+      // F.exists (the pre-survey SELECT's EXISTS) must equal the swept row
+      // count — a drift means the pre-survey itself is incomplete, so only
+      // a full sweep can be trusted
+      if ((F.exists ?? F.server.size) !== F.server.size ||
+          Number(st.exists) !== F.exists - removed.size + nAppends ||
+          uidnext !== F.uidnext + nAppends) {
+        emitLog('post', `${F.name}: server moved outside this run's ops — post rows re-swept`);
+        return rowsFor(F.name, uidnext);
+      }
+      // fold this run's STOREs onto the pre-survey rows
+      const post = new Map();
+      const deltas = serverFlagDeltas.get(F.name);
+      for (const [uid, row] of F.server) {
+        if (removed.has(uid)) {
+          continue;
+        }
+        const folds = deltas?.get(uid);
+        if (folds) {
+          const set = new Set(row.flags ?? []);
+          for (const d of folds) {
+            for (const f of d.remove) {
+              set.delete(f);
+            }
+            for (const f of d.add) {
+              set.add(f);
+            }
+          }
+          post.set(uid, {...row, flags: [...set]});
+        }
+        else {
+          post.set(uid, row);
+        }
+      }
+      // the delta sweep: just the fresh uid region (this run's own APPENDs
+      // land here too — their server-assigned uids, flags and sizes come
+      // back exactly the way a full sweep used to deliver them)
+      if (uidnext > F.uidnext) {
+        for (const [uid, row] of await rowsFor(F.name, uidnext, F.uidnext)) {
+          post.set(uid, row);
+        }
+      }
+      emitLog('post', `${F.name}: post rows derived from the survey + this run's ops` +
+        (uidnext > F.uidnext ? ' (plus a delta sweep of the fresh uid region)'
+          : ' (no sweep needed)'));
+      return post;
+    }
+
     // post-apply survey: the truth the snapshot must now describe; anything
     // new also gets pulled right away (e.g. a moved message's fresh uid in
     // its destination folder). readDir() again — uidnext/uidvalidity may
@@ -2278,7 +2391,10 @@ async function rowsFor(name, uidnext) {
       const st = await select(F.name);
       const uidvalidity = Number(st?.uidvalidity || 0);
       const uidnext = Number(st?.uidnext || 0);
-      const post = await rowsFor(F.name, uidnext);
+      // post-apply rows: derived from the survey + this run's ops when the
+      // SELECT counters prove nobody else touched the folder (the common
+      // case — no second full sweep), a full re-sweep otherwise
+      const post = await postRows(F, st, uidnext);
       postServers.set(F.name, post);
       if (!restricted) {
         await store.writeUidValidity(F.name, uidvalidity);
