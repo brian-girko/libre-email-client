@@ -38,9 +38,12 @@
 //            run (the engine's 'sync-synced' broadcast) wipes the
 //            strikes. Connectivity is part of the loop: an offline
 //            browser skips the submit (a doomed job would only burn
-//            the engine's connect timeout), and connectivity returning
-//            pulls every armed full alarm forward to the retry delay —
-//            strike-informed, so a flapping network backs off too. A
+//            the engine's connect timeout) and waits out its cadence —
+//            with one shortcut: a return from idle/locked (a real
+//            worker wake; service workers never receive the web's
+//            'online' event) pulls every armed full alarm forward to
+//            the retry delay, strike-informed, so a flapping network
+//            backs off too. A
 //            manual full sync
 //            (client combo or sync interface — both arrive as a
 //            'sync-request', which this module eavesdrops on) resets
@@ -87,10 +90,11 @@
 // cadence armed the moment it exists — boot reconcile only saw the old
 // registry. The engine's post-run 'sync-pending-dirs' state report re-arms
 // the account's dirty alarm, so dirs left holding pending moves resync on
-// the dirty cadence. Connectivity joining ('online' on the worker's
-// global scope) pulls every armed full alarm forward to the strike-backed
-// retry delay — the accounts that skipped or failed while offline stop
-// waiting out their cadence.
+// the dirty cadence. A return from idle/locked pulls every armed full
+// alarm forward to the strike-backed retry delay — the accounts that
+// skipped or failed while offline stop waiting out their cadence (a
+// worker wake: the web's 'online' event never reaches a service
+// worker, and cannot wake one).
 // The context menu adds two more: a full sweep ('Sync Now') and a badge
 // sweep ('Update Badge Now' — syncBadgeDirs, one 'sync-dirs' job per
 // badge-enabled account over its badge-defined folder, or over the
@@ -133,8 +137,8 @@ const MIN_FULL_S = 300;
 
 // the failure-retry floor: a FIRST failed full run retries a minute out
 // instead of a full cadence later (Chrome delays alarm delivery below
-// 30s, so the pull-forward — and the online listener's re-arm — never
-// sit under an undeliverable delay)
+// 30s, so the pull-forward and every retry re-arm never sit under an
+// undeliverable delay)
 const RETRY_S = 60;
 
 // return-from-idle trigger threshold: 10 minutes of inactivity — the
@@ -484,9 +488,11 @@ async function submitFull(acc, cfg, tag, passValue) {
     return;   // unresolvable password: skipped, retried next cycle
   }
   // offline: the engine would accept the job and die on the IMAP
-  // connect — skip here, the online listener pulls the (already
-  // re-armed) alarm forward the moment connectivity returns. navigator
-  // is read fail-open: an environment without it (tests) runs as online.
+  // connect — skip here; the run waits out its cadence unless a wake
+  // (an idle/locked return, or the next startup) pulls the already
+  // re-armed alarm forward to the retry delay (catchUpOverdueFulls).
+  // navigator is read fail-open: an environment without it (tests)
+  // runs as online.
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     dlog('scheduler', '[scheduler]', tag, acc.name || acc.id,
       '— offline, skipping this cycle');
@@ -890,6 +896,62 @@ booting.then(async () => {
   knownAccounts = (await registry()).map(a => a.id);
 }).catch(() => {});
 
+// An offline skip waits out its cadence by default; this pulls it
+// short. Service workers never see the web's 'online' event (it is not
+// in the ServiceWorkerGlobalScope event list, and a terminated worker
+// has no event loop for the spec's global task to fire into), so the
+// catch-up rides the wake reasons the worker DOES get: the idle/locked
+// return below and the startup sweep. When the worker is awake and
+// online, every armed full alarm whose wait outlasts the
+// strike-informed retry delay is pulled forward — an account that
+// skipped for being offline retries within the minute once someone is
+// back, without touching the "re-arm first" semantics of the runs (no
+// immediate sweep: the pulled alarm fires into the regular chain).
+// Strike-informed, so a flapping network cannot defeat the failure
+// backoff: an account with strikes pulls forward only to the SAME
+// delay its failures already backed off to. Only forward: an alarm due
+// sooner than the retry delay — or already overdue (a slept machine's
+// alarms deliver on resume) — is left alone.
+async function catchUpOverdueFulls(cause) {
+  await booting;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return;   // still offline: nothing to pull
+  }
+  const cfg = await settings();
+  if (!cfg.enabled || !cfg.fullEnabled) {
+    return;   // periodic full syncs disabled: the cadence is not ours
+  }
+  const accounts = await registry();
+  const fullAlarms = (await chrome.alarms.getAll().catch(() => []))
+    .filter(a => a.name.startsWith(FULL_PREFIX));
+  if (!fullAlarms.length) {
+    return;
+  }
+  const streaks = await readStreaks(FULL_STREAK_KEY);
+  let pulled = 0;
+  for (const alarm of fullAlarms) {
+    const id = alarm.name.slice(FULL_PREFIX.length);
+    const acc = findAccount(accounts, id);
+    if (!acc) {
+      continue;   // stale: jobFull drops it when it fires
+    }
+    const delay = retryMs(RETRY_S * 1000, cfg.fullMs,
+      Number(streaks[id]) || 0);
+    // only pull FORWARD: an alarm due sooner than the retry delay
+    // would be pushed back by a re-arm — leave that one alone
+    if (alarm.scheduledTime &&
+        alarm.scheduledTime - Date.now() <= delay) {
+      continue;
+    }
+    await armFull(acc.id, delay, cause + ' ' + acc.id).catch(() => {});
+    pulled++;
+  }
+  if (pulled) {
+    dlog('scheduler', '[scheduler]', cause, '— pulled', pulled,
+      'overdue full alarm(s) forward');
+  }
+}
+
 // -------------------------------------------------------------- listeners
 
 chrome.alarms.onAlarm.addListener(alarm => {
@@ -913,12 +975,14 @@ chrome.runtime.onStartup.addListener(() => {
       dlog('scheduler', '[scheduler] startup sync failed:', e?.message || e));
 });
 
-// the computer came back from idle/locked: a badge sweep ('Update Badge
-// Now') on the transition only — the badge folders resync, the full
-// cadence keeps its own rhythm (no re-arm here). The previous idle state
-// lives in chrome.storage.session (a service worker restarts lose memory);
-// with no recorded state the event is just noted — a fresh worker must
-// not guess a transition.
+// the computer came back from idle/locked: the offline catch-up
+// (catchUpOverdueFulls — a real worker wake, so accounts that skipped
+// for being offline stop waiting out their cadence) and a badge sweep
+// ('Update Badge Now'), on the transition only. The full cadence keeps
+// its own rhythm beyond the catch-up (no extra re-arm here). The
+// previous idle state lives in chrome.storage.session (a service worker
+// restarts lose memory); with no recorded state the event is just
+// noted — a fresh worker must not guess a transition.
 const IDLE_STATE = 'sync.auto.idleState';
 
 chrome.idle.onStateChanged.addListener(state => {
@@ -930,6 +994,12 @@ chrome.idle.onStateChanged.addListener(state => {
         (previous !== 'idle' && previous !== 'locked')) {
       return;
     }
+    // the transition itself is a real worker wake: run the offline
+    // catch-up even when the badge sweep is disabled — its gate is the
+    // full cadence's (enabled + fullEnabled), not idleEnabled's
+    await catchUpOverdueFulls('idle end').catch(e =>
+      dlog('scheduler', '[scheduler] idle catch-up failed:',
+        e?.message || e));
     const cfg = await settings();
     if (!cfg.enabled || !cfg.idleEnabled) {
       return;   // idle syncs disabled since the wake: no sweep
@@ -956,60 +1026,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
   })().catch(e =>
     dlog('scheduler', '[scheduler] master-pass sweep failed:',
       e?.message || e));
-});
-
-// connectivity returned: every armed full alarm whose wait outlasts the
-// retry floor is pulled forward to the strike-backed retry delay — an
-// account that skipped for being offline (or whose cadence has many
-// minutes left) retries within the minute, without touching the
-// "re-arm first" semantics of the runs themselves (no immediate sweep:
-// the pulled alarm fires into the regular chain). Strike-informed, so a
-// flapping network cannot defeat the failure backoff: an account with
-// strikes pulls forward only to the SAME delay its failures already
-// backed off to. Registered on the worker's global scope (the same
-// EventTarget 'online' is dispatched on) at top level, so the event
-// wakes a terminated worker.
-globalThis.addEventListener?.('online', () => {
-  (async () => {
-    await booting;
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      return;   // a flap settling offline again: nothing to pull
-    }
-    const cfg = await settings();
-    if (!cfg.enabled || !cfg.fullEnabled) {
-      return;   // periodic full syncs disabled: the cadence is not ours
-    }
-    const accounts = await registry();
-    const fullAlarms = (await chrome.alarms.getAll().catch(() => []))
-      .filter(a => a.name.startsWith(FULL_PREFIX));
-    if (!fullAlarms.length) {
-      return;
-    }
-    const streaks = await readStreaks(FULL_STREAK_KEY);
-    let pulled = 0;
-    for (const alarm of fullAlarms) {
-      const id = alarm.name.slice(FULL_PREFIX.length);
-      const acc = findAccount(accounts, id);
-      if (!acc) {
-        continue;   // stale: jobFull drops it when it fires
-      }
-      const delay = retryMs(RETRY_S * 1000, cfg.fullMs,
-        Number(streaks[id]) || 0);
-      // only pull FORWARD: an alarm due sooner than the retry delay
-      // would be pushed back by a re-arm — leave that one alone
-      if (alarm.scheduledTime &&
-          alarm.scheduledTime - Date.now() <= delay) {
-        continue;
-      }
-      await armFull(acc.id, delay, 'online ' + acc.id).catch(() => {});
-      pulled++;
-    }
-    if (pulled) {
-      dlog('scheduler', '[scheduler] online — pulled', pulled,
-        'full alarm(s) forward');
-    }
-  })().catch(e =>
-    dlog('scheduler', '[scheduler] online re-arm failed:', e?.message || e));
 });
 
 // a new account appeared (the options page writes plain 'accounts'; the
