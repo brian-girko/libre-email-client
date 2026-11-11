@@ -56,7 +56,13 @@
 // clearDirs()/clearAccount() calls right after its ack stay as an
 // idempotent second wipe; a run that later fails has its marks handed
 // back by the engine's 'sync-pending-dirs' reports, which re-arm the
-// dirty alarm here.
+// dirty alarm here. Each such report counts as one strike against the
+// account: a dir whose pending state KEEPS failing (a core build without
+// the MOVE export, a wedged gate) would otherwise resubmit the same
+// doomed job every base delay forever, so consecutive strikes double the
+// delay up to the full cadence. Any clean run (the engine's
+// 'sync-synced' broadcast) wipes the strikes — recovery is instant and
+// one-off failures never back off.
 //
 // Alarms persist beyond the worker's lifetime; the registry does not.
 // On every boot the alarm set is reconciled against the registry and
@@ -192,6 +198,50 @@ function armFull(id, fullMs, tag) {
 
 function armDirty(id, delayMs, tag) {
   return rearm(DIRTY_PREFIX + id, delayMs, tag || 'dirty rearm ' + id);
+}
+
+// ------------------------------------------------------------ strikes
+
+// Consecutive pending-dirs strikes per armed key, persisted in session
+// storage (a worker restart between cycles must not forget them). Strike
+// N arms the dirty alarm at delayMs × 2^(N−1), capped at the full
+// cadence: a permanently failing dir settles into the full-sync rhythm
+// instead of hammering every base delay, while the first report of a
+// failing state still retries at the base delay.
+const STREAK_KEY = 'sync.auto.pendingStreaks';
+
+/** one more strike for the key; storage failure degrades to strike 1 */
+async function bumpStreak(key) {
+  try {
+    const res = await chrome.storage.session.get(STREAK_KEY);
+    const streaks = res?.[STREAK_KEY] || {};
+    const n = (Number(streaks[key]) || 0) + 1;
+    await chrome.storage.session.set(
+      {[STREAK_KEY]: {...streaks, [key]: n}});
+    return n;
+  }
+  catch {
+    return 1;
+  }
+}
+
+/** wipe the strikes of every key spelling the account may be armed under */
+async function resetStreaks(keys) {
+  try {
+    const res = await chrome.storage.session.get(STREAK_KEY);
+    const streaks = res?.[STREAK_KEY] || {};
+    let changed = false;
+    for (const key of keys) {
+      if (key in streaks) {
+        delete streaks[key];
+        changed = true;
+      }
+    }
+    if (changed) {
+      await chrome.storage.session.set({[STREAK_KEY]: streaks});
+    }
+  }
+  catch {}
 }
 
 /** whether an alarm name is one of ours (other modules' are untouched) */
@@ -878,7 +928,10 @@ chrome.runtime.onMessage.addListener(msg => {
     case 'sync-pending-dirs': {
       // the engine's post-run state report: dirs left holding pending
       // moves were marked by dirty.mjs — re-arm that account's dirty
-      // alarm one delay out, so the store's leftovers resync soon
+      // alarm one delay out, so the store's leftovers resync soon. The
+      // report is also a strike: consecutive reports of the SAME failing
+      // state back the delay off exponentially (see bumpStreak) instead
+      // of resubmitting a doomed job every base delay.
       if (Array.isArray(msg.dirs) && msg.dirs.length) {
         const key = typeof msg.slug === 'string' && msg.slug
           ? msg.slug
@@ -890,13 +943,35 @@ chrome.runtime.onMessage.addListener(msg => {
             if (!cfg.enabled || !cfg.dirtyEnabled) {
               return;
             }
-            await armDirty(key, cfg.delayMs, 'pending dirs ' + key);
+            const strikes = await bumpStreak(key);
+            const delay = Math.min(
+              cfg.delayMs * 2 ** (strikes - 1), cfg.fullMs);
+            await armDirty(key, delay, 'pending dirs ' + key +
+              (strikes > 1 ? ` (strike ${strikes})` : ''));
           })().catch(e =>
             dlog('scheduler', '[scheduler] pending-dirs arm failed:',
               e?.message || e));
         }
       }
       return false;   // no response: dirty.mjs owns this message
+    }
+    // a clean run anywhere in the extension: that account's pending-dirs
+    // strikes are wiped, so the next failing report starts from the base
+    // delay again — one-off failures never back off
+    case 'sync-synced': {
+      const id = typeof msg.accountId === 'string' && msg.accountId
+        ? msg.accountId
+        : null;
+      if (id) {
+        (async () => {
+          await booting;
+          // the report keys under either spelling; resolve the account
+          // once so both spellings clear together
+          const acc = findAccount(await registry(), id);
+          await resetStreaks(acc ? accountKeys(acc) : [id]);
+        })().catch(() => {});
+      }
+      return false;
     }
     // a full-account run anywhere in the extension (a manual one from
     // the client combo or the sync interface) resets THAT account's

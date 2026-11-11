@@ -954,7 +954,12 @@ async function runPostSyncFilters(job, store, account, uids, {dirty = false, rou
  * local layout and reports the dirty dirs — the worker's dirty store
  * marks them, and its scheduler re-arms the alarm. Self-terminating:
  * once a sync claims and pushes the interlopers, the scan finds them
- * gone. The report rides the regular 'sync-pending-dirs' message.
+ * gone — including on a server that cannot MOVE: the first doomed
+ * replay pins moveSupported:false in the account prefs and the next
+ * replay runs as append+delete (and the scheduler backs its re-arm off
+ * strike by strike, so even an unresolvable state rides the full
+ * cadence instead of the dirty delay). The report rides the regular
+ * 'sync-pending-dirs' message.
  */
 async function reportPendingMoves(store, account) {
   try {

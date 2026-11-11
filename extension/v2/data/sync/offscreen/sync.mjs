@@ -190,7 +190,8 @@ export function describeOp(op) {
     case 'deleteServer':
       return `delete on server ${op.folder}/${op.uid}`;
     case 'moveServer':
-      return `move  on server ${op.folder}/${op.uid} → ${op.toFolder}`;
+      return `move  on server ${op.folder}/${op.uid} → ${op.toFolder}` +
+        (op.fallback ? ' (no MOVE: append+delete)' : '');
     default:
       return JSON.stringify(op);
   }
@@ -702,10 +703,20 @@ async function rowsFor(name, uidnext) {
     // it rejects keyword STOREs (flagsServer exec records starKeywords:false
     // in the account prefs), colors degrade to local-only filenames: $star-*
     // leaves the comparison on both sides and never gets planned again.
-    const starKeywordsOff = (await store.loadPrefs()).starKeywords === false;
+    const prefs = await store.loadPrefs();
+    // Star-color keywords diff like any standard flag. Once a server proves
+    // it rejects keyword STOREs (flagsServer exec records starKeywords:false
+    // in the account prefs), colors degrade to local-only filenames: $star-*
+    // leaves the comparison on both sides and never gets planned again.
+    const starKeywordsOff = prefs.starKeywords === false;
     const diffFlags = flags => starKeywordsOff
       ? knownFlags(flags).filter(f => !STAR_COLOR_KEYWORDS.includes(f))
       : knownFlags(flags);
+    // The same latch for MOVE: once the core build has proven it cannot
+    // MOVE at all (moveServer exec pins moveSupported:false in the prefs),
+    // every pending move is planned as the capability-free append+delete
+    // fallback instead of a doomed MOVE retry — see pushServerMove below.
+    const noMoveServer = prefs.moveSupported === false;
 
     const ops = [];
     const conflicts = [];
@@ -747,6 +758,35 @@ async function rowsFor(name, uidnext) {
       }
       return null;
     };
+
+    /**
+     * Plan a server-side move of folder/uid into toFolder. A server that
+     * has proven it cannot MOVE (the prefs latch moveSupported:false — a
+     * core build without the export) gets the capability-free equivalent
+     * planned as ONE op: the pending-move file's bytes APPENDed into the
+     * destination (the upload IS the move payload — the file is the
+     * message), then the source uid deleted. The marker file is kept
+     * either way, exactly like the MOVE path: the post-apply pairing
+     * renames it in place, and the append half never depends on the
+     * delete half (a failed delete only leaves a stray server-side copy
+     * the next run's own delete path settles; a failed append leaves the
+     * marker untouched for the next run to retry). It rides the
+     * moveServer kind so no destructive-op gate can strip the delete —
+     * a verified pending move deletes its source with the same authority
+     * a server MOVE does.
+     */
+    function pushServerMove(folder, uid, entry, toFolder, msgid, extra = {}) {
+      if (!noMoveServer) {
+        ops.push({kind: 'moveServer', folder, uid, entry, toFolder, msgid, ...extra});
+        return;
+      }
+      ops.push({
+        kind: 'moveServer', folder, uid, entry, toFolder, msgid,
+        flags: diffFlags(entry.flags ?? []),
+        fallback: true, ...extra
+      });
+      emitLog('plan', `${folder}: server move ${uid} → ${toFolder} planned as append+delete (no MOVE)`);
+    }
 
     // ---- mining: every uid that is new on the server gets one raw
     // download so msgid classification works across folder changes.
@@ -1038,15 +1078,7 @@ async function rowsFor(name, uidnext) {
       }
       entry.claimed = true;
       claimedInterlopers.add(entry);
-      ops.push({
-        kind: 'moveServer',
-        folder: name,
-        uid,
-        entry,
-        toFolder: dst,
-        msgid: fileId,
-        healed: true
-      });
+      pushServerMove(name, uid, entry, dst, fileId, {healed: true});
       emitLog('plan', `${name}: uid ${uid} snapshot record lost, pending move to "${dst}" verified by msgid — replayed as a server move`);
       await sweepDuplicates(dst, entry);
       return true;
@@ -1160,14 +1192,8 @@ async function rowsFor(name, uidnext) {
           }
         const moved = findInterloper(name, uid);
         if (moved) {
-          ops.push({
-            kind: 'moveServer',
-            folder: name,
-            uid,
-            entry: moved.entry,
-            toFolder: moved.folder,
-            msgid: messages[uid]?.msgid ?? null
-          });
+          pushServerMove(name, uid, moved.entry, moved.folder,
+            messages[uid]?.msgid ?? null);
           await sweepDuplicates(moved.folder, moved.entry);
         }
         }
@@ -1286,14 +1312,8 @@ async function rowsFor(name, uidnext) {
         // in K, gone locally, still on the server
         const moved = findInterloper(name, uid);
         if (moved) {
-          ops.push({
-            kind: 'moveServer',
-            folder: name,
-            uid,
-            entry: moved.entry,
-            toFolder: moved.folder,
-            msgid: k.msgid ?? null
-          });
+          pushServerMove(name, uid, moved.entry, moved.folder,
+            k.msgid ?? null);
           await sweepDuplicates(moved.folder, moved.entry);
           continue;
         }
@@ -2049,8 +2069,55 @@ async function rowsFor(name, uidnext) {
             break;
           }
           case 'moveServer': {
+            if (op.fallback) {
+              // the capability-free equivalent of MOVE: upload the marker's
+              // bytes into the destination (the file is the message), then
+              // delete the source uid. The marker is KEPT — like the MOVE
+              // path — so the post-apply pairing renames it in place; the
+              // delete half failing only leaves a stray source copy the
+              // next run settles, while a failed append leaves the marker
+              // untouched for the next run to retry.
+              const raw = await store.readFile(op.entry);
+              await select(op.toFolder, {force: true});
+              await mail.uploadMail(op.toFolder, raw, op.flags ?? []);
+              // the pairing must see the kept marker even when the delete
+              // below fails: the message is already served in the destination
+              movedKeeps.push({
+                from: op.folder,
+                to: op.toFolder,
+                oldUid: Number(op.uid),
+                entry: op.entry
+              });
+              emitLog('apply', `no-MOVE fallback: appended ${op.folder}/${op.uid} → ${op.toFolder} (${raw.byteLength} bytes)`);
+              await select(op.folder, {force: true});
+              await mail.deleteMail(Number(op.uid));
+              emitLog('apply', `server move ${op.folder}/${op.uid} → ${op.toFolder} (append+delete)`);
+              break;
+            }
             await select(op.folder, {force: true});
-            await mail.moveMail(Number(op.uid), op.toFolder);
+            try {
+              await mail.moveMail(Number(op.uid), op.toFolder);
+            }
+            catch (e) {
+              // a core build without the MOVE export fails every
+              // pending-move replay the same way: pin moveSupported:false
+              // so the next plan routes pending moves through the
+              // append+delete fallback instead of retrying the doomed
+              // MOVE every dirty delay. Only the definitive build error
+              // latches — a transient move failure must not disable MOVE
+              // for the account's lifetime.
+              if (/does not support MOVE|move_messages/.test(e?.message || String(e))) {
+                try {
+                  const prefs = await store.loadPrefs();
+                  if (prefs.moveSupported !== false) {
+                    await store.savePrefs({...prefs, moveSupported: false});
+                    emitLog('apply', 'core build cannot MOVE — pending moves will replay as append+delete from now on', 'warn');
+                  }
+                }
+                catch {}
+              }
+              throw e;
+            }
             // keep the pending-move file: the server assigned the message a
             // NEW uid in the destination, and the post-apply pass below
             // pairs the kept copy with it and renames the file in place —

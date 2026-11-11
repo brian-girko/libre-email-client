@@ -52,10 +52,13 @@ const idOf = async msgid => await msgidOf(rawOf(msgid));
 
 // ---- mock mail (IMAP facade) + store (MaildirStore) ------------------------
 
-function mockMail(server, {failMove = false} = {}) {
+function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'} = {}) {
   return {
     fetches: 0,      // raw downloads (readMail/readMails)
     current: null,
+    // every deleteMail call — {folder, uids}: the no-MOVE fallback's
+    // source delete rides the same call the deleteServer op uses
+    deletes: [],
     async folders() {
       return [...server.keys()].map(name => ({name, delimiter: '.', attrs: []}));
     },
@@ -84,7 +87,7 @@ function mockMail(server, {failMove = false} = {}) {
     },
     async moveMail(uid, mailbox) {
       if (failMove) {
-        throw new Error('mock-fs: move failed');
+        throw new Error(moveError);
       }
       const dir = server.get(this.current);
       const raw = dir.raws.get(uid);
@@ -116,15 +119,27 @@ function mockMail(server, {failMove = false} = {}) {
       dst.raws.set(uid, raw);
       dst.rows.set(uid, {flags: flags ?? [], subject: null, from: null, date: null, size: raw.length});
       return true;
+    },
+    /** marks \\Deleted and purges: the mock just drops the rows */
+    async deleteMail(uids) {
+      const list = Array.isArray(uids) ? uids : [uids];
+      const dir = server.get(this.current);
+      for (const uid of list) {
+        dir.rows.delete(Number(uid));
+        dir.raws.delete(Number(uid));
+      }
+      this.deletes.push({folder: this.current, uids: list.map(Number)});
+      return true;
     }
   };
 }
 
-function mockStore(snapshot, listings, delimiter = '/', failRenames = false) {
+function mockStore(snapshot, listings, delimiter = '/', failRenames = false, prefs = {}) {
   const saved = [];
   return {
     delimiter,
     saved,
+    prefs,
     // every writeMessage call the engine makes — {folder, uid, flags, bytes,
     // fmd5|null}: pull-time routing lands in the DESTINATION dir with the
     // SOURCE folder's md5, unrouted pulls land in their folder unmarked
@@ -138,7 +153,11 @@ function mockStore(snapshot, listings, delimiter = '/', failRenames = false) {
       return structuredClone(snapshot);
     },
     async loadPrefs() {
-      return {};
+      return {...prefs};
+    },
+    async savePrefs(next) {
+      Object.assign(prefs, next);
+      return true;
     },
     async listFolders() {
       return [...listings.keys()];
@@ -1347,6 +1366,132 @@ const emptyFolders = () => ({
     'the ignored folder\'s scoped run plans nothing');
   assert.ok(lines.some(l => String(l.content).includes('on the ignore list')),
     'the stand-down is narrated: ' + JSON.stringify(lines));
+}
+
+// ---- scenario G: a core build without MOVE latches the prefs once ---------
+// The pending-move replay fails with the definitive build error ("does not
+// support MOVE") on EVERY run — the old behavior re-planned the same doomed
+// moveServer op forever and the scheduler re-armed the dirty alarm every
+// delay. The failed op now pins moveSupported:false in the account prefs,
+// so the NEXT plan routes pending moves through the append+delete fallback.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])],
+    ['Silent.Broken Links', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}
+      }},
+      'Silent.Broken Links': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Silent.Broken Links', listing([], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  const prefs = {};
+  const store = mockStore(snapshot, listings, '/', false, prefs);
+  const engine = createSync(mockMail(server, {
+    failMove: true,
+    moveError: 'moveTo: mail core build does not support MOVE; rebuild rust-client with move_messages export'
+  }), store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 1, 'the doomed moveServer op still fails this run');
+  assert.equal(summary.moveServer, 0, 'the failed MOVE is not counted as done');
+  assert.equal(prefs.moveSupported, false,
+    'the definitive build error latched moveSupported:false');
+  assert.deepEqual(store.moves, [], 'no local rename happened on a failed MOVE');
+  assert.equal(store.saved.length, 0, 'snapshot NOT committed');
+
+  // a transient-looking move failure must NOT latch: the account keeps
+  // replaying server MOVEs after a one-off hiccup
+  const prefs2 = {};
+  const engine2 = createSync(mockMail(server, {
+    failMove: true,
+    moveError: 'mock-fs: connection reset mid-move'
+  }), mockStore(snapshot, listings, '/', false, prefs2), {log: quietLog});
+  await engine2.run({dry: false});
+  assert.ok(!('moveSupported' in prefs2),
+    'a transient move failure does not disable MOVE');
+}
+
+// ---- scenario H: the latched fallback replays the move WITHOUT MOVE -------
+// With moveSupported:false the same pending-move state plans ONE moveServer
+// op flagged as the append+delete fallback: the marker's bytes upload into
+// the destination, the source uid is deleted, and the kept marker pairs with
+// the fresh destination uid and renames in place — the same end state a
+// server MOVE produces, with no re-download and no dirty-report loop.
+{
+  const m5 = await idOf('m5');
+  // fresh state per engine: plan() stamps `claimed` on the listing
+  // entries it consumes, so the dry engine and the run engine must not
+  // share one listings object
+  const freshServer = () => new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])],
+    ['Silent.Broken Links', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}
+      }},
+      'Silent.Broken Links': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const freshListings = () => new Map([
+    ['INBOX', listing([])],
+    ['Silent.Broken Links', listing([], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  // the dry plan alone shows the fallback shape
+  const dryStore = mockStore(snapshot, freshListings(), '/', false, {moveSupported: false});
+  const dryEngine = createSync(mockMail(freshServer()), dryStore, {log: quietLog});
+  const {plan: dryPlan} = await dryEngine.plan();
+  assert.deepEqual(dryPlan.ops.map(o => o.kind), ['moveServer'],
+    'one server-move op: ' + JSON.stringify(dryPlan.ops.map(describeOp)));
+  assert.equal(dryPlan.ops[0].fallback, true,
+    'the move rides the append+delete fallback: ' + describeOp(dryPlan.ops[0]));
+
+  // the full run completes the move: upload + source delete + in-place rename
+  const server = freshServer();
+  const store = mockStore(snapshot, freshListings(), '/', false, {moveSupported: false});
+  const mail = mockMail(server);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the fallback run is clean');
+  assert.equal(summary.serverMoves, 1, 'the fallback counts as a server move');
+  assert.deepEqual(mail.deletes, [{folder: 'INBOX', uids: [5]}],
+    'the source uid was deleted on the server');
+  assert.ok(!server.get('INBOX').rows.has(5),
+    'the message left its source folder');
+  assert.ok(server.get('Silent.Broken Links').rows.has(11),
+    'the appended copy landed in the destination (fresh uid 11)');
+  assert.equal(server.get('Silent.Broken Links').raws.get(11).length,
+    rawOf('m5').length, 'the uploaded bytes are the marker file\'s bytes');
+  assert.deepEqual(store.moves, [{
+    srcFolder: 'Silent.Broken Links', dstFolder: 'Silent.Broken Links',
+    uid: 11, keepFmd5: false, flags: []
+  }], 'the kept marker paired with the fresh uid and renamed in place');
+  assert.equal(summary.keptLocalMoves, 1, 'the copy was kept (no re-download)');
+  assert.equal(mail.fetches, 0, 'no message was re-fetched');
+  assert.equal(summary.warnings, 0, 'no unmatched-marker warning');
+  assert.equal(store.saved.length, 1, 'the snapshot committed');
+  assert.equal(store.saved[0].folders['Silent.Broken Links'].messages[11].msgid, m5,
+    'the snapshot carries the moved message under its fresh uid');
 }
 
 console.log('sync.test: all scenarios pass');

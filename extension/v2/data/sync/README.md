@@ -476,7 +476,18 @@ already sits in the destination on the server drops only the stale local
 file; a mismatch (uid reused by different mail) keeps the file, warns, and
 takes the normal re-pull. Scoped (`--dir`) runs survey the folder holding
 the pending-move file as a restricted extra, so a sync of the *source* dir
-replays the move too. Orphans nobody claimed (their source uid is gone from
+replays the move too. A server that cannot MOVE at all (a core build
+without the `move_messages` export — the wasm core itself already falls
+back to COPY+`\Deleted`+EXPUNGE for servers that merely lack the MOVE
+capability) fails every replay the same way, which used to re-mark the
+holding dir dirty forever. The first failed replay with the definitive
+build error pins `moveSupported: false` in the account prefs, and the
+planner routes every pending move through the capability-free equivalent
+thereafter: ONE op that APPENDs the marker file's bytes into the
+destination (the upload IS the move payload), deletes the source uid, and
+keeps the marker for the post-apply pairing to rename in place — the same
+end state a server MOVE produces, no re-download, and the dir stops
+re-marking dirty. Orphans nobody claimed (their source uid is gone from
 both the server and the snapshot — a replay whose marker-file removal
 failed, or a duplicate of a message the source still holds) are resolved by
 msgid in the final sweep: a copy whose message is already served somewhere
