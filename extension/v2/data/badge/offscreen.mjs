@@ -17,14 +17,14 @@
 // chrome.storage — assembled by /badge.mjs on the service worker:
 //
 //   {type:'badge-job', id, accounts:[{id, label, slug, mode, folder, query,
-//    lastSyncAt}], maxAge}
+//    maxAge, lastSyncAt}]}
 //
 // Folder mode counts the configured folder — INBOX when nothing is
 // configured (the badge's default scope). Query mode filters each folder's
 // unseen mail through a reduced, header-only search grammar. maxAge
-// (minutes, 0 = no limit) restricts the count to unread mail younger than
-// the window; its cost is one 64 KB header slice per candidate — the same
-// cheap read the client's list rows already pay.
+// (minutes, per account; 0 = no limit) restricts the count to unread mail
+// younger than the window; its cost is one 64 KB header slice per
+// candidate — the same cheap read the client's list rows already pay.
 
 'use strict';
 
@@ -312,9 +312,11 @@ async function handle(msg) {
       }
     }
     else {
-      const maxAgeMinutes = Math.max(0, Math.round(Number(msg.maxAge) || 0));
-      const maxAgeAt = maxAgeMinutes ? Date.now() - maxAgeMinutes * 60000 : 0;
       for (const spec of accounts) {
+        // the age window rides per account now (the driver resolves the
+        // legacy global badge.maxAge fallback for unset accounts)
+        const maxAgeMinutes = Math.max(0, Math.round(Number(spec.maxAge) || 0));
+        const maxAgeAt = maxAgeMinutes ? Date.now() - maxAgeMinutes * 60000 : 0;
         const entry = {
           id: spec.id,
           label: spec.label || spec.id,

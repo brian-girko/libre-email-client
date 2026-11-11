@@ -145,23 +145,12 @@
         <label class="check">
           <input type="checkbox" id="f-badge-enabled" checked> Enable the badge counter
         </label>
-        <label>Count only emails newer than
-          <select id="f-badge-max-age">
-            <option value="0" selected>No limit (ignore)</option>
-            <option value="15">15 minutes</option>
-            <option value="30">30 minutes</option>
-            <option value="60">1 hour</option>
-            <option value="120">2 hours</option>
-            <option value="360">6 hours</option>
-            <option value="720">12 hours</option>
-          </select>
-        </label>
         <div class="row">
           <button type="button" id="check-badge">Check now</button>
           <span id="badge-status" class="hint"></span>
         </div>
         <p class="hint">The badge reads the LOCAL maildir only (no server round-trip): every badge-enabled account's unread count comes from the message files themselves. The badge shows the combined unread total when it is not zero, and its title lists each account's count. A check runs after local edits and after each landed sync run (and on this button); there is no periodic look.</p>
-        <p class="hint">By default an account's badge counts its INBOX; pick a folder to count that folder instead, or a query to count query-matched unread mail across all folders (see the account editor). The age limit restricts the count to unread mail newer than the chosen window in both modes; a message whose Date header cannot be parsed does not count against an age-limited badge.</p>
+        <p class="hint">By default an account's badge counts its INBOX; pick a folder to count that folder instead, or a query to count query-matched unread mail across all folders (see the account editor). The age limit ("Count only emails newer than") is a per-account setting in the account editor now.</p>
       </fieldset>
       <fieldset>
         <legend>Preferences backup</legend>
@@ -254,6 +243,19 @@
             <input type="text" id="f-badge-query" placeholder="from:news@example.com or subject:invoice" disabled>
           </label>
           <p class="hint">Badge counter: "folder" counts unread messages in the folder; "search query" counts unread messages matching the query inside that folder (an empty query falls back to the folder's unread count).</p>
+          <label>Count only emails newer than
+            <select id="f-badge-max-age">
+              <option value="" selected>Default (old global setting)</option>
+              <option value="0">No limit (ignore)</option>
+              <option value="15">15 minutes</option>
+              <option value="30">30 minutes</option>
+              <option value="60">1 hour</option>
+              <option value="120">2 hours</option>
+              <option value="360">6 hours</option>
+              <option value="720">12 hours</option>
+            </select>
+          </label>
+          <p class="hint">Age window for this account's badge count: only unread mail newer than the chosen window is counted (in folder and query mode alike). "Default" follows the global age limit the badge counter had before this setting moved here; "No limit" counts every unread mail. A message whose Date header cannot be parsed does not count against an age-limited badge.</p>
         </fieldset>
 
         <div class="row" id="ignore-row">

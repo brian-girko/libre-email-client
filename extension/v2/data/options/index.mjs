@@ -52,7 +52,6 @@ const pageSizeEl = document.getElementById('f-page-size');
 const flaggedTopEl = document.getElementById('f-flagged-top');
 const syncPrefetchEl = document.getElementById('f-sync-prefetch');
 const badgeEnabledEl = document.getElementById('f-badge-enabled');
-const badgeMaxAgeEl = document.getElementById('f-badge-max-age');
 const pickerAutoOpenEl = document.getElementById('f-picker-auto-open');
 const syncAutoEnabledEl = document.getElementById('f-sync-auto-enabled');
 const syncFullEnabledEl = document.getElementById('f-sync-full-enabled');
@@ -69,7 +68,8 @@ let initialStorageMode = 'opfs';
 
 // ---- Storage root: browser storage (default) or a user-chosen directory ----
 
-// minutes; 0 disables the age limit (badge counts all unread mail)
+// minutes; 0 disables the age limit ('' follows the legacy global
+// badge.maxAge as the per-account default)
 const BADGE_MAX_AGES = [0, 15, 30, 60, 120, 360, 720];
 
 const masterEl = document.getElementById('f-master');
@@ -265,7 +265,8 @@ const FIELDS = {
   'email.badge': document.getElementById('f-badge'),
   'email.badgeMode': document.getElementById('f-badge-mode'),
   'email.badgeFolder': document.getElementById('f-badge-folder'),
-  'email.badgeQuery': document.getElementById('f-badge-query')
+  'email.badgeQuery': document.getElementById('f-badge-query'),
+  'email.badgeMaxAge': document.getElementById('f-badge-max-age')
 };
 
 let accounts = [];
@@ -434,6 +435,14 @@ async function select(id) {
     else if (name === 'email.badgeMode') {
       input.value = ['folder', 'query'].includes(value) ? value : 'folder';
     }
+    else if (name === 'email.badgeMaxAge') {
+      // '' = follow the legacy global badge.maxAge; 0 = no limit
+      input.value = value == null || value === ''
+        ? ''
+        : (BADGE_MAX_AGES.includes(Number(value))
+          ? String(Number(value))
+          : '0');
+    }
     else {
       input.value = value == null ? '' : value;
     }
@@ -546,6 +555,15 @@ formEl.addEventListener('submit', async e => {
     }
     else if (field === 'email.badgeMode') {
       writes[id] = ['folder', 'query'].includes(input.value) ? input.value : 'folder';
+    }
+    else if (field === 'email.badgeMaxAge') {
+      // '' = follow the legacy global badge.maxAge; otherwise a validated
+      // minute count (0 = no limit)
+      writes[id] = input.value === ''
+        ? ''
+        : (BADGE_MAX_AGES.includes(Number(input.value))
+          ? Number(input.value)
+          : '');
     }
     else {
       writes[id] = input.value.trim();
@@ -710,7 +728,6 @@ async function loadGlobalPrefs() {
     'ui.mailFlaggedTop': false,
     'mail.syncPrefetch': 'all',
     'badge.enabled': true,
-    'badge.maxAge': 0,
     'picker.autoOpen': true,
     'sync.auto.enabled': true,
     'sync.auto.fullEnabled': true,
@@ -737,9 +754,6 @@ async function loadGlobalPrefs() {
     ? String(res['mail.syncPrefetch'])
     : 'all';
   badgeEnabledEl.checked = res['badge.enabled'] !== false;
-  badgeMaxAgeEl.value = BADGE_MAX_AGES.includes(Number(res['badge.maxAge']))
-    ? String(Number(res['badge.maxAge']))
-    : '0';
   pickerAutoOpenEl.checked = res['picker.autoOpen'] !== false;
   syncAutoEnabledEl.checked = res['sync.auto.enabled'] !== false;
   syncFullEnabledEl.checked = res['sync.auto.fullEnabled'] !== false;
@@ -827,9 +841,6 @@ saveGlobalBtn.addEventListener('click', async () => {
       ? (syncPrefetchEl.value === 'all' ? 'all' : Number(syncPrefetchEl.value))
       : 'all',
     'badge.enabled': badgeEnabledEl.checked,
-    'badge.maxAge': BADGE_MAX_AGES.includes(Number(badgeMaxAgeEl.value))
-      ? Number(badgeMaxAgeEl.value)
-      : 0,
     'picker.autoOpen': pickerAutoOpenEl.checked,
     'sync.auto.enabled': syncAutoEnabledEl.checked,
     'sync.auto.fullEnabled': syncFullEnabledEl.checked,

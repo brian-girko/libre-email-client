@@ -8,12 +8,13 @@
 //   selection   — everything the options page already saves: the global
 //                 badge settings plus the per-account fields
 //                 (email.badge / email.badgeMode / email.badgeFolder /
-//                 email.badgeQuery), read fresh per check; account slugs
-//                 come from the sync registry (loadAccounts with
-//                 decrypt:false — badge jobs never carry server creds).
-//                 Each account's sync.lastSyncAt.<id> stamp rides in the
-//                 job too, so the tooltip can always show "last synced"
-//                 per account (the offscreen document has no storage).
+//                 email.badgeQuery / email.badgeMaxAge), read fresh per
+//                 check; account slugs come from the sync registry
+//                 (loadAccounts with decrypt:false — badge jobs never carry
+//                 server creds). Each account's sync.lastSyncAt.<id> stamp
+//                 rides in the job too, so the tooltip can always show
+//                 "last synced" per account (the offscreen document has no
+//                 storage).
 //   triggers    — 'sync-dirty-report' (client-side local edits; the same
 //                 messages dirty.mjs consumes, so a burst of file renames =
 //                 ONE check after the 3 s coalesce window), 'sync-refresh'
@@ -70,6 +71,10 @@ async function buildJob() {
     return null;   // badge turned off: nothing runs, the icon stays clear
   }
   const registry = await loadAccounts(null, {decrypt: false});
+  // the per-account age window falls back to the legacy global badge.maxAge
+  // when the account never stored its own value ('' rides the same way);
+  // an explicit 0 stays "no limit"
+  const legacyMaxAge = Math.max(0, Math.round(Number(storage['badge.maxAge']) || 0));
   const accounts = [];
   for (const acc of registry) {
     if (storage['email.badge.' + acc.id] === false) {
@@ -78,6 +83,10 @@ async function buildJob() {
     const folder = String(storage['email.badgeFolder.' + acc.id] ?? '').trim();
     const mode = storage['email.badgeMode.' + acc.id] === 'query' ? 'query' : 'folder';
     const query = String(storage['email.badgeQuery.' + acc.id] ?? '').trim();
+    const ownMaxAge = storage['email.badgeMaxAge.' + acc.id];
+    const maxAge = ownMaxAge === undefined || ownMaxAge === ''
+      ? legacyMaxAge
+      : Math.max(0, Math.round(Number(ownMaxAge) || 0));
     // the stored delimiter stamp rides the job too: the badge offscreen
     // has no chrome.storage, and its maildir reads must spell folder
     // names the exact way the engine's mirror does ('Zoo.Test', not the
@@ -91,6 +100,7 @@ async function buildJob() {
       // folder '' = the engine-side INBOX default (the badge's default scope)
       folder: mode === 'folder' ? folder : '',
       query: mode === 'query' ? query : '',
+      maxAge,
       delimiter: typeof delimiterStamp === 'string' &&
         delimiterStamp.length === 1 && delimiterStamp !== '%'
         ? delimiterStamp
@@ -107,12 +117,10 @@ async function buildJob() {
         : 'the account registry is empty or no account is fully configured'));
     return null;
   }
-  const maxAge = Math.max(0, Math.round(Number(storage['badge.maxAge']) || 0));
   return {
     type: 'badge-job',
     id: 'badge-' + Date.now(),
-    accounts,
-    maxAge
+    accounts
   };
 }
 
