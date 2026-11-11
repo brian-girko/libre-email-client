@@ -62,10 +62,26 @@ async function showStep(step) {
     await prefillAccount();
     await checkMasterStatus();
   }
+
+  // On step 4, fetch the folder list from the server (the account is NOT
+  // saved yet — the probe runs straight off the form fields) and render
+  // the ignore checkboxes
+  if (String(step) === '4') {
+    await onFoldersStepEnter();
+  }
 }
 
 // The account the form is currently editing (null when the form starts empty)
 let editingId = null;
+
+// True once step 4's folder tree actually rendered: only then does Finish
+// persist the tree's selection — a probe that failed (or never had a
+// password) must never overwrite a stored list with an empty one.
+let foldersLoaded = false;
+// True once the tree was seeded from storage this session: a re-entry
+// (back → fix a field → Next) then keeps the user's unsaved checks
+// instead of resetting them to the stored list.
+let foldersSeeded = false;
 
 // Mode selection
 document.querySelectorAll('.card').forEach(card => {
@@ -108,6 +124,14 @@ async function prefillAccount() {
     }
 
     editingId = primary.id;
+    // the folder tree's in-memory selection belongs to the previously
+    // edited account: a different editing target starts the ignore step
+    // over (unsaved checks must never migrate between accounts)
+    if (foldersSeeded || foldersLoaded) {
+      foldersSeeded = false;
+      foldersLoaded = false;
+      document.getElementById('folders-tree')?.setIgnored?.([]);
+    }
     const res = await chrome.storage.local.get([
       'imap.host.' + primary.id,
       'imap.port.' + primary.id,
@@ -566,26 +590,28 @@ function validateForm() {
   const port = Number(document.getElementById('f-port').value);
   const name = document.getElementById('f-name').value.trim();
   const errorEl = document.getElementById('form-error');
-  const finishBtn = document.querySelector('#step-3 [data-cmd="finish"]');
+  // step 3's forward button (the old Finish is now Next: the save moved
+  // to step 4's Finish, after the folder list was fetched)
+  const nextBtn = document.querySelector('#step-3 [data-cmd="next"]');
 
   if (!host) {
     errorEl.textContent = 'Host is required.';
-    finishBtn.disabled = true;
+    nextBtn.disabled = true;
     return false;
   }
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     errorEl.textContent = 'Port must be an integer between 1 and 65535.';
-    finishBtn.disabled = true;
+    nextBtn.disabled = true;
     return false;
   }
   if (!name) {
     errorEl.textContent = 'Name is required.';
-    finishBtn.disabled = true;
+    nextBtn.disabled = true;
     return false;
   }
 
   errorEl.textContent = '';
-  finishBtn.disabled = false;
+  nextBtn.disabled = false;
   return true;
 }
 
@@ -743,11 +769,13 @@ document.addEventListener('click', async ({target}) => {
 
   if (cmd === 'back') {
     const step = document.body.dataset.step;
-    if (step === '2a' || step === '2b') {
-      showStep('1');
+    if (step === '4') {
+      showStep('3');
     }
-    else if (step === '3') {
-      showStep(document.body.dataset.mode === 'remote' ? '2a' : '2b');
+    else if (step === '2a' || step === '2b' || step === '3') {
+      showStep(step === '3'
+        ? (document.body.dataset.mode === 'remote' ? '2a' : '2b')
+        : '1');
     }
   }
   else if (cmd === 'next') {
@@ -755,34 +783,22 @@ document.addEventListener('click', async ({target}) => {
     if (step === '2a' || step === '2b') {
       showStep('3');
     }
+    else if (step === '3') {
+      // the account is NOT saved here: step 4 fetches the folder list
+      // straight off the form fields, and Finish (step 4) saves the
+      // account, the ignore list and starts the first sync
+      if (validateForm()) {
+        showStep('4');
+      }
+    }
   }
-  else if (cmd === 'finish') {
-    if (validateForm()) {
-      // the Finish button: disabled while the save + sync-start runs
-      target.disabled = true;
-      let started = false;
-      try {
-        const id = await saveAccount();
-        started = await startAutoSync(id,
-          document.getElementById('f-pass').value);
-      }
-      catch (e) {
-        console.error('[welcome] finish failed:', e?.message || e);
-        document.getElementById('form-error').textContent =
-          'Saving the account failed — try again.';
-        target.disabled = false;
-        return;
-      }
-      if (started) {
-        window.close();
-      }
-      else {
-        // leave the wizard open with feedback: the user can retry Finish or
-        // start the sync later from the client
-        document.getElementById('form-error').textContent =
-          'Account saved, but the first sync could not start. Press Finish to retry, or Sync now in the mail client.';
-        target.disabled = false;
-      }
+  else if (cmd === 'finish' || cmd === 'continue-all') {
+    // both step-4 exits: Finish persists the account (+ the tree's ignore
+    // selection, when the tree loaded) and starts the first sync;
+    // continue-all is the same path after a failed fetch (the tree never
+    // loaded, so the stored ignore list is never overwritten)
+    if (document.body.dataset.step === '4') {
+      await finishSetup(target);
     }
   }
   else if (cmd === 'check-bridge') {
@@ -804,6 +820,159 @@ document.addEventListener('click', async ({target}) => {
     checkNativeConnection();
   }
 });
+
+/**
+ * Step 4's Finish (and continue-all): the whole save is postponed to here —
+ * account, ignore selection (only when the tree rendered) and the first
+ * sync. An unresolvable password leaves the wizard open with feedback; a
+ * retry re-runs everything.
+ */
+async function finishSetup(button) {
+  if (!editingId && !validateForm()) {
+    showStep('3');
+    return;
+  }
+  button.disabled = true;
+  const statusEl = document.getElementById('folders-status');
+  let started = false;
+  try {
+    const id = await saveAccount();
+    if (foldersLoaded) {
+      const {saveIgnores} = await import('/data/sync/ignore.mjs');
+      await saveIgnores(id,
+        document.getElementById('folders-tree').getIgnored());
+    }
+    started = await startAutoSync(id,
+      document.getElementById('f-pass').value);
+  }
+  catch (e) {
+    console.error('[welcome] finish failed:', e?.message || e);
+    statusEl.textContent = 'Saving the account failed — go back and try again.';
+    statusEl.className = 'error';
+    button.disabled = false;
+    return;
+  }
+  if (started) {
+    window.close();
+  }
+  else {
+    // leave the wizard open with feedback: the user can retry Finish or
+    // start the sync later from the client
+    statusEl.textContent =
+      'Account saved (the ignore list too), but the first sync could not ' +
+      'start. Press Finish to retry, or Sync now in the mail client.';
+    statusEl.className = 'error';
+    button.disabled = false;
+  }
+}
+
+/**
+ * Step 4 entry: fetch the folder list straight off the form fields and
+ * render the ignore checkboxes. A fetch failure never blocks setup — the
+ * status line explains, "Continue — sync everything" finishes without
+ * touching the ignore list.
+ */
+async function onFoldersStepEnter() {
+  const statusEl = document.getElementById('folders-status');
+  const noteEl = document.getElementById('folders-note');
+  const tree = document.getElementById('folders-tree');
+  const continueBtn = document.querySelector('[data-cmd="continue-all"]');
+  foldersLoaded = false;
+  statusEl.textContent = 'Fetching your folders…';
+  statusEl.className = '';
+  tree.hidden = true;
+  noteEl.hidden = true;
+  continueBtn.hidden = true;
+
+  try {
+    const account = await probeAccount();
+    if (!account) {
+      statusEl.textContent =
+        'No password available — enter it in the account step, or continue ' +
+        'with everything syncing (the list can be edited later).';
+      statusEl.className = 'error';
+      continueBtn.hidden = false;
+      return;
+    }
+    const {fetchFolders} = await import('/data/sync/client/folders-probe.mjs');
+    const res = await fetchFolders(account);
+    if (!res.ok) {
+      statusEl.textContent =
+        'Fetching the folder list failed: ' + (res.error || 'unknown');
+      statusEl.className = 'error';
+      noteEl.textContent =
+        'You can go back and check the account, or continue — the first sync ' +
+        'then pulls every folder. Ignores can be configured later.';
+      noteEl.hidden = false;
+      continueBtn.hidden = false;
+      return;
+    }
+    tree.setFolders(res.folders, res.delimiter || '/');
+    if (!foldersSeeded) {
+      // first entry: the checkboxes start from the stored ignore list
+      // (empty for a fresh account). Later entries keep whatever the user
+      // already checked — only unsaved state, nothing was stored yet.
+      const {loadIgnoresById} = await import('/data/sync/ignore.mjs');
+      tree.setIgnored(await loadIgnoresById(editingId));
+      foldersSeeded = true;
+    }
+    foldersLoaded = true;
+    statusEl.textContent =
+      'Uncheck the folders to ignore — they are never synced.';
+    statusEl.className = 'success';
+    tree.hidden = false;
+  }
+  catch (e) {
+    // a failed module load, a dead bridge or anything else unexpected must
+    // degrade to the same offer as a failed fetch — never an uncaught
+    // rejection that leaves the step dead
+    console.error('[welcome] folder step failed:', e?.message || e);
+    statusEl.textContent = 'Fetching the folder list failed: ' +
+      (e?.message || String(e));
+    statusEl.className = 'error';
+    noteEl.textContent =
+      'You can go back and check the account, or continue — the first sync ' +
+      'then pulls every folder. Ignores can be configured later.';
+    noteEl.hidden = false;
+    continueBtn.hidden = false;
+  }
+}
+
+/**
+ * The probe account for step 4: connection fields straight from the form
+ * (nothing is saved yet); the password is the typed one, or the stored one
+ * (decrypted — a master-password prompt may appear) when the field is
+ * empty. Null when neither exists.
+ */
+async function probeAccount() {
+  const account = {
+    id: editingId,
+    host: document.getElementById('f-host').value.trim(),
+    port: Number(document.getElementById('f-port').value),
+    secure: document.getElementById('f-secure').checked,
+    allowSelfSigned: document.getElementById('f-allow-self-signed').checked,
+    user: document.getElementById('f-name').value.trim(),
+    name: document.getElementById('f-label').value.trim() || 'Account'
+  };
+  if (!account.host || !Number.isInteger(account.port) ||
+      account.port < 1 || account.port > 65535 || !account.user) {
+    return null;
+  }
+  const formPass = document.getElementById('f-pass').value;
+  if (formPass) {
+    account.pass = formPass;
+    return account;
+  }
+  const promptEl = document.getElementById('prompt');
+  const {loadAccounts} = await import('/data/sync/client/accounts.mjs');
+  const stored = (await loadAccounts(promptEl, {decrypt: true}).catch(() => []))
+    .find(a => a.id === editingId);
+  if (!stored?.pass) {
+    return null;
+  }
+  account.pass = stored.pass;
+  return account;
+}
 
 // Runtime preference
 runtime.addEventListener('change', () => chrome.storage.local.set({

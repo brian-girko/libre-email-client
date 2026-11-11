@@ -33,6 +33,7 @@ import {ensure, closeNow, activeGen} from '/core/offscreen.mjs';
 import {detectNativeClient} from '/core/native/native-client.mjs';
 import {markSynced, clearSynced, loadGatePrefs} from '/data/sync/client/accounts.mjs';
 import {delimiterFor} from '/data/sync/client/delimiter.mjs';
+import {loadIgnores} from '/data/sync/ignore.mjs';
 import {loadFilters} from '/data/sync/filters/route.mjs';
 import {dlog} from '/core/debug-log.mjs';
 // side-effect imports: /dirty.mjs registers its own runtime listener — the
@@ -212,6 +213,9 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     // (no panel connected within the grace window), the stored
     // 'Purge from server' / 'Drop local dir' choice stands in — an open
     // panel answering over its port still wins.
+    //
+    // The account's folder ignore list (sync.ignore.<id>) rides along too:
+    // ignored folders are never synced, their local mirror copies stay.
     case 'sync-request': {
       const withFilters = msg?.bare === true
         ? Promise.resolve(null)
@@ -234,16 +238,26 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       // otherwise report its dirs in the wrong spelling)
       const withDelimiter = delimiterFor(msg?.account ?? null)
         .catch(() => null);
+      const withIgnores = loadIgnores(msg?.account ?? null)
+        .catch(e => {
+          console.warn('[sync] loading the ignore list FAILED — this run syncs every folder:',
+            e?.message || e);
+          return [];
+        });
       ensure('sync')
-        .then(() => Promise.all([withFilters, withDelimiter, loadGatePrefs().catch(() => null)]))
-        .then(([filters, delimiter, prefs]) => chrome.runtime.sendMessage({
+        .then(() => Promise.all([
+          withFilters, withDelimiter, loadGatePrefs().catch(() => null),
+          withIgnores
+        ]))
+        .then(([filters, delimiter, prefs, ignores]) => chrome.runtime.sendMessage({
           ...msg,
           type: 'sync-job',
           account: msg.account && typeof msg.account === 'object'
             ? {...msg.account, ...(delimiter ? {delimiter} : {})}
             : msg.account,
           ...(filters ? {filters} : {}),
-          ...(prefs ? {prefs} : {})
+          ...(prefs ? {prefs} : {}),
+          ...(ignores?.length ? {ignores} : {})
         }))
         .then(res => respond(res ?? {ok: false, error: 'engine did not answer'}))
         .catch(e => respond({ok: false, error: e?.message || String(e)}));

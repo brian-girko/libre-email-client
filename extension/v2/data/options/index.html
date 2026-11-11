@@ -256,6 +256,22 @@
           <p class="hint">Badge counter: "folder" counts unread messages in the folder; "search query" counts unread messages matching the query inside that folder (an empty query falls back to the folder's unread count).</p>
         </fieldset>
 
+        <div class="row" id="ignore-row">
+          <button type="button" id="edit-ignores" disabled>Edit ignored folders&hellip;</button>
+          <span class="hint" id="ignore-hint">Fill in host, port and user name to fetch the folder list.</span>
+        </div>
+        <div id="ignore-editor" hidden>
+          <fieldset>
+            <legend>Ignored folders</legend>
+            <p class="hint">Checked folders are synced; unchecked ones are
+              ignored &mdash; never synced, local and server copies stay
+              untouched. The list is saved together with
+              &ldquo;Save This Account&rdquo;.</p>
+            <p class="hint" id="ignore-status"></p>
+            <folder-tree id="ignore-tree" hidden></folder-tree>
+          </fieldset>
+        </div>
+
         <div class="row">
           <button type="submit">Save This Account</button>
           <span id="saved" hidden>Saved</span>
@@ -408,6 +424,7 @@ from:news@example.com'></text-viewer>
       <div class="row" id="choice-buttons"></div>
     </form>
   </dialog>
+  <script type="module" src="/data/sync/client/components/folder-tree.js"></script>
   <script type="module" src="/data/options/index.mjs"></script>
 </body>
 </html>

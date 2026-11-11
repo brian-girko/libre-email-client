@@ -35,6 +35,11 @@ class SyncView extends HTMLElement {
   #out;
   #buttons = {};   // id → button element
   #filters = [];   // [{id, label}] offered by the wiring (setFilters)
+  #ignoredList = []; // the account's ignored folders (setIgnored) — server-
+                     // spelled names, the Restore row's targets
+  #ignorerow;      // the ignored-folders row (hidden while empty)
+  #ignoreline;
+  #ignoredSel;
   #lines = [];     // {seq, gen, ts, type, content, cls} from the engine's log var
   #last = null;    // {gen, seq} of the newest accepted line: the engine's
                    // seq restarts at 0 in every document, so dedupe keys on
@@ -143,7 +148,7 @@ class SyncView extends HTMLElement {
           border-color: #8c3a3a;
           color: light-dark(#b3261e, #f2b8b5);
         }
-        select, #discard, #kill, #clearlog, #syncdirs {
+        select, #discard, #kill, #clearlog, #syncdirs, #restore {
           font: inherit;
           min-height: 28px;
           padding: 2px 10px;
@@ -152,13 +157,14 @@ class SyncView extends HTMLElement {
           background: var(--bg, #f5f6f8);
           color: var(--fg, #1b1d21);
         }
-        #discard, #kill, #clearlog, #syncdirs { cursor: pointer; }
+        #discard, #kill, #clearlog, #syncdirs, #restore { cursor: pointer; }
         #discard:hover:enabled, #kill:hover:enabled,
-        #clearlog:hover:enabled, #syncdirs:hover:enabled {
+        #clearlog:hover:enabled, #syncdirs:hover:enabled,
+        #restore:hover:enabled {
           border-color: var(--dim, #6f747d);
         }
         #discard:disabled, #kill:disabled, #clearlog:disabled,
-        #syncdirs:disabled, select:disabled {
+        #syncdirs:disabled, #restore:disabled, select:disabled {
           opacity: 0.45;
           cursor: not-allowed;
         }
@@ -300,6 +306,12 @@ class SyncView extends HTMLElement {
             <span class="note" id="dirtyline">checking the dirty report…</span>
             <button id="syncdirs" type="button" disabled>Sync suggested dirs</button>
           </div>
+          <div class="row" id="ignorerow" hidden>
+            <span class="note" id="ignoreline"></span>
+            <select id="ignored" aria-label="Ignored folders"></select>
+            <button id="restore" type="button" disabled
+              title="Sync this folder again (the next run diff-reconciles it)">Restore sync</button>
+          </div>
         </header>
         <div id="queue" hidden></div>
        <main>
@@ -416,6 +428,24 @@ class SyncView extends HTMLElement {
       this.#buttons[id] = this.#shadow.getElementById(id);
     }
     this.#dirtyline = this.#shadow.getElementById('dirtyline');
+    this.#ignorerow = this.#shadow.getElementById('ignorerow');
+    this.#ignoreline = this.#shadow.getElementById('ignoreline');
+    this.#ignoredSel = this.#shadow.getElementById('ignored');
+    this.#buttons.restore = this.#shadow.getElementById('restore');
+    this.#buttons.restore.addEventListener('click', () => {
+      const dir = this.pickedIgnored();
+      if (!dir) {
+        return;
+      }
+      this.dispatchEvent(new CustomEvent('sync-ignore-restore', {
+        detail: {dir},
+        bubbles: true,
+        composed: true
+      }));
+    });
+    this.#ignoredSel.addEventListener('change', () => {
+      this.#apply();
+    });
     const KINDS = new Map([
       ['sync', 'sync'],
       ['dry', 'dry'],
@@ -501,6 +531,12 @@ class SyncView extends HTMLElement {
 
   pickedDir() {
     const v = this.#dir?.value ?? '';
+    return v && v !== '__none__' ? v : null;
+  }
+
+  /** the ignored folder picked for a Restore (null when none) */
+  pickedIgnored() {
+    const v = this.#ignoredSel?.value ?? '';
     return v && v !== '__none__' ? v : null;
   }
 
@@ -608,6 +644,37 @@ class SyncView extends HTMLElement {
       this.#dir.value = preferred;
     }
     this.#dir.disabled = !names.length;
+    this.#apply();
+  }
+
+  /**
+   * The picked account's ignored folders (server-spelled names, the
+   * wiring reads sync.ignore.<id>): one Restore row above the log pane —
+   * hidden entirely while the list is empty. An ignored folder never
+   * syncs; Restore removes it from the list and the next full run
+   * diff-reconciles it (local copy and server copy both kept).
+   */
+  setIgnored(names) {
+    this.#ignoredList = (Array.isArray(names) ? names : [])
+      .filter(d => typeof d === 'string' && d)
+      .sort((a, b) => a.localeCompare(b));
+    this.#ignorerow.hidden = !this.#ignoredList.length;
+    this.#ignoredSel.replaceChildren();
+    const none = document.createElement('option');
+    none.value = '__none__';
+    none.textContent = '— ignored folder —';
+    this.#ignoredSel.appendChild(none);
+    for (const name of this.#ignoredList) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      this.#ignoredSel.appendChild(opt);
+    }
+    this.#ignoreline.textContent = this.#ignoredList.length
+      ? 'ignored — not synced (' + this.#ignoredList.length + '): ' +
+        this.#ignoredList.join(', ')
+      : '';
+    this.#ignoreline.title = this.#ignoredList.join('\n');
     this.#apply();
   }
 
@@ -861,6 +928,9 @@ class SyncView extends HTMLElement {
     // the Stop button lives with the run: only meaningful while busy
     this.#buttons.kill.hidden = !this.#busy;
     this.#buttons.kill.disabled = !this.#busy;
+    // Restore is a pure storage edit: no run involved, just an account
+    // and a picked ignored folder
+    this.#buttons.restore.disabled = !hasAccount || !this.pickedIgnored();
   }
 }
 

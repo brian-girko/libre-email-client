@@ -93,6 +93,9 @@ class DirectoryView extends HTMLElement {
   #addButton;
   #subButton;
   #deleteButton;
+  #ignoreButton;
+  #ignored = new Set();  // server-spelled names of the ignored folders
+  #ignoreMode = false;   // checkbox edit mode (Ignore pressed, Done ends it)
   #confirmDialog;
   #confirmMessage;
   #pendingDelete = null;
@@ -212,6 +215,25 @@ class DirectoryView extends HTMLElement {
         .row.disabled {
           color: var(--dim, #8a8f98);
         }
+        .row.ignored .label {
+          text-decoration: line-through;
+          opacity: 0.55;
+        }
+        .row .ignore-box {
+          flex: none;
+          width: calc(14px * var(--font-scale, 1));
+          height: calc(14px * var(--font-scale, 1));
+          margin: 0 calc(3px * var(--font-scale, 1));
+          accent-color: var(--accent, AccentColor);
+          cursor: pointer;
+        }
+        .row .ignore-box:disabled {
+          cursor: default;
+          opacity: 0.45;
+        }
+        .row.ignored .counts {
+          text-decoration: line-through;
+        }
         .twist {
           flex: none;
           width: calc(20px * var(--font-scale, 1));
@@ -255,6 +277,13 @@ class DirectoryView extends HTMLElement {
           background: var(--pane-bg, #ffffff);
           border-top: 1px solid var(--line, #d9dce1);
           user-select: none;
+        }
+        /* the checkbox edit mode has no compact-mode surface (the select
+           carries no checkboxes): the offer hides on narrow layouts */
+        @media (max-width: 699.98px) {
+          .dir-btn.ignore {
+            display: none;
+          }
         }
         .dir-btn {
           min-height: calc(26px * var(--font-scale, 1));
@@ -383,6 +412,7 @@ class DirectoryView extends HTMLElement {
           <button class="add-sub" type="button" title="New subfolder of the selected folder" disabled>Sub</button>
           <button class="add" type="button" title="New top-level folder">Dir</button>
         </combo-view>
+        <button class="dir-btn ignore" type="button" title="Edit the ignored folders (not synced)">Ignore</button>
         <button class="dir-btn delete" type="button" title="Delete the selected folder" disabled>Delete</button>
       </div>
       <select class="dir-select" aria-label="Folders" hidden></select>
@@ -405,6 +435,7 @@ class DirectoryView extends HTMLElement {
     this.#addButton = root.querySelector('combo-view .add');
     this.#subButton = root.querySelector('combo-view .add-sub');
     this.#deleteButton = root.querySelector('.dir-btn.delete');
+    this.#ignoreButton = root.querySelector('.dir-btn.ignore');
     this.#dirSelect = root.querySelector('.dir-select');
     this.#confirmDialog = root.querySelector('.confirm-dialog');
     this.#confirmMessage = root.querySelector('.confirm-dialog .message');
@@ -448,6 +479,14 @@ class DirectoryView extends HTMLElement {
       this.#pendingDelete = node.name;
       this.#confirmMessage.textContent = `Delete folder "${node.label}" and its messages?`;
       this.#confirmDialog.showModal();
+    });
+    // "Ignore": toggle the checkbox edit mode. Nothing destructive happens
+    // here — the checkboxes change the account's ignore list live (the
+    // wiring saves every toggle), the local copy and the server copy both
+    // stay untouched, and Done simply leaves the mode.
+    this.#ignoreButton.addEventListener('click', () => {
+      this.#ignoreMode = !this.#ignoreMode;
+      this.#render();
     });
     this.#dirSelect.addEventListener('change', () => {
       const node = this.#byName.get(this.#dirSelect.value);
@@ -511,6 +550,27 @@ class DirectoryView extends HTMLElement {
 
   get dirs() {
     return this.#list;
+  }
+
+  /**
+   * The account's ignored folders (server-spelled names, exactly what the
+   * wiring stores under sync.ignore.<id>): checked folders render
+   * line-through and the checkbox edit mode seeds from this set. Unknown
+   * names are harmless — the tree simply has no row for them.
+   */
+  set ignored(names) {
+    this.#ignored = new Set((Array.isArray(names) ? names : [])
+      .filter(n => typeof n === 'string' && n));
+    this.#render();
+  }
+
+  get ignored() {
+    return [...this.#ignored];
+  }
+
+  /** whether the checkbox edit mode is on (the wiring never needs this) */
+  get ignoreMode() {
+    return this.#ignoreMode;
   }
 
   get selected() {
@@ -707,6 +767,30 @@ class DirectoryView extends HTMLElement {
       && !node.children.length;
   }
 
+  /** the folder itself is on the ignore list */
+  #selfIgnored(node) {
+    return this.#ignored.has(node.name);
+  }
+
+  /**
+   * Effective ignore state: the folder itself is on the list, or an
+   * ancestor is — the subtree rule the sync engine applies (an ignored
+   * folder ignores everything under it). Drives the line-through class
+   * and the checkbox seeding in edit mode.
+   */
+  #effectiveIgnored(node) {
+    return this.#selfIgnored(node) || this.#ancestorIgnored(node);
+  }
+
+  #ancestorIgnored(node) {
+    for (let p = node.parent; p; p = p.parent) {
+      if (this.#ignored.has(p.name)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   #updateActions() {
     const node = this.#selected ? this.#byName.get(this.#selected) : null;
     const noInferiors = !!node && node.attrs.some(a => /\\Noinferiors/i.test(String(a)));
@@ -721,15 +805,25 @@ class DirectoryView extends HTMLElement {
     this.#deleteButton.title = deletable
       ? `Delete "${node.label}"`
       : 'Select a folder to delete (INBOX and parent folders are protected)';
+    // the Ignore button is a mode toggle: no selection needed, and in the
+    // edit mode it reads Done (the checkboxes save their state live)
+    this.#ignoreButton.textContent = this.#ignoreMode ? 'Done' : 'Ignore';
+    this.#ignoreButton.title = this.#ignoreMode
+      ? 'Leave the ignore edit mode (changes are already saved)'
+      : 'Edit the ignored folders — checked folders are not synced (the local and server copies stay untouched)';
   }
 
   #row(node, depth) {
     const row = document.createElement('div');
     const selected = this.#selected === node.name;
+    const checkable = this.#ignoreMode && node.selectable &&
+      node.name.toUpperCase() !== 'INBOX';
+    const ignored = this.#effectiveIgnored(node);
     row.className = 'row'
       + (node.children.length ? ' parent' : '')
       + (selected ? ' selected' : '')
-      + (node.selectable ? '' : ' disabled');
+      + (node.selectable ? '' : ' disabled')
+      + (ignored ? ' ignored' : '');
     row.dataset.name = node.name;
     row.setAttribute('role', 'treeitem');
     row.setAttribute('aria-level', String(depth + 1));
@@ -753,7 +847,37 @@ class DirectoryView extends HTMLElement {
     counts.textContent = c ? `${c.unread}/${c.total}` : '-/-';
     counts.hidden = !node.selectable;
     counts.title = 'Unread/total messages';
-    row.append(twist, label, counts);
+    row.append(twist);
+    if (checkable) {
+      // edit-mode checkbox: checked = the folder itself is ignored OR an
+      // ancestor is (the subtree rule); an ignored parent's box is
+      // checked+disabled — uncheck the parent first. Toggling fires
+      // 'ignore-toggle' and the wiring saves the list live.
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.className = 'ignore-box';
+      const self = this.#selfIgnored(node);
+      const ancestor = ignored && !self;
+      box.checked = ignored;
+      box.disabled = ancestor;
+      box.title = ancestor
+        ? 'Ignored with the parent folder — uncheck the parent first'
+        : self
+          ? 'Ignored — not synced (the local copy stays; uncheck to sync again)'
+          : 'Ignore this folder (its subfolders ignore with it)';
+      // the checkbox is its own control: a click must never select/open
+      // the row underneath
+      box.addEventListener('click', e => e.stopPropagation());
+      box.addEventListener('change', () => {
+        this.dispatchEvent(new CustomEvent('ignore-toggle', {
+          detail: {name: node.name, ignored: box.checked},
+          bubbles: true,
+          composed: true
+        }));
+      });
+      row.append(box);
+    }
+    row.append(label, counts);
     row.addEventListener('click', e => {
       if (e.target === twist && node.children.length) {
         this.#toggle(node);

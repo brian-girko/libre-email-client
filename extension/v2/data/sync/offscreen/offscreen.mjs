@@ -82,10 +82,16 @@
 
 import {createClient} from './client.mjs';
 import {prepare} from '/core/fs.mjs';
-import {MaildirStore, folderFor, parseFilename} from '../maildir.mjs';
+import {MaildirStore, folderFor, parseFilename, isIgnoredFolder, normalizeFolderPath} from '../maildir.mjs';
 import {createSync} from './sync.mjs';
 import {runAllFilters} from '../filters/run.mjs';
 import {routeMessage} from '../filters/route.mjs';
+
+/** the job-carried ignore list, normalized (the engine has no chrome.storage:
+ *  the worker and the scheduler attach the stored sync.ignore.<id> list) */
+const ignoresOf = job =>
+  (Array.isArray(job?.ignores) ? job.ignores : [])
+    .filter(n => typeof n === 'string' && n);
 
 // Everything that needs restricted chrome.* APIs lives elsewhere:
 //   - account configs arrive IN the job (the client page resolves them;
@@ -661,7 +667,10 @@ function enqueueJob(msg) {
     filters: Array.isArray(msg.filters) ? msg.filters.slice() : null,
     // the stored gate preferences (sync-ui.purge / sync-ui.drop): only a
     // saved yes/no counts, null = ask (the DECISIONS default stands in)
-    prefs: gatePrefsOf(msg)
+    prefs: gatePrefsOf(msg),
+    // the account's folder ignore list (sync.ignore.<id>): ignored folders
+    // never join the survey — the kept local copies stay untouched
+    ignores: ignoresOf(msg)
   });
   engineLog('queue',
     `${describeJob(msg)} requested — ` +
@@ -773,10 +782,32 @@ function pullRouteOf(job, account) {
   if (!filters.length) {
     return null;
   }
+  // the ignore list applies to routing destinations too: a filter whose
+  // target folder is ignored (its subtree included) would land mail in a
+  // folder the engine never surveys again — the pending move could never
+  // replay. Such a match reads as NO match: the message stays in INBOX,
+  // the post-sync pass skips the ignored filter as well (its own guard),
+  // so nothing is ever written into the ignored folder.
+  const ignores = ignoresOf(job);
+  const delim = typeof account?.delimiter === 'string' && account.delimiter
+    ? account.delimiter : '/';
+  const ignoredDests = new Map();   // dest folder → warned already
   return async raw => {
     const res = await routeMessage(raw, {filters, accountId: account.id});
     if (!res.matched) {
       return res;
+    }
+    if (res.action !== 'stop' && res.folder) {
+      const dest = normalizeFolderPath(res.folder, delim);
+      if (isIgnoredFolder(dest, ignores, delim)) {
+        if (!ignoredDests.has(dest)) {
+          ignoredDests.set(dest, true);
+          engineLog('filter',
+            `filter destination "${dest}" is on the ignore list — matching messages stay in INBOX (the folder is not synced)`,
+            'warn');
+        }
+        return {...res, matched: false};
+      }
     }
     const i = stored.findIndex(g => g && g.id === res.filter?.id);
     return {...res, no: i >= 0 ? i + 1 : null};
@@ -813,7 +844,14 @@ function pullRouteOf(job, account) {
  */
 async function runPostSyncFilters(job, store, account, uids, {dirty = false, routed = null} = {}) {
   const stored = Array.isArray(job.filters) ? job.filters : [];
-  const filters = stored.filter(f => f && f.enabled !== false &&
+  // a move filter whose destination joined the ignore list is skipped: the
+  // pull-time router already treats such matches as no-match, so this pass
+  // must not write into the ignored folder either (its local mirror is the
+  // user's kept copy, not a filter target)
+  const ignores = ignoresOf(job);
+  const delim = typeof account?.delimiter === 'string' && account.delimiter
+    ? account.delimiter : '/';
+  let filters = stored.filter(f => f && f.enabled !== false &&
     typeof f.query === 'string' &&
     (f.action === 'stop' || f.folder));
   // full-account runs and INBOX-scoped dir runs filter their new INBOX
@@ -822,6 +860,18 @@ async function runPostSyncFilters(job, store, account, uids, {dirty = false, rou
     String(job.dir || '').toUpperCase() === 'INBOX';
   if (job.kind !== 'sync' && !dirScopedInbox) {
     return;
+  }
+  if (filters.length && ignores.length) {
+    const skipped = filters.filter(f => f.action !== 'stop' && f.folder &&
+      isIgnoredFolder(normalizeFolderPath(f.folder, delim), ignores, delim));
+    if (skipped.length) {
+      for (const f of skipped) {
+        engineLog('filter',
+          `filter destination "${f.folder}" is on the ignore list — filter skipped (matching messages stay in place)`,
+          'warn');
+      }
+      filters = filters.filter(f => !skipped.includes(f));
+    }
   }
   if (!filters.length || !(uids instanceof Set)) {
     return;
@@ -1044,8 +1094,23 @@ async function withSession(job) {
       // per-dir failure logs and moves on, the rest still sync. dry-dirs
       // is the merge-fused form of queued dry-dir jobs: survey-only.
       const dry = job.kind.startsWith('dry');
-      const dirs = (job.dirs || []).filter(d =>
-        typeof d === 'string' && d);
+      // the ignore list applies here too: a queued job's dir that joined
+      // the ignore list since it was marked dirty is skipped with its own
+      // line, the rest still run
+      const ignores = ignoresOf(job);
+      const delim = typeof account.delimiter === 'string' && account.delimiter
+        ? account.delimiter : '/';
+      const dirs = [];
+      for (const d of (job.dirs || []).filter(d =>
+        typeof d === 'string' && d)) {
+        if (isIgnoredFolder(d, ignores, delim)) {
+          engineLog(dry ? 'dry' : 'sync',
+            `dir "${d}" is on the ignore list — skipped`);
+        }
+        else {
+          dirs.push(d);
+        }
+      }
       if (!dirs.length) {
         engineLog(dry ? 'dry' : 'sync', '(no dirs listed — nothing to sync)');
         return {started: true};
@@ -1067,6 +1132,7 @@ async function withSession(job) {
             pullQuantum,
             miningBatch,
             only: dir,
+            ignores,
             route: dirInbox ? pullRouteOf(job, account) : null
           });
           liveEngines.add(engine);
@@ -1139,6 +1205,17 @@ async function withSession(job) {
       }
     }
     else {
+      const ignores = ignoresOf(job);
+      const delim = typeof account.delimiter === 'string' && account.delimiter
+        ? account.delimiter : '/';
+      // a dir-scoped job whose target joined the ignore list since it was
+      // submitted: no session at all (the survey guard inside the engine
+      // is the second line of defence)
+      if (only != null && isIgnoredFolder(only, ignores, delim)) {
+        engineLog(job.kind.startsWith('dry') ? 'dry' : 'sync',
+          `dir "${only}" is on the ignore list — nothing to sync`);
+        return {started: true};
+      }
       engine = createSync(mail, store, {
         account: `${account.user}@${account.host}`,
         log: engineLog,
@@ -1148,6 +1225,7 @@ async function withSession(job) {
         pullQuantum,
         miningBatch,
         only,
+        ignores,
         // the job's filter list routes INBOX pulls into their destination
         // Maildir WHILE they land (null for interface jobs: no filters ride
         // the sync interface's own buttons — see pullRouteOf)

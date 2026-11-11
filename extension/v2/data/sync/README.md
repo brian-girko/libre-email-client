@@ -150,6 +150,83 @@ wins; the pref only decides when no interface responds. A closed panel that
 still receives a `sync-confirm-req` broadcast answers from the stored value
 the same way instead of declining unconditionally.
 
+## Ignored folders (the folder-pane checkboxes)
+
+Every account carries an ignore list — `chrome.storage.local`, flat key
+`sync.ignore.<id>` (one array of **server-spelled** folder names; the
+writers resolve slug/id references alike, see `data/sync/ignore.mjs`).
+The mail client's folder pane owns the surface: its **Ignore** button
+turns the tree into a checkbox edit mode — one checkbox per folder
+(INBOX and pure hierarchy parents get none), each change saved live, and
+the same checkboxes are the un-ignore path. Ignored folders render
+**line-through** on the tree. The sync panel keeps a secondary
+management surface: an ignored-folders row with a per-folder **Restore
+sync** button (and its Dir select hides ignored folders — they are never
+scoppable).
+
+**Configuring before the first sync.** The folder pane can only list
+folders that exist locally, so two page-side surfaces cover the "big
+folder, fast everything else" case before any pull happens — both fetch
+the folder list from the SERVER with a one-off IMAP session
+(`data/sync/client/folders-probe.mjs`): the page imports the facade
+`createClient` directly (the documented page-side path), acquires the
+bridge under its own `folders-probe` ref key (`bridge-acquire` /
+`bridge-release` — refs are a Set of keys, a probe can never collide
+with a run's `sync` ref), lists the mailboxes and tears everything down.
+The offscreen document is deliberately NOT involved — it works exactly
+like before. The derived hierarchy delimiter is broadcast like a run's
+summary (`sync-delimiter`), stamping `sync.delimiter.<id>` before the
+first sync.
+
+- **Welcome wizard, step 4** ("Ignored folders"): step 3's Next only
+  validates the form — the whole save is postponed to step 4's Finish,
+  AFTER the folder list was fetched straight off the form fields. Finish
+  saves the account + the ignore selection and starts the first sync. A
+  failed fetch never blocks setup: "Continue — sync everything" finishes
+  without touching the list.
+- **Options page, account editor**: an "Edit ignored folders…" button
+  before "Save This Account", enabled once the required fields are
+  valid; it probes with the FORM's connection values (typed password, or
+  the stored one via the master-password prompt) and renders the same
+  checkbox tree inline. The selection is held in memory and persisted
+  together with "Save This Account" — before the new-account auto-sync
+  submits, so the very first run already carries it.
+- **`<folder-tree>`** (`data/sync/client/components/folder-tree.js`) is
+  the shared checkbox tree of both surfaces, with the pane's semantics
+  (subtree rule, disabled descendants under an ignored parent,
+  line-through).
+
+What ignoring means:
+
+- **The folder is never synced.** The engine's survey drops ignored
+  folders (and, by the subtree rule, everything under them: ignoring
+  `Work` covers `Work/Sub`) — never surveyed, never planned, never
+  applied. A scoped (`--dir`) run onto an ignored folder stands down
+  with its own log line; `sync-dirs` jobs skip ignored dirs the same way.
+- **The local copy is kept.** Ignored folders' local Maildirs are
+  excluded from the `localOnly` computation — a kept mirror with a
+  snapshot entry must never misclassify as a `dropLocal` op and get
+  deleted behind the dir-drop gate. Ignored folders stay browsable in
+  the client; their mirror simply stops tracking the server.
+- **The server copy is untouched.** Ignoring is a local scheduling
+  decision, not a server delete.
+- **The snapshot entry carries forward.** Full-run commits copy every
+  ignored folder's `.sync-state.json` entry over the rewrite, so
+  un-ignoring later diff-reconciles the folder (the normal three-way
+  K/S/L diff) instead of re-pulling it from scratch.
+- **Filter routing respects the list.** A filter whose destination is
+  ignored reads as a no-match at pull time (the message stays in INBOX),
+  and the post-sync filter pass skips ignored-destination filters —
+  nothing is ever written into a folder the engine will never survey
+  again.
+
+Like the filter list and the gate preferences, the offscreen engine
+cannot read `chrome.storage`: the worker (`sync-request`) and the
+scheduler (every alarm-driven run) attach the stored list to each
+forwarded `sync-job` as `ignores`. The matching helper
+(`isIgnoredFolder` in `maildir.mjs`) is exact-name OR
+`entry + delimiter` prefix.
+
 ## Why this exists
 
 The extension wires an IMAP session through three layers, all hidden behind

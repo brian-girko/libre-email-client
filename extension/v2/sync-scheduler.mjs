@@ -85,6 +85,7 @@ import {ensure} from '/core/offscreen.mjs';
 import {dlog} from '/core/debug-log.mjs';
 import {loadAccounts, decryptPassword, loadGatePrefs} from '/data/sync/client/accounts.mjs';
 import {delimiterFor} from '/data/sync/client/delimiter.mjs';
+import {loadIgnores} from '/data/sync/ignore.mjs';
 import {loadFilters} from '/data/sync/filters/route.mjs';
 import {getNeeded, clearDirs, clearAccount} from '/dirty.mjs';
 
@@ -329,6 +330,9 @@ function jobDirty(alarm) {
     }
     const list = await filters();
     const prefs = await loadGatePrefs().catch(() => null);
+    // the ignore list rides along like the filters/prefs do (the engine
+    // has no chrome.storage): ignored folders are never synced
+    const ignores = await loadIgnores(acc).catch(() => []);
     // the delimiter rides along too (no chrome.storage offscreen-side):
     // the engine seeds its store with the server's hierarchy spelling
     const delimiter = await delimiterFor(acc).catch(() => null);
@@ -345,7 +349,8 @@ function jobDirty(alarm) {
       // the stored gate preferences ride along the same way (the engine
       // has no chrome.storage): a headless answer follows the saved
       // 'Purge from server' / 'Drop local dir' choice
-      ...(prefs ? {prefs} : {})
+      ...(prefs ? {prefs} : {}),
+      ...(ignores.length ? {ignores} : {})
     });
     if (res.started !== false) {
       await clearDirs(accountKeys(acc), dirs)
@@ -387,15 +392,19 @@ async function submitFull(acc, cfg, tag, passValue) {
   if (delimiter) {
     payload.account.delimiter = delimiter;
   }
-  const [list, prefs] = await Promise.all([
+  const [list, prefs, ignores] = await Promise.all([
     filters(),
-    loadGatePrefs().catch(() => null)
+    loadGatePrefs().catch(() => null),
+    loadIgnores(acc).catch(() => [])
   ]);
   if (list.length) {
     payload.filters = list;
   }
   if (prefs) {
     payload.prefs = prefs;
+  }
+  if (ignores.length) {
+    payload.ignores = ignores;
   }
   const res = await submitJob(payload);
   if (res.started !== false) {
@@ -588,6 +597,9 @@ function syncBadgeDirs(cause) {
       try {
         const list = await filters();
         const prefs = await loadGatePrefs().catch(() => null);
+        // the ignore list rides along like the filters/prefs do (the
+        // engine has no chrome.storage): ignored folders are never synced
+        const ignores = await loadIgnores(acc).catch(() => []);
         // the delimiter rides along (no chrome.storage offscreen-side)
         const delimiter = await delimiterFor(acc).catch(() => null);
         const res = await submitJob({
@@ -597,7 +609,8 @@ function syncBadgeDirs(cause) {
           account: {...acc, pass: passValue, ...(delimiter ? {delimiter} : {})},
           dirs,
           ...(list.length ? {filters: list} : {}),
-          ...(prefs ? {prefs} : {})
+          ...(prefs ? {prefs} : {}),
+          ...(ignores.length ? {ignores} : {})
         });
         if (res.started !== false) {
           accepted++;

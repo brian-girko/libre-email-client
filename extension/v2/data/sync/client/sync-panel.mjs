@@ -47,6 +47,7 @@ import {getRootHandle} from '../../client/local-api.mjs';
 import {loadFilters} from '../filters/route.mjs';
 import {runAllFilters, runFilter} from '../filters/run.mjs';
 import {delimiterFor} from './delimiter.mjs';
+import {loadIgnoresById, saveIgnores} from '../ignore.mjs';
 
 /**
  * Wires one <sync-view> element to the offscreen sync engine.
@@ -368,7 +369,19 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       }
     }
     await refreshDirs();
-    return Promise.all([refreshFilters(), refreshDirty()]);
+    return Promise.all([refreshFilters(), refreshDirty(), refreshIgnores()]);
+  }
+
+  /**
+   * The picked account's ignored folders (sync.ignore.<id>) into the
+   * Restore row — the management surface for what the client's folder
+   * pane checkbox mode created. Re-queried on open, on account changes
+   * and after every restore.
+   */
+  async function refreshIgnores() {
+    const acc = findAccount(syncView.pickedAccount());
+    const names = acc ? await loadIgnoresById(acc.id).catch(() => []) : [];
+    syncView.setIgnored(names);
   }
 
   /**
@@ -399,7 +412,13 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     if (acc && fs) {
       try {
         const store = await openStore(fs, acc.slug, acc.id);
-        names = (await store.listFolders()).sort((a, b) => a.localeCompare(b));
+        // ignored folders are not scoppable (they never sync): the dir
+        // select hides them — the Restore row is their only surface here
+        const ignored = new Set(
+          await loadIgnoresById(acc.id).catch(() => []));
+        names = (await store.listFolders())
+          .filter(name => !ignored.has(name))
+          .sort((a, b) => a.localeCompare(b));
       }
       catch (e) {
         names = [];
@@ -651,7 +670,8 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
     if (!forcedAccount && id) {
       setLastPref('lastAccount', id);
     }
-    return Promise.all([refreshDirs(), refreshFilters(), refreshDirty()]);
+    return Promise.all([refreshDirs(), refreshFilters(), refreshDirty(),
+      refreshIgnores()]);
   });
   syncView.addEventListener('sync-dir-changed', e => {
     const acc = findAccount(syncView.pickedAccount());
@@ -698,8 +718,28 @@ export function initSyncPanel(syncView, promptEl, opts = {}) {
       .catch(e => syncView.setStatus('stop failed: ' + (e?.message || String(e))));
   });
 
-  // one queued job's drop button: removes exactly that pending entry —
-  // the running job is untouchable (Stop is the only way out of a live run)
+  // un-ignore (the Restore row): the folder leaves the account's ignore
+  // list — pure storage edit, no engine involvement. The next full sync
+  // surveys it again and the normal three-way diff reconciles the kept
+  // local copy against the server.
+  syncView.addEventListener('sync-ignore-restore', e => {
+    const dir = e?.detail?.dir;
+    const acc = findAccount(syncView.pickedAccount());
+    if (!acc || typeof dir !== 'string' || !dir) {
+      return;
+    }
+    (async () => {
+      const list = await loadIgnoresById(acc.id);
+      await saveIgnores(acc.id, list.filter(name => name !== dir));
+      syncView.localNote(
+        `"${dir}" restored to the sync — the next run surveys it again and ` +
+        'diff-reconciles the kept local copy (nothing is re-pulled from scratch)', 'hint');
+      await refreshIgnores();
+      await refreshDirs();
+    })().catch(err =>
+      syncView.setStatus('restore failed: ' + (err?.message || String(err))));
+  });
+
   syncView.addEventListener('sync-job-drop', e => {
     const rid = e?.detail?.rid;
     if (typeof rid !== 'string' || !rid) {

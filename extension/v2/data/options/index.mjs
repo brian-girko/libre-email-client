@@ -84,6 +84,121 @@ const addBtn = document.getElementById('add-account');
 const deleteBtn = document.getElementById('delete-account');
 const savedEl = document.getElementById('saved');
 
+// ---- ignored folders (the inline editor above "Save This Account") ----
+// The tree's selection lives in memory only: it is persisted together with
+// the account on "Save This Account", and unsaved edits are discarded when
+// the selection changes or the editor closes (the stored list stays).
+const editIgnoresBtn = document.getElementById('edit-ignores');
+const ignoreEditorEl = document.getElementById('ignore-editor');
+const ignoreStatusEl = document.getElementById('ignore-status');
+const ignoreTreeEl = document.getElementById('ignore-tree');
+let ignoreOpen = false;
+
+function ignoreFieldsValid() {
+  const host = FIELDS['imap.host'].value.trim();
+  const port = Number(FIELDS['imap.port'].value);
+  const name = FIELDS['user.name'].value.trim();
+  return !!host && Number.isInteger(port) && port >= 1 && port <= 65535 &&
+    !!name;
+}
+
+function updateIgnoreButton() {
+  editIgnoresBtn.disabled = !ignoreFieldsValid() || ignoreProbeRunning;
+  document.getElementById('ignore-hint').textContent = ignoreFieldsValid()
+    ? 'Fetch the folder list from the server and pick what not to sync.'
+    : 'Fill in host, port and user name to fetch the folder list.';
+}
+
+// the connection for the probe: form values first (unsaved edits are
+// probed honestly); the password is the typed one, or the stored one
+// (decrypted — a master-password prompt may appear) when the field is
+// empty. Null when neither exists.
+async function probeAccountForEditor() {
+  const account = {
+    id: selectedId,
+    host: FIELDS['imap.host'].value.trim(),
+    port: Number(FIELDS['imap.port'].value),
+    secure: FIELDS['imap.secure'].checked,
+    allowSelfSigned: FIELDS['imap.allowSelfSigned'].checked,
+    user: FIELDS['user.name'].value.trim(),
+    name: document.getElementById('f-label').value.trim() || 'Account'
+  };
+  const formPass = FIELDS['user.pass'].value;
+  if (formPass) {
+    account.pass = formPass;
+    return account;
+  }
+  try {
+    const stored = (await loadAccounts(promptEl))
+      .find(a => a.id === selectedId);
+    if (stored?.pass) {
+      account.pass = stored.pass;
+      return account;
+    }
+  }
+  catch {}
+  return null;
+}
+
+let ignoreProbeRunning = false;
+
+editIgnoresBtn.addEventListener('click', async () => {
+  if (ignoreProbeRunning) {
+    return;
+  }
+  if (ignoreOpen) {
+    closeIgnoreEditor();
+    return;
+  }
+  ignoreProbeRunning = true;
+  updateIgnoreButton();
+  ignoreEditorEl.hidden = false;
+  ignoreTreeEl.hidden = true;
+  ignoreStatusEl.textContent = 'Fetching your folders…';
+  try {
+    const account = await probeAccountForEditor();
+    if (!account) {
+      ignoreStatusEl.textContent =
+        'No password available — type it in the password field above ' +
+        '(it is saved with the account as usual), then fetch again.';
+      return;
+    }
+    // lazy import: a module-load failure (or anything else) degrades to a
+    // status line — the options page itself can never die from the editor
+    const {fetchFolders} = await import('../sync/client/folders-probe.mjs');
+    const res = await fetchFolders(account);
+    if (!res.ok) {
+      ignoreStatusEl.textContent =
+        'Fetching the folder list failed: ' + (res.error || 'unknown');
+      return;
+    }
+    ignoreTreeEl.setFolders(res.folders, res.delimiter || '/');
+    const {loadIgnoresById} = await import('../sync/ignore.mjs');
+    ignoreTreeEl.setIgnored(await loadIgnoresById(selectedId));
+    ignoreTreeEl.hidden = false;
+    ignoreStatusEl.textContent = '';
+    ignoreOpen = true;
+    editIgnoresBtn.textContent = 'Close ignored folders';
+  }
+  catch (e) {
+    console.error('[options] ignore editor failed:', e?.message || e);
+    ignoreStatusEl.textContent = 'Fetching failed: ' + (e?.message || e);
+  }
+  finally {
+    ignoreProbeRunning = false;
+    updateIgnoreButton();
+  }
+});
+
+function closeIgnoreEditor() {
+  ignoreOpen = false;
+  ignoreEditorEl.hidden = true;
+  ignoreTreeEl.hidden = true;
+  ignoreStatusEl.textContent = '';
+  editIgnoresBtn.textContent = 'Edit ignored folders…';
+  updateIgnoreButton();
+}
+
 const tabsEl = document.getElementById('tabs');
 const TAB_NAMES = ['global', 'accounts', 'actions', 'filters', 'storage'];
 
@@ -158,6 +273,12 @@ let draft = null;
 let selectedId = null;
 let flashTimer = null;
 let passDirty = false;
+
+// the ignore button follows the form's validity live: any change in the
+// required fields re-evaluates it (same rule the submit guard applies)
+for (const name of ['imap.host', 'imap.port', 'user.name']) {
+  FIELDS[name].addEventListener('input', updateIgnoreButton);
+}
 
 const key = (name, id) => name + '.' + id;
 const byOrder = (a, b) => a.order - b.order;
@@ -324,9 +445,13 @@ async function select(id) {
     ? ''
     : 'Stored (encrypted) — not shown until the master password is confirmed';
   passDirty = false;
+  // the ignore editor belongs to the previous account: close it so a
+  // pending (unsaved) selection can never leak into the newly selected one
+  closeIgnoreEditor();
   render();
   updateSecureDependentFields();
   updateBadgeFields();
+  updateIgnoreButton();
 }
 
 function updateBadgeFields() {
@@ -457,6 +582,21 @@ formEl.addEventListener('submit', async e => {
   }
   writes.accounts = accounts;
   await chrome.storage.local.set(writes);
+  // the open ignore editor's selection rides the save: persisted together
+  // with the account, BEFORE the new-account auto-sync below submits (the
+  // worker attaches the stored list to every sync-request). Lazy import +
+  // best-effort: a module failure must never fail the account save.
+  if (ignoreOpen) {
+    try {
+      const {saveIgnores} = await import('../sync/ignore.mjs');
+      await saveIgnores(selectedId, ignoreTreeEl.getIgnored());
+      closeIgnoreEditor();
+    }
+    catch (e) {
+      console.error('[options] ignore list save failed:', e?.message || e);
+      flash('Saving the ignored folders failed', true);
+    }
+  }
   await chrome.storage.local.remove(key('email.showRemoteContent', selectedId));
   if (passDirty) {
     // the client prefers the per-session plain password over the stored one;
@@ -515,6 +655,8 @@ deleteBtn.addEventListener('click', async () => {
     await chrome.storage.local.remove([...Object.keys(FIELDS), 'email.showRemoteContent'].map(name => key(name, selectedId)));
     // engine-discovered state the worker stamps outside the FIELDS set
     await chrome.storage.local.remove('sync.delimiter.' + selectedId);
+    // the account's ignore list goes with it (saveIgnores's key style)
+    await chrome.storage.local.remove('sync.ignore.' + selectedId);
     await chrome.storage.session.remove(key('user.pass', selectedId));
     accounts = accounts.filter(a => a.id !== selectedId);
   }

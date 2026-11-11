@@ -12,6 +12,7 @@
     <span class="dot active"></span>
     <span class="dot"></span>
     <span class="dot"></span>
+    <span class="dot"></span>
   </div>
 
   <!-- Step 1: Mode Choice -->
@@ -131,12 +132,33 @@
     <p id="form-error" class="error"></p>
     <div class="nav">
       <input type="button" data-cmd="back" value="Back">
-      <input type="button" data-cmd="finish" value="Finish" disabled>
+      <input type="button" data-cmd="next" value="Next">
+    </div>
+  </section>
+
+  <!-- Step 4: Ignored Folders (the account is saved on Finish, AFTER the
+       folder list was fetched — the ignore choices ride the first sync) -->
+  <section id="step-4" class="step" hidden>
+    <h1>Ignored Folders</h1>
+    <p>Uncheck folders you do not want to sync. Ignored folders are skipped
+       by every sync — the local copy and the server copy both stay
+       untouched, and the choice can be changed later from the options page
+       or the folder pane.</p>
+    <p id="folders-status">Fetching your folders…</p>
+    <folder-tree id="folders-tree" hidden></folder-tree>
+    <p class="hint" id="folders-note" hidden></p>
+    <div class="actions">
+      <input type="button" data-cmd="continue-all" value="Continue — sync everything" hidden>
+    </div>
+    <div class="nav">
+      <input type="button" data-cmd="back" value="Back">
+      <input type="button" data-cmd="finish" value="Finish">
     </div>
   </section>
 
   <prompt-view id="prompt" hidden></prompt-view>
   <script src="/data/components/prompt-view.js"></script>
+  <script type="module" src="/data/sync/client/components/folder-tree.js"></script>
   <script src="index.js"></script>
 </body>
 </html>

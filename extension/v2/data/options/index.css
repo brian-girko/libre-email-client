@@ -223,6 +223,14 @@ button:disabled {
   white-space: pre-line;
 }
 
+/* the ignored-folders row (account editor): breathing room below the
+   button — to the editor panel when it is open, and to the
+   "Save This Account" row when it is closed (the editor's own fieldset
+   carries the spacing back down to the Save row, same 14px rhythm) */
+#ignore-row {
+  margin-bottom: 14px;
+}
+
 #saved,
 #global-saved,
 #master-saved,

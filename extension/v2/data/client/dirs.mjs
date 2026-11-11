@@ -5,6 +5,7 @@ import {enqueue, accountPendingJobs} from './jobs.mjs';
 import * as counters from './counters.mjs';
 import {listAccounts} from './accounts.mjs';
 import {isSyncRunning} from './sync-events.mjs';
+import {loadIgnores, saveIgnores} from '../sync/ignore.mjs';
 import {MODE_EXTERNAL, getStorageMode} from '../sync/root-handle.mjs';
 
 let el = null;
@@ -269,6 +270,13 @@ async function load(id) {
     el.dirs = dirs;
     replayCounts(id);
     countDirs(api, id, token);
+    // the ignore list rides along (server-spelled names on the tree): the
+    // line-through rows and the checkbox edit mode seed from it
+    loadIgnores(id).then(list => {
+      if (token === loadToken && accountId === id && el?.isConnected) {
+        el.ignored = list;
+      }
+    }).catch(() => {});
     // Nothing to bring up to date in the background — the tree/list render
     // from the disk truth immediately (the picker's re-grant flow recovers a
     // lost handle; the sync engine's own pass refreshes the files).
@@ -361,6 +369,45 @@ function init(element) {
   });
   el.addEventListener('delete-dir', e => {
     deleteDir(e);
+  });
+  // One checkbox toggle in the tree's ignore edit mode: the view already
+  // shows the wanted state (line-through + box), storage catches up here.
+  // Saves serialize through a chain so rapid toggles never lose a change
+  // to a concurrent read-modify-write.
+  let ignoreChain = Promise.resolve();
+  el.addEventListener('ignore-toggle', e => {
+    const {name, ignored} = e.detail || {};
+    if (!accountId || typeof name !== 'string' || !name ||
+        typeof ignored !== 'boolean') {
+      return;
+    }
+    const id = accountId;
+    // optimistic: the row's line-through — and any descendant's
+    // checked+disabled state — follows the checkbox right away (the
+    // storage save below only makes it durable; the view must not wait
+    // for it, or the styling lags until the next load)
+    const set = new Set(el.ignored);
+    if (ignored) {
+      set.add(name);
+    }
+    else {
+      set.delete(name);
+    }
+    el.ignored = [...set];
+    ignoreChain = ignoreChain.then(async () => {
+      if (accountId !== id) {
+        return;   // the account was switched while the chain waited
+      }
+      const list = await loadIgnores(id);
+      if (accountId !== id) {
+        return;
+      }
+      const next = ignored
+        ? [...new Set([...list, name])]
+        : list.filter(n => n !== name);
+      await saveIgnores(id, next);
+    }).catch(err =>
+      console.warn('[dirs] ignore list save failed:', err?.message || err));
   });
 }
 

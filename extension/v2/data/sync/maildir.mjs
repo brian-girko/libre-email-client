@@ -245,6 +245,38 @@ export function sameFolder(a, b, delimiter = '/') {
   return normalizeFolderPath(a, delimiter) === normalizeFolderPath(b, delimiter);
 }
 
+/**
+ * The ignore-list test, shared by the client's tree (checkbox edit mode)
+ * and the sync engine's survey: `name` is ignored when it equals an entry
+ * EXACTLY, or when it sits UNDER one — an ignored folder ignores its whole
+ * subtree (entry + hierarchy delimiter prefix). Entries are server-spelled
+ * names (the survey's/snapshot's currency); the delimiter is the folder's
+ * own hierarchy delimiter where the caller knows it, the account's
+ * discovered one otherwise.
+ * @param {string} name server folder name to test
+ * @param {string[]} [ignores] stored ignore entries (server-spelled)
+ * @param {string} [delimiter] server hierarchy delimiter
+ * @returns {boolean}
+ */
+export function isIgnoredFolder(name, ignores = [], delimiter = '/') {
+  if (!name) {
+    return false;
+  }
+  const list = Array.isArray(ignores) ? ignores : [];
+  for (const entry of list) {
+    if (typeof entry !== 'string' || !entry) {
+      continue;
+    }
+    if (entry === name) {
+      return true;
+    }
+    if (delimiter && name.startsWith(entry + delimiter)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 let seq = 0;
 
 /** "<ts>.M<msec>P<pid>Q<seq>.<host>" — the unique part of a maildir name */

@@ -55,7 +55,7 @@
 
 'use strict';
 
-import {KNOWN_FLAG_NAMES, knownFlags, md5hex, normalizeFolderPath, sameFolder, sameFlags, STAR_COLOR_KEYWORDS} from '../maildir.mjs';
+import {KNOWN_FLAG_NAMES, knownFlags, md5hex, normalizeFolderPath, sameFolder, sameFlags, isIgnoredFolder, STAR_COLOR_KEYWORDS} from '../maildir.mjs';
 import {msgidOf, validateMail} from '../snapshot.mjs';
 
 // server flags that never mean anything outside their session — never
@@ -342,9 +342,20 @@ function resolveOnly(all, wanted) {
 // When `only` names one folder, the whole pipeline (survey, plan, apply,
 // snapshot) is scoped to that single dir: the rest of the account keeps its
 // snapshot untouched and only that dir's entry is rewritten.
-export function createSync(mail, store, {account = null, log = console.log, onProgress = null, only = null, confirmPurge = null, confirmDropDirectory = null, pullBatch = 8, pullQuantum = 10, miningBatch = 100, route = null} = {}) {
+export function createSync(mail, store, {account = null, log = console.log, onProgress = null, only = null, confirmPurge = null, confirmDropDirectory = null, pullBatch = 8, pullQuantum = 10, miningBatch = 100, route = null, ignores = null} = {}) {
   pullQuantum = Math.max(1, Math.floor(Number(pullQuantum) || 10));
   miningBatch = Math.max(1, Math.floor(Number(miningBatch) || 100));
+  // the account's folder ignore list (job-carried — the engine has no
+  // chrome.storage): ignored folders are NEVER surveyed, planned or applied,
+  // and their local mirror copies are kept untouched. The entries are
+  // server-spelled names; a folder whose parent is ignored is ignored too
+  // (isIgnoredFolder's subtree rule). `isIgn` tests one name against the
+  // list — the folder's own delimiter where the caller knows it, the
+  // account's discovered delimiter otherwise.
+  const ignoreList = (Array.isArray(ignores) ? ignores : [])
+    .filter(n => typeof n === 'string' && n);
+  const isIgn = (name, delimiter = store.delimiter || '/') =>
+    ignoreList.length > 0 && isIgnoredFolder(name, ignoreList, delimiter);
   const emitLog = (type, content, cls = '') =>
     log({type, content, cls});
   let selected = null;
@@ -489,8 +500,24 @@ async function rowsFor(name, uidnext) {
       if (resolved !== only) {
         only = resolved;
       }
+      if (isIgn(only)) {
+        // a scoped run onto an ignored folder syncs nothing: the folder is
+        // on the ignore list (its subtree included) — report and stand down
+        emitLog('survey', `folder "${only}" is on the ignore list — nothing to sync`);
+        return {snap, folders: new Map(), localOnly: [], allFolders: all};
+      }
     }
-    const selectable = only ? all.filter(f => f.name === only) : all;
+    const selectable = only
+      ? all.filter(f => f.name === only)
+      // ignored folders never join the survey — never planned, never
+      // applied, the server copy untouched (their local mirrors stay)
+      : all.filter(f => !isIgn(f.name, f.delimiter));
+    const ignoredCount = only ? 0
+      : all.length - selectable.length;
+    if (ignoredCount) {
+      const names = all.filter(f => isIgn(f.name, f.delimiter)).map(f => f.name);
+      emitLog('survey', `ignored: ${ignoredCount} folder(s) on the ignore list (not synced): ${names.join(', ')}`);
+    }
     const folders = new Map();
     const localCache = new Map();   // folder → listing (avoids double disk reads)
     async function listLocalCached(name) {
@@ -636,7 +663,12 @@ async function rowsFor(name, uidnext) {
     }
     const localOnly = only
       ? []
-      : (await store.listFolders()).filter(name => !folders.has(name));
+      // ignored folders' local mirrors are KEPT: they must never join the
+      // localOnly set — a kept copy with a snapshot entry would otherwise
+      // classify as a dropLocal op (and behind the dir-drop gate actually
+      // delete the copy the user chose to keep)
+      : (await store.listFolders())
+        .filter(name => !folders.has(name) && !isIgn(name));
     // INBOX first, then smallest dirs: their maildir structure lands locally (and the
     // snapshot commits a folder entry per apply) while the big folders are
     // still being surveyed/planned — new mail in them reads sooner.
@@ -2134,7 +2166,18 @@ async function rowsFor(name, uidnext) {
     // cached "already open dir" must not show a stale status.
     // Scoped run (only): start from the pre-sync snapshot and rewrite just
     // the synced dir's entry — untouched dirs keep their old state lines.
+    // Full runs start empty BUT carry every ignored folder's entry forward:
+    // they were never surveyed, so a plain rebuild would drop their state
+    // and a later un-ignore would lose the diff baseline (a fresh re-pull
+    // instead of the normal three-way reconcile).
     const snapOut = {version: 2, lastSyncAt: null, folders: only ? structuredClone(survey.snap.folders ?? {}) : {}};
+    if (only == null) {
+      for (const [name, entry] of Object.entries(survey.snap.folders ?? {})) {
+        if (isIgn(name)) {
+          snapOut.folders[name] = structuredClone(entry ?? {});
+        }
+      }
+    }
     // post-apply server rows per folder — what the tombstone prune checks
     // against at commit time ("is the deleted message still on the server?")
     const postServers = new Map();

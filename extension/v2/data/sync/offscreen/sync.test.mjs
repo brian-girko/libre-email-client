@@ -1262,4 +1262,91 @@ const emptyFolders = () => ({
     'the carried record is cleaned by the full run\'s rewrite');
 }
 
+// ---- scenario: the folder ignore list --------------------------------------
+// Ignored folders (job-carried `ignores`) are never surveyed, planned or
+// applied — their local mirror copies stay untouched, their snapshot entries
+// carry forward through full-run commits, and a scoped run onto one stands
+// down. Subtree rule: ignoring "Zoo" covers "Zoo.Sub"; the exact entry
+// "Work.Sub" ignores only that folder, not its parent.
+{
+  const i1 = await idOf('i1');
+  const z5 = await idOf('z5');
+  const zs1 = await idOf('zs1');
+  const w1 = await idOf('w1');
+  const ws1 = await idOf('ws1');
+  const server = new Map([
+    ['INBOX', dirState(1000, 2, [[1, 'i1']])],
+    ['Zoo', dirState(2000, 2, [[1, 'z1']])],
+    ['Zoo.Sub', dirState(3000, 2, [[1, 'zs1']])],
+    ['Work', dirState(4000, 2, [[1, 'w1']])],
+    ['Work.Sub', dirState(5000, 2, [[1, 'ws1']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 2, messages: {}},
+      'Zoo': {uidvalidity: 2000, uidnext: 2, messages: {5: {msgid: z5, flags: []}}},
+      'Zoo.Sub': {uidvalidity: 3000, uidnext: 2, messages: {1: {msgid: zs1, flags: []}}},
+      'Work': {uidvalidity: 4000, uidnext: 2, messages: {1: {msgid: w1, flags: []}}},
+      'Work.Sub': {uidvalidity: 5000, uidnext: 2, messages: {1: {msgid: ws1, flags: []}}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Zoo', listing([
+      fileEntry('f5', 5, md5hex('Zoo'), rawOf('z5'))
+    ])],
+    ['Zoo.Sub', listing([
+      fileEntry('f1', 1, md5hex('Zoo.Sub'), rawOf('zs1'))
+    ])],
+    ['Work', listing([
+      fileEntry('f1', 1, md5hex('Work'), rawOf('w1'))
+    ])],
+    ['Work.Sub', listing([
+      fileEntry('f1', 1, md5hex('Work.Sub'), rawOf('ws1'))
+    ])]
+  ]);
+  const ignores = ['Zoo', 'Work.Sub'];
+
+  // 1. the plan: only INBOX's new mail is pulled — the ignored folders
+  //    contribute NOTHING, and their kept local copies never classify as
+  //    dropLocal (a kept mirror with a snapshot entry would otherwise be
+  //    read as "server folder gone" and destroyed behind the dir-drop gate)
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mockMail(server), store,
+    {log: quietLog, ignores});
+  const {plan} = await engine.plan();
+  assert.deepEqual(plan.ops.map(o => `${o.kind}:${o.folder}`), ['pull:INBOX'],
+    'only the un-ignored folder diffs: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.ok(!plan.warnings.some(w => w.includes('never uploaded')),
+    'no kept-copy warning: ' + JSON.stringify(plan.warnings));
+
+  // 2. the commit: an ignored folder's snapshot entry CARRIES FORWARD
+  //    through the full run's rewrite — the un-ignore diff baseline
+  await engine.run({dry: false});
+  const committed = store.saved[0];
+  assert.equal(committed.folders['INBOX'].messages[1].msgid, i1,
+    'the surveyed folder commits its fresh state');
+  assert.equal(committed.folders['Zoo'].messages[5].msgid, z5,
+    'the ignored folder\'s snapshot entry survives the commit');
+  assert.equal(committed.folders['Work.Sub'].messages[1].msgid, ws1,
+    'the exactly-ignored folder\'s snapshot entry survives the commit');
+  assert.ok(committed.folders['Work']?.messages[1],
+    'the surveyed (not ignored) folder still commits');
+
+  // 3. the scoped run: a dir-scoped job onto an ignored folder syncs
+  //    nothing and says so
+  const lines = [];
+  const scoped = createSync(mockMail(server), mockStore(snapshot, listings), {
+    log: line => lines.push(line),
+    only: 'Zoo',
+    ignores
+  });
+  const {plan: scopedPlan} = await scoped.run({dry: true});
+  assert.deepEqual(scopedPlan.ops, [],
+    'the ignored folder\'s scoped run plans nothing');
+  assert.ok(lines.some(l => String(l.content).includes('on the ignore list')),
+    'the stand-down is narrated: ' + JSON.stringify(lines));
+}
+
 console.log('sync.test: all scenarios pass');
