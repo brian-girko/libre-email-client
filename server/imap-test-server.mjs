@@ -4,7 +4,8 @@
 // Self-contained and dependency-free (node:net / node:tls only). Speaks just
 // enough IMAP for end-to-end client tests: greeting, CAPABILITY, LOGIN (any
 // credentials), LIST/LSUB (hierarchical mailboxes), CREATE / DELETE (dynamic
-// mailbox set), SELECT, STATUS, UID FETCH (ENVELOPE summaries, RFC822.SIZE,
+// mailbox set), SELECT (optional CONDSTORE/HIGHESTMODSEQ), STATUS, UID FETCH
+// (ENVELOPE summaries, RFC822.SIZE,
 // BODY.PEEK[] bodies), STORE / UID STORE (flag changes: read/unread, star,
 // ...), IDLE, NOOP, LOGOUT; anything else gets `BAD`.
 //
@@ -349,6 +350,7 @@ export function resolveConfig({ argv = process.argv, env = process.env } = {}) {
         "  --no-tls          plaintext IMAP (CLI default; env STUB_TLS=0|1)",
         "  --no-idle         do not advertise or accept IDLE (env STUB_NO_IDLE=1)",
         "  --no-delivery     disable the simulated mail delivery",
+        "  --condstore       advertise CONDSTORE and answer SELECT with HIGHESTMODSEQ (env STUB_CONDSTORE=1)",
         "  --state-file FILE where to persist flag state (default .imap-test-state.json",
         "                    next to this script; env STUB_STATE_FILE)",
         "  --no-persist      keep flag state in memory only (env STUB_NO_PERSIST=1)",
@@ -372,6 +374,7 @@ export function resolveConfig({ argv = process.argv, env = process.env } = {}) {
     tls,
     noIdle: flag("--no-idle") || env.STUB_NO_IDLE === "1",
     noDelivery: flag("--no-delivery"),
+    condstore: flag("--condstore") || env.STUB_CONDSTORE === "1",
     stateFile: flag("--no-persist") || env.STUB_NO_PERSIST === "1"
       ? null
       : value("--state-file", env.STUB_STATE_FILE || path.join(SCRIPT_DIR, ".imap-test-state.json")),
@@ -456,6 +459,7 @@ export async function startImapTestServer(options = {}) {
     tls: !!options.tls,
     noIdle: !!options.noIdle,
     noDelivery: !!options.noDelivery,
+    condstore: !!options.condstore,
     stateFile: options.stateFile === undefined
       ? path.join(SCRIPT_DIR, ".imap-test-state.json")
       : options.stateFile,
@@ -497,7 +501,7 @@ export async function startImapTestServer(options = {}) {
     credentials = ensureCerts(cfg, log);
   }
 
-  const state = { boxes, persist };
+  const state = { boxes, persist, modseqs: new Map() };
   const server = cfg.tls
     ? tls.createServer(credentials, (sock) => handleConnection(sock, cfg, log, state))
     : net.createServer((sock) => handleConnection(sock, cfg, log, state));
@@ -524,7 +528,7 @@ export async function startImapTestServer(options = {}) {
 // per-connection IMAP state machine
 // ---------------------------------------------------------------------------
 
-function handleConnection(sock, cfg, log, { boxes, persist }) {
+function handleConnection(sock, cfg, log, { boxes, persist, modseqs }) {
   log("client connected");
   sock.setEncoding("latin1");
 
@@ -537,7 +541,13 @@ function handleConnection(sock, cfg, log, { boxes, persist }) {
 
   const currentMessages = () => boxes.get(selected ?? "INBOX");
 
-  const capability = `IMAP4rev1${cfg.noIdle ? "" : " IDLE"} UIDPLUS`;
+  const capability = `IMAP4rev1${cfg.noIdle ? "" : " IDLE"}${cfg.condstore ? " CONDSTORE" : ""} UIDPLUS`;
+
+  // RFC 7162: every mailbox carries a mod-sequence that bumps on each
+  // mutation (STORE, EXPUNGE, delivery). Cheap per-mailbox counter; only
+  // surfaced (and only bumped-to-notice) when --condstore is on.
+  const modseqOf = (box) => modseqs.get(box) ?? 100;
+  const bumpModseq = (box) => modseqs.set(box, modseqOf(box) + 1);
   const write = (s) => {
     log(`<< ${s.length > 90 ? s.slice(0, 90) + "..." : s}`);
     sock.write(s);
@@ -553,6 +563,9 @@ function handleConnection(sock, cfg, log, { boxes, persist }) {
         write(`* ${currentMessages().length + 1} EXISTS\r\n`);
       } else {
         pendingExists = true;
+      }
+      if (selected) {
+        bumpModseq(selected);   // a delivered message is a mailbox mutation
       }
     }, DELIVERY_AFTER_MS);
     if (typeof timer.unref === "function") timer.unref();
@@ -657,6 +670,9 @@ function handleConnection(sock, cfg, log, { boxes, persist }) {
       if (firstUnseen > 0) write(`* OK [UNSEEN ${firstUnseen}] first unseen\r\n`);
       write(`* OK [UIDVALIDITY ${UID_VALIDITY}] UIDs valid\r\n`);
       write(`* OK [UIDNEXT ${uidNextFor(msgs)}] next uid\r\n`);
+      if (cfg.condstore) {
+        write(`* OK [HIGHESTMODSEQ ${modseqOf(box)}] highest modseq\r\n`);
+      }
       write(`${tag} OK [${C === "EXAMINE" ? "READ-ONLY" : "READ-WRITE"}] ${C} done\r\n`);
     } else if (C === "STATUS") {
       const box = (args[0] || '""').replace(/^"|"$/g, "");
@@ -926,6 +942,7 @@ function handleConnection(sock, cfg, log, { boxes, persist }) {
     if (!targets.length) write(`${tag} NO no matching messages\r\n`);
     else {
       persist();
+      bumpModseq(selected);
       write(`${tag} OK ${byUid ? "UID " : ""}STORE done\r\n`);
     }
   }
@@ -963,6 +980,7 @@ function handleConnection(sock, cfg, log, { boxes, persist }) {
       const gone = new Set(doomed.map(({ msg }) => msg));
       boxes.set(selected, msgs.filter((m) => !gone.has(m)));
       persist();
+      bumpModseq(selected);
       write(`${tag} OK EXPUNGE completed\r\n`);
     }
   }

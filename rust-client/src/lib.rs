@@ -48,6 +48,18 @@ struct MailboxStatus {
     uidvalidity: u32,
     uidnext: u32,
     unseen: Option<u32>,
+    /// Highest mailbox mod-sequence (RFC 7162 CONDSTORE) as a decimal
+    /// string, or null when the server does not report one. A string on
+    /// purpose: u64 would surface as a BigInt on the JS side and the sync
+    /// snapshot wants a plain JSON literal to compare.
+    #[serde(rename = "highestModSeq")]
+    highest_modseq: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MsgFlags {
+    uid: u32,
+    flags: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -75,6 +87,10 @@ pub struct MailClient {
     insecure: bool,
     plaintext: bool,
     session: Option<ImapSession>,
+    /// CONDSTORE (RFC 7162) support, probed once per session: the SELECT
+    /// parameter form (and its HIGHESTMODSEQ reply) is only sent when the
+    /// server advertised the capability. None = not probed yet.
+    condstore: Option<bool>,
 }
 
 #[wasm_bindgen]
@@ -94,6 +110,7 @@ impl MailClient {
             insecure: false,
             plaintext: false,
             session: None,
+            condstore: None,
         }
     }
 
@@ -156,16 +173,49 @@ impl MailClient {
     }
 
     pub async fn select(&mut self, mailbox: &str) -> Result<JsValue, JsValue> {
-        let s = self.session_mut()?;
-        let m = s
-            .select(mailbox)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        // Probe CONDSTORE once per session (one CAPABILITY round trip): when
+        // the server advertises it, SELECT carries the (CONDSTORE) parameter
+        // so the untagged OK includes HIGHESTMODSEQ — the cheap "has anything
+        // changed?" probe the sync engine's incremental survey keys on.
+        let condstore = match self.condstore {
+            Some(v) => v,
+            None => {
+                let has = {
+                    let s = self.session_mut()?;
+                    matches!(s.capabilities().await, Ok(caps) if caps.has_str("CONDSTORE"))
+                };
+                self.condstore = Some(has);
+                has
+            }
+        };
+        let attempt = {
+            let s = self.session_mut()?;
+            if condstore {
+                s.select_condstore(mailbox).await
+            }
+            else {
+                s.select(mailbox).await
+            }
+        };
+        let m = match attempt {
+            Ok(m) => m,
+            // A server that advertised CONDSTORE but rejected the SELECT
+            // parameter form stops being asked; plain SELECT still works.
+            Err(e) if condstore => {
+                self.condstore = Some(false);
+                let s = self.session_mut()?;
+                s.select(mailbox)
+                    .await
+                    .map_err(|e2| JsValue::from_str(&e2.to_string()))?
+            },
+            Err(e) => return Err(JsValue::from_str(&e.to_string())),
+        };
         let status = MailboxStatus {
             exists: m.exists,
             uidvalidity: m.uid_validity.unwrap_or(0),
             uidnext: m.uid_next.unwrap_or(0),
             unseen: m.unseen,
+            highest_modseq: m.highest_modseq.map(|ms| ms.to_string()),
         };
         to_value(&status)
     }
@@ -218,6 +268,32 @@ impl MailClient {
                     .and_then(|e| e.message_id.as_deref())
                     .map(bytes_to_string)
                     .map(|s| s.trim().to_string()),
+            });
+        }
+        to_value(&out)
+    }
+
+    /// Fetch UID+FLAGS for a UID set (e.g. "1:5000") — the cheap per-message
+    /// sweep. No ENVELOPE, no size: the sync engine's steady-state survey
+    /// only needs the live uid set and each message's flags (identity and
+    /// size ride the snapshot), so this costs a fraction of the full
+    /// summaries fetch. The CONDSTORE-enabled session may add MODSEQ data to
+    /// each response; imap-proto parses it and it is ignored here.
+    pub async fn fetch_flags(&mut self, uid_set: &str) -> Result<JsValue, JsValue> {
+        let s = self.session_mut()?;
+        let query = "(UID FLAGS)";
+        let stream = s
+            .uid_fetch(uid_set, query)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        use futures::StreamExt;
+        let mut stream = stream;
+        let mut out = Vec::new();
+        while let Some(f) = stream.next().await {
+            let f = f.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            out.push(MsgFlags {
+                uid: f.uid.unwrap_or(0),
+                flags: f.flags().map(flag_to_string).collect(),
             });
         }
         to_value(&out)

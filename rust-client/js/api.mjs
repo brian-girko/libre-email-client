@@ -187,6 +187,15 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
  * @property {number} uidvalidity
  * @property {number} uidnext next UID the server will assign
  * @property {number|null} unseen
+ * @property {string|null} highestModSeq the folder's highest mod-sequence
+ *   (RFC 7162 CONDSTORE) as a decimal string; null when the server does not
+ *   support/report one.
+ */
+
+/**
+ * @typedef {Object} FlagSummary uid + flags of one message (no ENVELOPE).
+ * @property {number} uid
+ * @property {string[]} flags
  */
 
 /**
@@ -205,6 +214,8 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
  * @property {number} [pageSize=20] messages per page.
  * @property {number} [fromUid] explicit UID range (overrides page/pageSize).
  * @property {number} [toUid] explicit UID range end (inclusive).
+ * @property {number[]} [uids] explicit UID set (overrides range/page): one
+ *   UID FETCH for a disjoint list — the sync engine's lost-record uids.
  */
 
 /**
@@ -247,6 +258,9 @@ function decodeMimeWords(input) {    if (!input || input.indexOf('=?') === -1) r
  *   closes it when it was the open dir.
  * @property {(opts?: ListOpts) => Promise<MessageSummary[]>} listFiles one
  *   request per page; results sorted newest (highest UID) first.
+ * @property {(opts: ListOpts) => Promise<FlagSummary[]>} listFlags uid+flags
+ *   rows of the open dir for an explicit uid range (fromUid required); no
+ *   ENVELOPE, no size. Throws on cores without the fetch_flags export.
  * @property {() => Promise<ThreadSummary[]>} listThreads group the whole
  *   selected dir into conversations (JWZ threading inside the wasm core,
  *   newest thread first).
@@ -475,6 +489,11 @@ export async function createMailApi(cfg) {
                     uidvalidity: Number(s.uidvalidity),
                     uidnext: Number(s.uidnext),
                     unseen: s.unseen ?? null,
+                    // RFC 7162 CONDSTORE: the folder's highest mod-sequence
+                    // as a decimal string, null when the server does not
+                    // support/report one. Lets the sync engine skip
+                    // unchanged folders without any message fetch.
+                    highestModSeq: s.highestModSeq ?? null,
                 };
                 log(`openDir(${JSON.stringify(name)}) -> {exists:${out.exists}, uidnext:${out.uidnext}} (${Date.now() - t0}ms)`);
                 return out;
@@ -523,9 +542,16 @@ export async function createMailApi(cfg) {
         async listFiles(opts) {
             assertConnected();
             if (!selected) throw new Error('openDir() first');
-            const { page = 0, pageSize = 20, fromUid, toUid } = opts ?? {};
+            const { page = 0, pageSize = 20, fromUid, toUid, uids } = opts ?? {};
             let set;
-            if (fromUid != null) {
+            if (Array.isArray(uids)) {
+                // explicit uid set (e.g. the sync engine's lost-record uids):
+                // one UID FETCH for a disjoint list, ascending, deduped —
+                // an empty set returns nothing without a round trip
+                set = [...new Set(uids.map(Number).filter(Number.isFinite))]
+                    .sort((a, b) => a - b).join(',');
+                if (!set) return [];
+            } else if (fromUid != null) {
                 set = toUid != null ? `${fromUid}:${toUid}` : `${fromUid}`;
             } else {
                 const newest = Number(status?.uidnext ?? 1) - 1;
@@ -555,6 +581,39 @@ export async function createMailApi(cfg) {
                 return out;
             } catch (e) {
                 log(`listFiles(${JSON.stringify(opts ?? {})}) FAILED after ${Date.now() - t0}ms: ${e.message}`);
+                throw e;
+            }
+        },
+
+        /**
+         * Flag-only summaries of the open dir: UID + FLAGS per message, no
+         * ENVELOPE and no size. The cheap sweep for the sync engine's
+         * incremental survey — a uid range (fromUid[:toUid]) is required.
+         * Cores without the fetch_flags export throw (callers feature-detect
+         * via the "does not support flag-only fetch" error text).
+         */
+        async listFlags(opts) {
+            assertConnected();
+            if (!selected) throw new Error('openDir() first');
+            const { fromUid, toUid } = opts ?? {};
+            if (fromUid == null) throw new Error('listFlags: fromUid required (uid range of the open dir)');
+            if (typeof client.fetch_flags !== 'function') {
+                throw new Error('listFlags: mail core build does not support flag-only fetch (fetch_flags export missing)');
+            }
+            const set = toUid != null ? `${fromUid}:${toUid}` : `${fromUid}`;
+            const t0 = Date.now();
+            try {
+                const rows = await clientCall('fetch_flags', set);
+                const out = rows
+                    .map((m) => ({
+                        uid: Number(m.uid),
+                        flags: Array.isArray(m.flags) ? m.flags.map(String) : [],
+                    }))
+                    .sort((a, b) => a.uid - b.uid);
+                log(`listFlags(uid set ${set}) -> ${out.length} rows (${Date.now() - t0}ms)`);
+                return out;
+            } catch (e) {
+                log(`listFlags(uid set ${set}) FAILED after ${Date.now() - t0}ms: ${e.message}`);
                 throw e;
             }
         },

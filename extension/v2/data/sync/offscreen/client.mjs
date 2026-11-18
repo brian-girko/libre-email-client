@@ -231,7 +231,38 @@ export function createClient(settings) {
       const st = await run(api => api.openDir(name));
       selected = name;
       status = st;
-      return {folder: name, exists: st.exists, uidvalidity: st.uidvalidity, uidnext: st.uidnext};
+      return {folder: name, exists: st.exists, uidvalidity: st.uidvalidity,
+        uidnext: st.uidnext, highestModSeq: st.highestModSeq ?? null};
+    },
+
+    /**
+     * Flag-only summaries of the selected dir: uid + flags per message, no
+     * ENVELOPE and no size — the cheap sweep for the sync engine's
+     * incremental survey (identities and sizes ride the snapshot).
+     * @param {{fromUid: number, toUid?: number}} opts uid range of the open dir
+     * @returns {Promise<Array<{uid: number, folder: string, flags: string[]}>>|null}
+     *   null when the wasm core predates the fetch_flags export — the caller
+     *   falls back to the full summaries sweep (the guard error never leaves
+     *   this facade: it is detected before any network round trip).
+     */
+    async listFlags(opts = {}) {
+      if (!selected) {
+        throw new Error('readDir(name) first');
+      }
+      try {
+        const rows = await run(api => api.listFlags(opts ?? {}));
+        return rows.map(m => ({
+          uid: Number(m.uid),
+          folder: selected,
+          flags: m.flags ?? []
+        }));
+      }
+      catch (e) {
+        if (String(e?.message || e).includes('does not support flag-only fetch')) {
+          return null;
+        }
+        throw e;
+      }
     },
 
     /**

@@ -20,7 +20,7 @@ data/sync/
                    facade comes from /core/fs.mjs — THE module that touches
                    handles; every mutation emits an fs-event tagged with the
                    caller's prepare() origin)
-  snapshot.mjs   ← .sync-state.json (uid → msgid/flags last-good view)
+  snapshot.mjs   ← .sync-state.json (uid → {msgid, flags, size} last-good view)
   offscreen/     ← the sync engine, running inside the SHARED offscreen
                     host document (/offscreen/index.html, manager.mjs);
                     the module here is loaded on its first routed message
@@ -286,8 +286,9 @@ const info = await mail.info();  // {account, secure, dirs, status, selected}
 | `connect()` | idempotent bootstrap (bridge, wasm, login) |
 | `info()` | snapshot: `{account, secure, connected, selected, dirs, status}` |
 | `folders()` | every mailbox: `{name, delimiter, attrs}` |
-| `readDir(name)` | SELECT a dir for the calls below; returns `{folder, exists, uidvalidity, uidnext}` |
-| `listMails({page, pageSize, fromUid, toUid})` | summaries of the open dir, newest first — each row carries `messageId` (the ENVELOPE message-id; `null` on older core builds or headerless mail) |
+| `readDir(name)` | SELECT a dir for the calls below; returns `{folder, exists, uidvalidity, uidnext, highestModSeq}` (`highestModSeq`: the CONDSTORE mod-sequence as a decimal string, `null` on servers without it) |
+| `listMails({page, pageSize, fromUid, toUid, uids})` | summaries of the open dir, newest first — each row carries `messageId` (the ENVELOPE message-id; `null` on older core builds or headerless mail). `uids` (an array) fetches one disjoint uid set in a single call |
+| `listFlags({fromUid, toUid})` | flag-only rows of the open dir: `{uid, folder, flags}` — no ENVELOPE, no size; the incremental survey's sweep. Returns `null` on core builds without the `fetch_flags` export |
 | `listThreads()` | JWZ conversations of the open dir |
 | `readMail(uid)` | raw RFC822: `{uid, folder, size, raw: Uint8Array}` |
 | `markMail(uids, add, remove)` | UID STORE flags |
@@ -367,9 +368,10 @@ Everything metadata-ish lives in the filename (no message database):
   (e.g. `1727778354_0.55641.host,U=18768,FMD5=…:2,S` must become
   `…,I=2,S`).
 
-The snapshot is the classifier's baseline ("K"): uid → {msgid, flags}, where
-msgid comes from the bundled postal-mime parser (sha-256 fallback for broken
-headers). Three-way diff K/S/L produces an explicit op list first
+The snapshot is the classifier's baseline ("K"): uid → {msgid, flags, size},
+where msgid comes from the bundled postal-mime parser (sha-256 fallback for
+broken headers) and size (optional; older snapshots lack it) is the message's
+RFC822 byte length. Three-way diff K/S/L produces an explicit op list first
 (`planSync`), rendered by `describePlan` for the dry-run button; `apply` is
 the only mutating step and rewrites the snapshot at the very end, so a
 half-done run simply replays the same diffs. Files dropped into a folder's
@@ -405,11 +407,48 @@ file into an op list or declares it unclaimable — there is no
 UIDs, and scoped (`--dir`) runs never classify or purge other folders'
 files.
 
-Server surveys page the UID space with an adaptive stride: dense folders
-page 500 uids per call; an empty window means a gap of expunged uids and
-the stride quadruples (up to 16k) — windows always tile `[lo, uidnext)` as a
-partition, so nothing can be skipped regardless of stride changes. Empty
-folders (SELECT's `EXISTS` = 0) skip the sweep entirely.
+Server surveys are **incremental — three tiers, cheapest first**. Every
+folder's SELECT already returns the counters the tiers key on: `EXISTS`,
+`UIDVALIDITY`, `UIDNEXT` and — on servers advertising `CONDSTORE` (RFC
+7162, the wasm core probes the capability once per session and selects with
+the parameter) — `HIGHESTMODSEQ` as a decimal string.
+
+1. **CONDSTORE skip.** The snapshot persists the folder's *pre-survey*
+   `highestModSeq` (plus `uidnext`, plus a `carried` count when a scoped run
+   carried lost-uid records). When the next run's SELECT reports the same
+   modseq, `uidvalidity`/`uidnext` agree, `EXISTS` equals the snapshot's
+   message count and nothing was carried, the folder is *exactly* what the
+   last committed run left it: the survey derives its server rows straight
+   from the snapshot — **zero message calls**, logged as `unchanged (modseq
+   …)`. Persisting the *pre-survey* value (not the post-apply one) keeps the
+   skip honest: this run's own server writes move the server past it, so the
+   next run re-sweeps the folder once, and a third-party change landing
+   mid-run can never hide forever. Carried records make an entry larger than
+   server truth and always block the skip (the `EXISTS` equality alone would
+   too — the `carried` stamp documents it).
+2. **Flag-only sweep.** No modseq match (a non-CONDSTORE server, a change
+   since the last commit, or an entry without a modseq): a flag-only `UID
+   FETCH (UID FLAGS)` tiles `[1, uidnext)` for the live uid set and flags
+   (windows of 5000, widening logarithmically over expunged gaps), identities
+   (`msgid`) and sizes ride the snapshot for known uids, and ONE envelope
+   fetch covers just the fresh uid region the snapshot does not know yet.
+   Uids the snapshot lost inside the known region (an interrupted or garbled
+   earlier run) get one disjoint-set envelope fetch (`listMails {uids}`) so
+   the size-adoption path keeps recognizing their local copies; more than
+   1000 of them falls back to the honest full sweep.
+3. **Full envelope sweep** — the pre-incremental behavior: first survey of a
+   folder, a resync (uidvalidity changed or the local dir missing), an old
+   wasm core without the `fetch_flags` export (the facade reports it and the
+   tier is skipped), or a server whose counters disagree with its listings.
+   The sweep pages 500 uids per call with the same adaptive stride: an empty
+   window means a gap of expunged uids and the stride quadruples (up to 16k)
+   — windows always tile `[lo, uidnext)` as a partition, so nothing can be
+   skipped regardless of stride changes. Empty folders (SELECT's `EXISTS` =
+   0) skip the sweep entirely.
+
+A run's survey cost is narrated at the end (`survey done: N folder(s), X
+flag fetch(es), Y envelope window(s)`), and each skipped folder's survey
+line carries `✓ unchanged`.
 
 The **post-apply pass no longer re-sweeps the whole UID space**. In the
 steady case its rows are *derived*: the pre-survey rows folded with this

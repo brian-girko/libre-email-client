@@ -1,17 +1,19 @@
 #!/bin/sh
 # Build the rust IMAP core to WASM and deploy the artifacts the extension
-# needs into extension/core/rust-imap-client/:
+# needs into extension/v2/core/rust-imap-client/:
 #   mail_core.mjs      wasm-bindgen glue (renamed from .js, all modules are .mjs)
 #   mail_core_bg.wasm  the module
-#   api.mjs            MailApi facade (import path rewritten to sibling file)set -e
+# js/api.mjs is NOT deployed: the extension's core/rust-imap-client/api.mjs is
+# hand-maintained (it imports the shared ../mime.mjs decoder) — keep its
+# MailApi surface in sync manually after changing the facade.
+set -e
 cd "$(dirname "$0")"
 
 wasm-pack build --release --target web
 
-DEST=../extension/core/rust-imap-client
+DEST=../extension/v2/core/rust-imap-client
 mkdir -p "$DEST"
 cp pkg/mail_core_bg.wasm "$DEST/"
 sed "s|'\./mail_core\.js'|'./mail_core.mjs'|" pkg/mail_core.js > "$DEST/mail_core.mjs"
-sed "s|'\.\./pkg/mail_core\.js'|'./mail_core.mjs'|" js/api.mjs > "$DEST/api.mjs"
 
-echo "deployed: $DEST/{mail_core.mjs, mail_core_bg.wasm, api.mjs}"
+echo "deployed: $DEST/{mail_core.mjs, mail_core_bg.wasm}"

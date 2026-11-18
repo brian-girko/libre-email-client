@@ -52,10 +52,11 @@ const idOf = async msgid => await msgidOf(rawOf(msgid));
 
 // ---- mock mail (IMAP facade) + store (MaildirStore) ------------------------
 
-function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'} = {}) {
+function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed', noFlagsFetch = false} = {}) {
   return {
     fetches: 0,      // raw downloads (readMail/readMails)
-    windows: 0,      // listMails calls — the UID sweeps' cost unit
+    windows: 0,      // listMails calls — the envelope sweeps' cost unit
+    flagsCalls: 0,   // listFlags calls — the flag-only sweeps' cost unit
     current: null,
     // every deleteMail call — {folder, uids}: the no-MOVE fallback's
     // source delete rides the same call the deleteServer op uses
@@ -69,12 +70,32 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
       this.current = name;
       return server.get(name).status;
     },
-    async listMails({fromUid, toUid}) {
+    async listMails(opts = {}) {
       this.windows++;
+      const {fromUid, toUid, uids} = opts ?? {};
+      const wanted = uid => Array.isArray(uids)
+        ? uids.map(Number).includes(uid)
+        : uid >= fromUid && uid <= toUid;
+      const rows = [];
+      for (const [uid, row] of server.get(this.current).rows) {
+        if (wanted(uid)) {
+          rows.push({uid, ...row});
+        }
+      }
+      return rows.sort((a, b) => a.uid - b.uid);
+    },
+    // flag-only sweep (the incremental survey's Tier 2): uid + flags, no
+    // ENVELOPE, no size. `noFlagsFetch` simulates an older core build
+    // without the fetch_flags export (the facade's null → full sweep).
+    async listFlags({fromUid, toUid}) {
+      if (noFlagsFetch) {
+        return null;
+      }
+      this.flagsCalls++;
       const rows = [];
       for (const [uid, row] of server.get(this.current).rows) {
         if (uid >= fromUid && uid <= toUid) {
-          rows.push({uid, ...row});
+          rows.push({uid, flags: row.flags});
         }
       }
       return rows.sort((a, b) => a.uid - b.uid);
@@ -110,6 +131,8 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
       });
       dir.status.exists = dir.rows.size;
       dst.status.exists = dst.rows.size;
+      this.bumpModseq(dir);
+      this.bumpModseq(dst);
       return newUid;
     },
     /**
@@ -125,6 +148,7 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
       dst.raws.set(uid, raw);
       dst.rows.set(uid, {flags: flags ?? [], subject: null, from: null, date: null, size: raw.length});
       dst.status.exists = dst.rows.size;
+      this.bumpModseq(dst);
       return true;
     },
     /** UID STORE flags: the mock folds add/remove into the row's flags */
@@ -143,6 +167,8 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
       }
       row.flags = [...set];
       this.marks.push({folder: this.current, uid: Number(uid), add, remove});
+      // CONDSTORE: any server-side mutation bumps the folder's modseq
+      this.bumpModseq(dir);
       return true;
     },
     /** marks \\Deleted and purges: the mock just drops the rows */
@@ -155,7 +181,14 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed'}
       }
       dir.status.exists = dir.rows.size;
       this.deletes.push({folder: this.current, uids: list.map(Number)});
+      this.bumpModseq(dir);
       return true;
+    },
+    /** CONDSTORE: one decimal bump per mutating call (null-safe: folders
+     *  without a modseq get one — nothing reads it unless a snapshot does) */
+    bumpModseq(dir) {
+      dir.status.highestModSeq =
+        String(Number(dir.status.highestModSeq ?? 0) + 1);
     }
   };
 }
@@ -175,6 +208,19 @@ function mockStore(snapshot, listings, delimiter = '/', failRenames = false, pre
     // same-folder call with keepFmd5 false, the fresh uid and the fresh
     // server row's flags
     moves: [],
+    // every renameMessage call — {folder, entry, patch}: the reflag exec's
+    // local rename; the entry's flags adopt the patch
+    renames: [],
+    async renameMessage(folder, entry, patch = {}) {
+      if (failRenames) {
+        throw new Error('mock-fs: rename failed');
+      }
+      this.renames.push({folder, entry, patch: {...patch}});
+      if (patch.flags) {
+        entry.flags = [...patch.flags];
+      }
+      return entry.fileName;
+    },
     async loadState() {
       return structuredClone(snapshot);
     },
@@ -253,9 +299,9 @@ function listing(entries, interlopers = []) {
 const quietLog = () => {};
 
 // server picture helper: uid → {flags: []}, raws uid → raw
-function dirState(uidvalidity, uidnext, rows) {
+function dirState(uidvalidity, uidnext, rows, highestModSeq = null) {
   return {
-    status: {folder: 'x', exists: rows.length, uidvalidity, uidnext},
+    status: {folder: 'x', exists: rows.length, uidvalidity, uidnext, highestModSeq},
     rows: new Map([...rows].map(([uid, msgid]) =>
       [uid, {flags: [], subject: msgid, from: null, date: null, size: rawOf(msgid).length}])),
     raws: new Map([...rows].map(([uid, msgid]) => [uid, rawOf(msgid)]))
@@ -1617,9 +1663,11 @@ const emptyFolders = () => ({
   }], 'the kept marker paired with the fresh uid and renamed in place');
   assert.equal(summary.keptLocalMoves, 1, 'the copy was kept (no re-download)');
   assert.equal(mail.fetches, 0, 'no message was re-fetched');
-  assert.equal(mail.windows, 2,
-    'one pre-survey window (INBOX) + ONE delta window (the destination\'s ' +
-    'fresh-uid region) — no second full sweep of either folder');
+  assert.equal(mail.windows, 1,
+    'ONE delta window (the destination\'s fresh-uid region) — the surveys ' +
+    'ran flag-only, no envelope sweep of either folder');
+  assert.equal(mail.flagsCalls, 1,
+    'one flag-only sweep for INBOX — the empty destination skips the sweep');
   assert.equal(summary.warnings, 0, 'no unmatched-marker warning');
   assert.equal(store.saved.length, 1, 'the snapshot committed');
   assert.equal(store.saved[0].folders['Silent.Broken Links'].messages[11].msgid, m5,
@@ -1661,8 +1709,9 @@ const emptyFolders = () => ({
   const {summary} = await engine.run({dry: false});
 
   assert.equal(summary.failed, 0, 'the steady-state run is clean');
-  assert.equal(mail.windows, 1,
-    'one pre-survey window, ZERO post-apply windows: ' + mail.windows);
+  assert.equal(mail.windows, 0,
+    'flag-only survey (no envelope window), ZERO post-apply windows');
+  assert.equal(mail.flagsCalls, 1, 'one flag-only sweep for INBOX');
   assert.equal(mail.fetches, 0, 'nothing was re-fetched');
   assert.equal(store.saved.length, 1, 'the snapshot committed');
   assert.deepEqual(Object.keys(store.saved[0].folders.INBOX.messages), ['5', '7'],
@@ -1701,8 +1750,9 @@ const emptyFolders = () => ({
 
   assert.equal(summary.failed, 0, 'the append run is clean');
   assert.equal(summary.pushed, 1, 'the upload happened');
-  assert.equal(mail.windows, 2,
-    'one pre-survey window + ONE delta window over [10, 11): ' + mail.windows);
+  assert.equal(mail.windows, 1,
+    'ONE delta window over [10, 11) — the pre-survey ran flag-only: ' + mail.windows);
+  assert.equal(mail.flagsCalls, 1, 'one flag-only sweep for INBOX');
   assert.equal(mail.fetches, 1,
     'the uploaded copy is re-pulled once (the canonical post-pull)');
   const msgs = store.saved[0].folders.INBOX.messages;
@@ -1742,8 +1792,9 @@ const emptyFolders = () => ({
   assert.equal(summary.serverFlagChanges, 1, 'the STORE happened');
   assert.deepEqual(mail.marks, [{folder: 'INBOX', uid: 5, add: ['\\Seen'], remove: []}],
     'the server saw the flag edit');
-  assert.equal(mail.windows, 1,
-    'one pre-survey window, ZERO post-apply windows: ' + mail.windows);
+  assert.equal(mail.windows, 0,
+    'flag-only survey, ZERO post-apply windows (flagsServer folds into the derived rows)');
+  assert.equal(mail.flagsCalls, 1, 'one flag-only sweep for INBOX');
   assert.deepEqual(store.saved[0].folders.INBOX.messages[5].flags, ['\\Seen'],
     'the snapshot folded this run\'s own STORE into the derived rows');
 }
@@ -1776,12 +1827,12 @@ const emptyFolders = () => ({
   ]);
 
   const mail = mockMail(server);
-  const baseListMails = mail.listMails.bind(mail);
+  const baseListFlags = mail.listFlags.bind(mail);
   let sweeps = 0;
-  mail.listMails = async opts => {
-    const rows = await baseListMails(opts);
+  mail.listFlags = async opts => {
+    const rows = await baseListFlags(opts);
     if (++sweeps === 1) {
-      // a third-party client appends right after the pre-survey sweep
+      // a third-party client appends right after the pre-survey flag sweep
       const dir = server.get('INBOX');
       dir.raws.set(10, rawOf('m10'));
       dir.rows.set(10, {flags: [], subject: m10, from: null, date: null,
@@ -1796,8 +1847,9 @@ const emptyFolders = () => ({
   const {summary} = await engine.run({dry: false});
 
   assert.equal(summary.failed, 0, 'the run is clean');
-  assert.equal(mail.windows, 2,
+  assert.equal(mail.windows, 1,
     'the tripped invariant fell back to a full post sweep: ' + mail.windows);
+  assert.equal(mail.flagsCalls, 1, 'the pre-survey ran flag-only');
   assert.equal(mail.fetches, 1, 'the third-party arrival was pulled');
   const msgs = store.saved[0].folders.INBOX.messages;
   assert.deepEqual(Object.keys(msgs).sort(), ['10', '5', '7'],
@@ -1832,12 +1884,13 @@ const emptyFolders = () => ({
   ]);
 
   const mail = mockMail(server);
-  const baseListMails = mail.listMails.bind(mail);
+  const baseListFlags = mail.listFlags.bind(mail);
   let sweeps = 0;
-  mail.listMails = async opts => {
-    const rows = await baseListMails(opts);
+  mail.listFlags = async opts => {
+    const rows = await baseListFlags(opts);
     if (++sweeps === 1) {
       // a third-party client expunges uid 7 right after the pre-survey
+      // flag sweep
       const dir = server.get('INBOX');
       dir.rows.delete(7);
       dir.raws.delete(7);
@@ -1850,10 +1903,257 @@ const emptyFolders = () => ({
   const {summary} = await engine.run({dry: false});
 
   assert.equal(summary.failed, 0, 'the run is clean');
-  assert.equal(mail.windows, 2,
+  assert.equal(mail.windows, 1,
     'the tripped invariant fell back to a full post sweep: ' + mail.windows);
+  assert.equal(mail.flagsCalls, 1, 'the pre-survey ran flag-only');
   assert.deepEqual(Object.keys(store.saved[0].folders.INBOX.messages), ['5'],
     'the snapshot dropped the uid the server no longer serves');
+}
+
+// ---- scenario C1: CONDSTORE skip — an unchanged folder costs NO calls ------
+// The snapshot carries the folder's PRE-survey HIGHESTMODSEQ (RFC 7162) and
+// the server still reports the same value, uidnext and EXISTS: the folder is
+// exactly what the last committed run left it. The survey derives its server
+// rows from the snapshot — zero flag fetches, zero envelope windows, zero
+// downloads — and the commit persists the same modseq, so the next run skips
+// again until anything (this engine or another client) touches the folder.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']], '100')]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, highestModSeq: '100', messages: {
+        5: {msgid: m5, flags: [], size: rawOf('m5').length},
+        7: {msgid: m7, flags: [], size: rawOf('m7').length}
+      }}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {plan, summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the skip run is clean');
+  assert.deepEqual(plan.ops, [], 'nothing to do');
+  assert.equal(mail.flagsCalls, 0, 'the skip fired: zero flag fetches');
+  assert.equal(mail.windows, 0, 'zero envelope windows');
+  assert.equal(mail.fetches, 0, 'zero downloads');
+  const snap = store.saved[0].folders.INBOX;
+  assert.equal(snap.highestModSeq, '100', 'the modseq persists');
+  assert.equal(snap.messages[5].size, rawOf('m5').length, 'sizes ride the snapshot');
+}
+
+// ---- scenario C2: a local flag edit under the skip, and the next run -------
+// Run 1: the skip fires (no server changes), the local \Seen edit plans a
+// flagsServer STORE — the server modseq moves past the persisted value.
+// Run 2: no skip — one flag sweep proves it, zero ops (server and local
+// agree), and the FRESH pre-survey modseq commits, so run 3 skips again.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']], '100')]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, highestModSeq: '100', messages: {
+        5: {msgid: m5, flags: [], size: rawOf('m5').length},
+        7: {msgid: m7, flags: [], size: rawOf('m7').length}
+      }}
+    }
+  };
+
+  // run 1: skip + local \Seen edit on uid 7
+  const listings1 = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'), ['\\Seen'])
+    ])]
+  ]);
+  const mail1 = mockMail(server);
+  const store1 = mockStore(snapshot, listings1);
+  const engine1 = createSync(mail1, store1, {log: quietLog});
+  const {plan: plan1, summary: summary1} = await engine1.run({dry: false});
+
+  assert.equal(summary1.failed, 0, 'run 1 is clean');
+  assert.deepEqual(plan1.ops.map(o => o.kind), ['flagsServer'],
+    'the local edit pushes to the server: ' + JSON.stringify(plan1.ops.map(describeOp)));
+  assert.equal(mail1.flagsCalls, 0, 'run 1 skipped the sweep');
+  assert.deepEqual(mail1.marks, [{folder: 'INBOX', uid: 7, add: ['\\Seen'], remove: []}],
+    'the STORE happened');
+  // the mock bumped the server modseq; the snapshot keeps the PRE-survey one
+  assert.equal(server.get('INBOX').status.highestModSeq, '101',
+    'the STORE bumped the server modseq');
+  assert.equal(store1.saved[0].folders.INBOX.highestModSeq, '100',
+    'the snapshot commits the pre-survey modseq, not the post-apply one');
+  assert.deepEqual(store1.saved[0].folders.INBOX.messages[7].flags, ['\\Seen'],
+    'the derived rows folded the STORE');
+
+  // run 2: the server's modseq moved past the snapshot's — one flag sweep
+  const committed = store1.saved[0];
+  const listings2 = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'), ['\\Seen'])
+    ])]
+  ]);
+  const mail2 = mockMail(server);
+  const store2 = mockStore(committed, listings2);
+  const engine2 = createSync(mail2, store2, {log: quietLog});
+  const {plan: plan2, summary: summary2} = await engine2.run({dry: false});
+
+  assert.equal(summary2.failed, 0, 'run 2 is clean');
+  assert.deepEqual(plan2.ops, [], 'server and local agree — nothing to do');
+  assert.equal(mail2.flagsCalls, 1, 'run 2 paid exactly one flag sweep');
+  assert.equal(mail2.windows, 0, 'no envelope window');
+  assert.equal(store2.saved[0].folders.INBOX.highestModSeq, '101',
+    'the fresh modseq commits — run 3 would skip again');
+}
+
+// ---- scenario C3: a third-party flag change is caught through the sweep ----
+// Another client marked uid 5 read between the runs: the server modseq
+// moved, the skip cannot fire, and the flag sweep sees \Seen where the
+// snapshot says plain — a reflag op renames the local copy.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']], '100')]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, highestModSeq: '100', messages: {
+        5: {msgid: m5, flags: [], size: rawOf('m5').length},
+        7: {msgid: m7, flags: [], size: rawOf('m7').length}
+      }}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+
+  // a third-party client marked uid 5 read and bumped the modseq
+  const dir = server.get('INBOX');
+  dir.rows.get(5).flags = ['\\Seen'];
+  dir.status.highestModSeq = '101';
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {plan, summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.deepEqual(plan.ops.map(o => o.kind), ['reflag'],
+    'the server flag change lands locally: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(mail.flagsCalls, 1, 'one flag sweep — the skip could not fire');
+  assert.equal(mail.windows, 0, 'no envelope window needed');
+  assert.deepEqual(store.saved[0].folders.INBOX.messages[5].flags, ['\\Seen'],
+    'the snapshot carries the server\'s flags');
+}
+
+// ---- scenario C4: carried records never let the skip fire ------------------
+// A scoped run carried a lost-uid record forward (a native move another
+// client made — see scenario O). The entry's uidnext/EXISTS can still match
+// a quiet server, so the skip MUST be gated on the carried stamp: the next
+// FULL run has to sweep (and mine) to trace the move by msgid — the skip
+// would freeze the carried record forever.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    // uid 5 left INBOX on the server (native move); m5 lives in Trash as
+    // fresh uid 2, READ there by the client that moved it
+    ['INBOX', dirState(1000, 9, [[7, 'm7']], '100')],
+    ['Trash', {status: {folder: 'x', exists: true, uidvalidity: 3000, uidnext: 3, highestModSeq: '200'},
+      rows: new Map([[2, {flags: ['\\Seen'], subject: 'm5', from: null, date: null, size: rawOf('m5').length}]]),
+      raws: new Map([[2, rawOf('m5')]])}]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, highestModSeq: '100', carried: 1, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }},
+      'Trash': {uidvalidity: 3000, uidnext: 3, highestModSeq: '200', messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7')),
+      fileEntry(makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')}),
+        5, md5hex('INBOX'), rawOf('m5'))
+    ])],
+    ['Trash', listing([])]
+  ]);
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the tracing run is clean');
+  assert.equal(summary.localMoves, 1,
+    'the carried record was traced: the move reconciled by msgid');
+  assert.equal(mail.flagsCalls, 2,
+    'no skip fired (the carried entry must sweep): INBOX + Trash swept');
+  assert.equal(mail.fetches, 1, 'only Trash/2\'s raw was mined — no re-download');
+  assert.ok(!store.saved[0].folders.INBOX?.messages[5],
+    'the carried record is consumed');
+  assert.ok(!store.saved[0].folders.INBOX.carried,
+    'the carried stamp is gone once nothing is carried');
+}
+
+// ---- scenario C5: a core without the flags fetch sweeps envelopes ----------
+// An older wasm build (no fetch_flags export) must behave exactly like the
+// pre-incremental engine: the facade's listFlags answers null, the survey
+// falls back to the full envelope sweep, and the run result is identical.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+
+  const mail = mockMail(server, {noFlagsFetch: true});
+  const store = mockStore(snapshot, listings);
+  const engine = createSync(mail, store, {log: quietLog});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the fallback run is clean');
+  assert.equal(mail.flagsCalls, 0, 'the facade reported the core as incapable');
+  assert.equal(mail.windows, 1, 'one full envelope sweep — the old behavior');
+  assert.deepEqual(Object.keys(store.saved[0].folders.INBOX.messages).sort(), ['5', '7'],
+    'the snapshot is unchanged');
 }
 
 console.log('sync.test: all scenarios pass');

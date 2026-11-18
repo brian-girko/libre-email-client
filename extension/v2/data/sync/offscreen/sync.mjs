@@ -65,6 +65,10 @@ const readableFlags = flags => (flags ?? []).filter(f => !SESSION_FLAGS.has(f));
 
 const UID_WINDOW = 500;                 // floor stride: dense areas page this size
 const UID_STRIDE_MAX = UID_WINDOW * 32; // 16000: the cap for skipping gaps
+// flag-only sweeps page much wider than envelope sweeps: the response is a
+// fraction of the size (no ENVELOPE, no size item per row)
+const FLAGS_WINDOW = 5000;                 // floor stride: dense areas page this size
+const FLAGS_STRIDE_MAX = FLAGS_WINDOW * 4; // 20000: the cap for skipping gaps
 const RAW_BUDGET = 32 * 1024 * 1024;
 
 // hard ceiling on one message FETCH: a wedged bridge stream never resolves
@@ -376,6 +380,9 @@ export function createSync(mail, store, {account = null, log = console.log, onPr
   const routedInbox = new Set();
   // run-level route counters for the end-of-apply summary line
   const routeStats = {moved: 0, kept: 0, unmatched: 0, failed: 0};
+  // survey cost counters — one line at the end of the survey narrates what
+  // the incremental paths actually spent (flag fetches vs envelope windows)
+  const surveyCalls = {flags: 0, windows: 0};
 
   // ---- tombstones: locally deleted mail the snapshot inference must not
   // resurrect --------------------------------------------------------------
@@ -460,6 +467,7 @@ async function rowsFor(name, uidnext, lo = 1) {
   let stride = UID_WINDOW;
   while (lo <= high) {
     const hi = Math.min(lo + stride - 1, high);
+    surveyCalls.windows++;
     const rows = await mail.listMails({fromUid: lo, toUid: hi});
     for (const r of rows) {
       out.set(Number(r.uid), {
@@ -485,10 +493,153 @@ async function rowsFor(name, uidnext, lo = 1) {
   return out;
 }
 
+/** Flag-only sweep of [lo, uidnext): uid → string[] flags. Same tiling
+ *  discipline as rowsFor (windows partition the uid space; an empty window
+ *  implies a gap of expunged uids and widens the stride logarithmically),
+ *  with a much larger floor — no ENVELOPE and no size ride the response, so
+ *  wide windows stay cheap. Returns null when the wasm core predates the
+ *  fetch_flags export (the facade's null signals "unsupported"); the caller
+ *  falls back to the full envelope sweep. */
+async function flagsFor(name, uidnext, lo = 1) {
+  const out = new Map();
+  const high = uidnext - 1;
+  let stride = FLAGS_WINDOW;
+  while (lo <= high) {
+    const hi = Math.min(lo + stride - 1, high);
+    surveyCalls.flags++;
+    const rows = await mail.listFlags({fromUid: lo, toUid: hi});
+    if (rows === null) {
+      return null;   // old core: no flag-only fetch — full sweep instead
+    }
+    for (const r of rows) {
+      out.set(Number(r.uid), r.flags ?? []);
+    }
+    if (rows.length === 0) {
+      stride = Math.min(stride * 4, FLAGS_STRIDE_MAX);
+    }
+    else {
+      stride = Math.max(FLAGS_WINDOW, stride >> 1);
+    }
+    lo = hi + 1;
+  }
+  return out;
+}
+
+/** Snapshot rows as server rows: uid → {flags, msgid, size, …}. The
+ *  CONDSTORE skip's data source — only valid when the skip's invariants
+ *  proved the folder is exactly what the snapshot describes. */
+function rowsFromSnapshot(last) {
+  const rows = new Map();
+  for (const [uidTxt, rec] of Object.entries(last ?? {})) {
+    rows.set(Number(uidTxt), {
+      flags: readableFlags(rec?.flags ?? []),
+      msgid: rec?.msgid ?? null,
+      size: rec?.size ?? null,
+      subject: null,
+      from: null,
+      date: null
+    });
+  }
+  return rows;
+}
+
+/**
+ * Server rows for one surveyed folder — three tiers, cheapest first.
+ *
+ *  1. CONDSTORE skip (RFC 7162): the survey SELECT's HIGHESTMODSEQ equals
+ *     the snapshot's, uidvalidity/uidnext agree, EXISTS matches the
+ *     snapshot's message count and the entry carries no carried records →
+ *     the folder is exactly what the last committed run left it: the rows
+ *     come straight from the snapshot and no message call happens at all.
+ *     The snapshot persists the PRE-survey modseq (not the post-apply one),
+ *     so a folder this run itself writes to re-sweeps next run, and a
+ *     third-party change landing mid-run can never hide forever.
+ *  2. Flags sweep: a flag-only UID FETCH tiles [1, uidnext) for the live
+ *     uid set + flags; identities (msgid) and sizes ride the snapshot for
+ *     known uids, and one envelope fetch covers just the fresh uid region
+ *     the snapshot does not know yet. Uids the snapshot lost inside the
+ *     known region surface without a msgid and are classified through the
+ *     normal mining/pull paths.
+ *  3. Full envelope sweep (rowsFor) — the pre-incremental behavior: first
+ *     survey of a folder, a resync (uidvalidity changed or the local dir
+ *     missing), an old wasm core without fetch_flags, or a server whose
+ *     SELECT counters disagree with its own listings.
+ * @returns {Promise<{rows: Map<number,object>, unchanged: boolean}>}
+ */
+async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestModSeq, resync, localMissing}) {
+  const last = current?.messages ?? null;
+  const lastCount = last ? Object.keys(last).length : -1;
+  if (!resync && !localMissing && exists > 0 && last &&
+      !current.carried &&
+      highestModSeq && current.highestModSeq === highestModSeq &&
+      Number(current.uidnext || 0) === uidnext &&
+      exists === lastCount) {
+    emitLog('survey', `${f.name}: unchanged (modseq ${highestModSeq}) — rows from the snapshot, no message fetch`);
+    return {rows: rowsFromSnapshot(last), unchanged: true};
+  }
+  if (!exists) {
+    return {rows: new Map(), unchanged: false};
+  }
+  const snapUidnext = Number(current?.uidnext || 0);
+  if (!resync && !localMissing && last && snapUidnext > 0 && snapUidnext <= uidnext &&
+      typeof mail.listFlags === 'function') {
+    const flags = await flagsFor(f.name, uidnext);
+    if (flags) {
+      const rows = new Map();
+      for (const [uid, fl] of flags) {
+        const rec = last[uid] ?? null;
+        rows.set(uid, {
+          flags: readableFlags(fl),
+          msgid: rec?.msgid ?? null,
+          size: rec?.size ?? null,
+          subject: null,
+          from: null,
+          date: null
+        });
+      }
+      // uids the snapshot LOST inside the known region (an interrupted or
+      // garbled earlier run): their envelope row restores the size (and the
+      // identity when the server has one) so the size-adoption path keeps
+      // recognizing the local copy — without it a perfectly good file would
+      // be purged and re-pulled. One disjoint-set envelope fetch; a folder
+      // that lost this many records falls back to the honest full sweep.
+      const lost = [...flags.keys()].filter(uid => uid < snapUidnext && !last[uid]);
+      if (lost.length > 1000) {
+        return {rows: await rowsFor(f.name, uidnext), unchanged: false};
+      }
+      if (lost.length) {
+        surveyCalls.windows++;
+        for (const row of await mail.listMails({uids: lost})) {
+          rows.set(Number(row.uid), {
+            flags: readableFlags(row.flags),
+            subject: row.subject ?? null,
+            from: row.from ?? null,
+            date: row.date ?? null,
+            size: row.size ?? null,
+            msgid: row.messageId ?? null
+          });
+        }
+      }
+      // the fresh region: envelope rows supply the identities and sizes
+      // the snapshot cannot know yet (and carry their own flags — the same
+      // session moment as the flag sweep, so both agree)
+      if (snapUidnext <= uidnext - 1) {
+        for (const [uid, row] of await rowsFor(f.name, uidnext, snapUidnext)) {
+          rows.set(uid, row);
+        }
+      }
+      return {rows, unchanged: false};
+    }
+    // flags fetch unsupported by the core build: fall through to the sweep
+  }
+  return {rows: await rowsFor(f.name, uidnext), unchanged: false};
+}
+
   /**
    * The full server+local picture in one read-only pass.
     * @returns {Promise<{snap, folders: Map<string,Folder>, localOnly: string[]}>}
-    *   Folder: {name, uidvalidity, uidnext, exists, server, last, resync, local, localMissing}
+    *   Folder: {name, uidvalidity, uidnext, exists, highestModSeq, server, last,
+    *   resync, local, localMissing, unchanged}
     */
   async function surveyNow() {
     const snap = await store.loadState();
@@ -543,7 +694,11 @@ async function rowsFor(name, uidnext, lo = 1) {
       // skip below (no windows at all) and anchors the post-apply pass's
       // derived-rows invariant (postRows checks it against the sweep).
       const exists = Number(st?.exists || 0);
-      const server = exists ? await rowsFor(f.name, uidnext) : new Map();
+      // RFC 7162 CONDSTORE: the folder's highest mod-sequence as a decimal
+      // string (null on servers without the capability). Persisted in the
+      // snapshot at commit time; an equal value on the next run proves the
+      // folder has not changed since this SELECT — zero message calls.
+      const highestModSeq = st?.highestModSeq ?? null;
       const current = snap.folders[f.name] ?? null;
       const resync = !!current?.uidvalidity && Number(current.uidvalidity) !== uidvalidity;
       store.delimiter = f.delimiter || '/';
@@ -551,6 +706,8 @@ async function rowsFor(name, uidnext, lo = 1) {
       // null when the whole Maildir dir is gone (or not a Maildir) — the
       // dir-level form of "vanished locally" (see plan()'s resync branch)
       const localMissing = !local && !resync;
+      const {rows: server, unchanged} = await serverRowsFor(f, current,
+        {uidvalidity, uidnext, exists, highestModSeq, resync, localMissing});
 
       /** @type {Folder} */
       const F = {
@@ -559,15 +716,17 @@ async function rowsFor(name, uidnext, lo = 1) {
         uidvalidity,
         uidnext,
         exists,
+        highestModSeq,
         server,
         last: current,
         resync,
         localMissing,
-        local
+        local,
+        unchanged
       };
       folders.set(f.name, F);
       onProgress?.({phase: 'survey', folder: f.name, done: ++done, total});
-      emitLog('survey', `${f.name}: server=${server.size} local=${local ? local.entries.size : '?'} foreign=${local ? local.interlopers.length : 0} untracked=${local ? local.untracked.length : 0} ignored=${local ? local.excluded.length : 0} tmp=${local ? local.stranded.length : 0}${resync ? '  ⟳ RESYNC (uidvalidity changed)' : localMissing ? '  ⟳ RESYNC (local dir missing)' : ''}`);
+      emitLog('survey', `${f.name}: server=${server.size} local=${local ? local.entries.size : '?'} foreign=${local ? local.interlopers.length : 0} untracked=${local ? local.untracked.length : 0} ignored=${local ? local.excluded.length : 0} tmp=${local ? local.stranded.length : 0}${resync ? '  ⟳ RESYNC (uidvalidity changed)' : localMissing ? '  ⟳ RESYNC (local dir missing)' : ''}${unchanged ? '  ✓ unchanged' : ''}`);
       // keyword visibility: unencodable IMAP keywords ($Filtered, …) cannot
       // live in Maildir filenames, so they ride the SNAPSHOT only —
       // server-owned state, never encoded, never compared against files.
@@ -700,6 +859,8 @@ async function rowsFor(name, uidnext, lo = 1) {
   async function plan() {
     selected = null;
     const survey = await surveyNow();
+    emitLog('survey', `survey done: ${survey.folders.size} folder(s), ` +
+      `${surveyCalls.flags} flag fetch(es), ${surveyCalls.windows} envelope window(s)`);
     // locally deleted mail the classifier must not re-pull (see the
     // tombstone block above): loaded fresh every plan, dry runs included —
     // only apply() ever prunes the file
@@ -2404,7 +2565,7 @@ async function rowsFor(name, uidnext, lo = 1) {
     // bug. Such records are therefore CARRIED until a full run can trace
     // them by msgid; see the carry-forward block further below.
     // settledMoves: uids this run itself moved away ON THE SERVER
-    // (moveServer) — their source record is settled, dropping it is safe.</think><tool_call>edit<arg_key>newString</arg_key><arg_value>    // (moveServer) — their source record is settled, dropping it is safe.
+    // (moveServer) — their source record is settled, dropping it is safe.
     const settledMoves = new Set();
     if (only != null) {
       for (const op of plan.ops) {
@@ -2502,7 +2663,12 @@ async function rowsFor(name, uidnext, lo = 1) {
           // full flags: standard letters PLUS server keywords ($Filtered, …)
           // — unencodable in filenames, so the snapshot carries them; the
           // classifier only ever diffs the standard-letter subset
-          flags: readableFlags(row.flags)
+          flags: readableFlags(row.flags),
+          // the message size: the next run's incremental survey derives its
+          // rows from entries like this one, and the lost-move verifier
+          // compares bytes without a raw fetch. Absent on older snapshots —
+          // every consumer tolerates a missing field.
+          ...(row.size != null ? {size: Number(row.size)} : {})
         };
       }
       if (restricted) {
@@ -2516,22 +2682,40 @@ async function rowsFor(name, uidnext, lo = 1) {
       // either relocates/pulls the copy with its flags intact — instead of
       // pulling it as unread "new" mail. Genuinely gone mail is cleaned
       // naturally: a full run's rewrite drops unmatched records.
+      let carried = 0;
       if (only != null && F.name === only && !F.resync) {
         const lastMsgs = F.last?.messages ?? {};
-        let carried = 0;
         for (const [uidTxt, rec] of Object.entries(lastMsgs)) {
           const uid = Number(uidTxt);
           if (uid >= uidnext || Object.prototype.hasOwnProperty.call(messages, uid) || settledMoves.has(uid)) {
             continue;
           }
-          messages[uid] = {msgid: rec?.msgid ?? null, flags: rec?.flags ?? []};
+          messages[uid] = {msgid: rec?.msgid ?? null, flags: rec?.flags ?? [],
+            ...(rec?.size != null ? {size: rec.size} : {})};
           carried++;
         }
         if (carried) {
           emitLog('post', `${F.name}: ${carried} message(s) left the folder on the server while other tools ran — records kept until a full run can trace the move`);
         }
       }
-      snapOut.folders[F.name] = {uidvalidity, uidnext, messages};
+      const entry = {uidvalidity, uidnext, messages};
+      // the PRE-survey modseq (RFC 7162 CONDSTORE): the next run's survey
+      // skips this folder without any message fetch when the server still
+      // reports this value — nothing has touched it since this SELECT.
+      // Persisting the pre-survey value (not the post-apply one) keeps the
+      // skip honest: this run's own server writes move the server past it,
+      // so the next run re-sweeps the folder once, and a third-party change
+      // landing mid-run can never hide forever.
+      if (F.highestModSeq) {
+        entry.highestModSeq = String(F.highestModSeq);
+      }
+      if (carried) {
+        // carried records make the entry larger than server truth — with
+        // one, the survey's CONDSTORE skip must never fire (it would keep
+        // re-deriving the carried uid as a live server row forever)
+        entry.carried = carried;
+      }
+      snapOut.folders[F.name] = entry;
       emitLog('post', `${F.name}: ${Object.keys(messages).length} message(s), uidvalidity=${uidvalidity}, uidnext=${uidnext}`);
     }
     // the run's pull-time routing, as one line (arrivals included; a run
