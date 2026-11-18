@@ -1,23 +1,14 @@
 import {starColorOf, threadStarColor} from '../star-colors.mjs';
+import {SORT_MODES, senderName} from '../list-order.mjs';
 import './star-toggle.js';
 
 const timeFormat = new Intl.DateTimeFormat(undefined, {hour: '2-digit', minute: '2-digit'});
 const dayFormat = new Intl.DateTimeFormat(undefined, {month: 'short', day: 'numeric'});
 const fullFormat = new Intl.DateTimeFormat(undefined, {year: 'numeric', month: 'short', day: 'numeric'});
 
-function senderName(from) {
-  if (!from) {
-    return '';
-  }
-  const s = String(from);
-  const lt = s.lastIndexOf('<');
-  const gt = s.lastIndexOf('>');
-  if (lt > -1 && gt > lt) {
-    const name = s.slice(0, lt).trim().replace(/^"+|"+$/g, '').trim();
-    return name || s.slice(lt + 1, gt).trim();
-  }
-  return s.trim();
-}
+// the header-indexing progress dialog only opens for parses big enough to
+// be worth waiting for (smaller folders index in well under a second)
+const PROGRESS_MIN = 400;
 
 function formatDate(value) {
   if (!value) {
@@ -40,40 +31,6 @@ function formatDate(value) {
 
 function hasFlag(flags, name) {
   return Array.isArray(flags) && flags.some(f => String(f).toLowerCase() === name.toLowerCase());
-}
-
-// Text comparator: locale compare; empty/missing values always sort last
-// regardless of direction; ties broken by the thread's newest UID.
-function textComparator(get, desc) {
-  const sign = desc ? -1 : 1;
-  return (a, b) => {
-    const va = get(a);
-    const vb = get(b);
-    if (!va && !vb) return newestUid(a, desc) - newestUid(b, desc);
-    if (!va) return 1;
-    if (!vb) return -1;
-    return sign * va.localeCompare(vb) || newestUid(a, desc) - newestUid(b, desc);
-  };
-}
-
-// Numeric comparator (timestamps): missing (null) values always sort last.
-function numberComparator(get, desc) {
-  const sign = desc ? -1 : 1;
-  return (a, b) => {
-    const va = get(a);
-    const vb = get(b);
-    if (va === null && vb === null) return newestUid(a, desc) - newestUid(b, desc);
-    if (va === null) return 1;
-    if (vb === null) return -1;
-    return sign * (va - vb) || newestUid(a, desc) - newestUid(b, desc);
-  };
-}
-
-// Deterministic tiebreak: equal values order by newest UID — ascending for
-// asc sorts, descending for desc sorts (mirrors the value direction).
-function newestUid(thread, desc) {
-  const uid = thread.uids.length ? thread.uids[thread.uids.length - 1] : 0;
-  return desc ? -uid : uid;
 }
 
 // Display path for folder pickers: the raw server-spelled name, no
@@ -102,7 +59,6 @@ class ListView extends HTMLElement {
   #clearFilter;
   #sort;
   #sortMode = '';
-  #flaggedOnTop = false;
   #filterQuery = '';
   #moveDialog;
   #moveForm;
@@ -120,6 +76,11 @@ class ListView extends HTMLElement {
   #purgeMessage;
   #purgePending = null;
   #purgeQueue = Promise.resolve();
+  #indexDialog;
+  #progressBar;
+  #progressCount;
+  #progressShown = false;
+  #progressAt = 0;
   // per-message save errors (uid -> message) from a native save job; rows
   // carrying one get a visible failure marker until the folder reloads
   #failures = new Map();
@@ -133,7 +94,6 @@ class ListView extends HTMLElement {
   #pageLast;
   #refreshBtn;
   #unreadOnly = false;
-  #threadMode = true;
   #actions;
   #btnsWrap;
   #searchWrap;
@@ -617,6 +577,45 @@ class ListView extends HTMLElement {
         .purge-dialog .danger {
           color: light-dark(#b3261e, #f2b8b5);
         }
+        .index-dialog {
+          width: min(90vw, 380px);
+          padding: calc(18px * var(--font-scale, 1));
+          color: var(--fg, #1b1d21);
+          background: var(--pane-bg, #ffffff);
+          border: 1px solid var(--line, #d9dce1);
+          border-radius: var(--radius, 10px);
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+          margin: auto;
+        }
+        .index-dialog::backdrop {
+          background: rgba(0, 0, 0, 0.4);
+        }
+        .index-dialog form {
+          display: flex;
+          flex-direction: column;
+          gap: calc(12px * var(--font-scale, 1));
+          margin: 0;
+        }
+        .index-dialog .message {
+          margin: 0;
+          font-size: calc(14px * var(--font-scale, 1));
+        }
+        .index-dialog .bar {
+          width: 100%;
+          height: calc(8px * var(--font-scale, 1));
+          accent-color: var(--accent, AccentColor);
+        }
+        .index-dialog .count {
+          margin: 0;
+          font-size: calc(12px * var(--font-scale, 1));
+          color: var(--dim, #8a8f98);
+          font-variant-numeric: tabular-nums;
+        }
+        .index-dialog .submessage {
+          margin: 0;
+          font-size: calc(12px * var(--font-scale, 1));
+          color: var(--dim, #8a8f98);
+        }
       </style>
       <div class="actions" title="Message list — Alt+2 focus · ↑/↓ move · Space check · Enter/double-click preview · Ctrl+A select all">
         <label class="all">
@@ -647,8 +646,9 @@ class ListView extends HTMLElement {
                  aria-label="Select matching messages" spellcheck="false" autocomplete="off">
           <button class="clear-filter" type="button" hidden title="Clear filter"
                   aria-label="Clear selection filter">✕</button>
-          <select class="sort" aria-label="Sort conversations" title="Sort conversations (current view only)">
-            <option value="">Newest first</option>
+          <select class="sort" aria-label="Sort order" title="Sort order">
+            <option value="">Conversation order</option>
+            <option value="date-desc">Date newest first</option>
             <option value="date-asc">Date oldest first</option>
             <option value="subject-asc">Subject A→Z</option>
             <option value="subject-desc">Subject Z→A</option>
@@ -695,6 +695,14 @@ class ListView extends HTMLElement {
             <button type="submit" class="danger">Delete permanently</button>
           </div>
         </form>
+      </dialog>
+      <dialog class="index-dialog">
+        <form>
+          <p class="message">Indexing message headers…</p>
+          <progress class="bar"></progress>
+          <p class="count"></p>
+          <p class="submessage">One-time per folder — later opens reuse this.</p>
+        </form>
       </dialog>`;
     this.#status = root.querySelector('.status');
     this.#statusText = root.querySelector('.status p');
@@ -723,6 +731,12 @@ class ListView extends HTMLElement {
     this.#afterSaveMove = this.#afterSaveDialog.querySelector('.ok');
     this.#purgeDialog = root.querySelector('.purge-dialog');
     this.#purgeMessage = this.#purgeDialog.querySelector('.message');
+    this.#indexDialog = root.querySelector('.index-dialog');
+    this.#progressBar = this.#indexDialog.querySelector('.bar');
+    this.#progressCount = this.#indexDialog.querySelector('.count');
+    // wait-for-it dialog: Esc and every other cancel path are refused; it
+    // closes when the host's progressDone() lands
+    this.#indexDialog.addEventListener('cancel', e => e.preventDefault());
     this.#pagerEl = root.querySelector('.pager');
     this.#pageInfo = root.querySelector('.page-info');
     this.#pageFirst = root.querySelector('.page[data-page="first"]');
@@ -907,64 +921,13 @@ class ListView extends HTMLElement {
     this.#ro.disconnect();
   }
 
-  // When on (default), conversations are grouped into thread rows; when off,
-  // every message renders as its own flat single-message row. Persistence is
-  // the host's job via the "thread-changed" event.
-  get threadMode() {
-    return this.#threadMode;
-  }
-
-  set threadMode(on) {
-    const next = !!on;
-    if (this.#threadMode === next) {
-      return;
-    }
-    this.#threadMode = next;
-    this.#render();
-    this.dispatchEvent(new CustomEvent('thread-changed', {
-      detail: {on: next},
-      bubbles: true,
-      composed: true
-    }));
-  }
-
-  // Map server threads into the rows the view builds on. Thread mode keeps
-  // them as-is; flat mode reshapes each thread into one pseudo-row per
-  // message (single-message "conversation"), so all selection, action,
-  // filter and rollback logic below works unchanged on both shapes.
-  #flatten(rows) {
-    if (this.#threadMode) {
-      return rows;
-    }
-    const out = [];
-    for (const thread of Array.isArray(rows) ? rows : []) {
-      const messages = Array.isArray(thread?.messages) ? thread.messages : [];
-      if (!messages.length) {
-        out.push(thread);
-        continue;
-      }
-      for (const item of messages) {
-        const flags = Array.isArray(item.flags) ? item.flags.map(String) : [];
-        out.push({
-          uids: [Number(item.uid)],
-          messages: [item],
-          count: 1,
-          unread: flags.includes('\\Seen') ? 0 : 1,
-          flagged: flags.includes('\\Flagged'),
-          subject: item.subject || thread.subject || '',
-          from: item.from || thread.from || '',
-          date: item.date || thread.date || ''
-        });
-      }
-    }
-    return out;
-  }
-
   // Full build: initial folder load, page change, folder switch, the
   // toolbar refresh. The post-sync path (sync below) reconciles instead of
-  // rebuilding.
+  // rebuilding. The rows arrive ordered and paginated from the host
+  // (list.mjs — list-order.mjs orders the folder before the page slices);
+  // flat mode arrives pre-flattened (one pseudo-row per message).
   build(rows) {
-    this.#rows = this.#flatten(rows);
+    this.#rows = Array.isArray(rows) ? rows : [];
     this.#selected = new Set();
     this.#expanded = new Set();
     this.#lastChecked = null;
@@ -985,7 +948,7 @@ class ListView extends HTMLElement {
   // (the user's, when no filter query is active), expansion and the scroll
   // position survive; no loading state is shown.
   sync(rows) {
-    const next = Array.isArray(rows) ? this.#flatten(rows) : [];
+    const next = Array.isArray(rows) ? rows : [];
     const oldUids = new Set();
     for (const thread of this.#rows) {
       for (const uid of thread.uids) {
@@ -1025,7 +988,7 @@ class ListView extends HTMLElement {
   }
 
   // Keyed DOM reconciliation for the sync path: bring the grid's children
-  // in line with #sortedRows() (+ expanded sub rows). Untouched rows keep
+  // in line with #rows (+ expanded sub rows). Untouched rows keep
   // their DOM nodes (and the star pickers they host) — no recreation when
   // nothing changed, moves are plain insertBefore of existing nodes, and
   // only genuinely changed rows rebuild. #render() keeps the degenerate
@@ -1035,7 +998,7 @@ class ListView extends HTMLElement {
       this.#render();
       return;
     }
-    if (!this.#rows.length || (this.#unreadOnly && !this.#rows.some(thread => thread.unread > 0))) {
+    if (!this.#rows.length) {
       this.#render();
       return;
     }
@@ -1043,7 +1006,7 @@ class ListView extends HTMLElement {
     // #render's empty state hid nothing but showed the status text)
     this.#status.hidden = true;
     const desired = [];
-    for (const thread of this.#sortedRows()) {
+    for (const thread of this.#rows) {
       desired.push({thread, item: null});
       if (this.#expanded.has(thread.uids[0])) {
         const messages = this.#unreadOnly
@@ -1159,40 +1122,26 @@ class ListView extends HTMLElement {
       && node.getAttribute('aria-selected') === String(checked);
   }
 
-  // Active sort mode ("" = natural newest-first). Setting it syncs the
-  // toolbar select and re-renders; persistence is the host's job (the
-  // component stays chrome-free) via the "sort-changed" event.
+  // Active sort mode as shown in the toolbar select ("" = the folder's
+  // natural conversation order). Ordering itself lives in the host
+  // (list.mjs → list-order.mjs, folder-wide, before pagination) — the
+  // component only mirrors the value and re-renders the page it is given;
+  // persistence is the host's job via the "sort-changed" event.
   get sortMode() {
     return this.#sortMode;
   }
 
   set sortMode(mode) {
-    const known = ['', 'date-asc', 'subject-asc', 'subject-desc', 'sender-asc', 'sender-desc'];
-    this.#sortMode = known.includes(mode) ? mode : '';
+    this.#sortMode = SORT_MODES.includes(mode) ? mode : '';
     this.#sort.value = this.#sortMode;
-    this.#render();
+    // no local re-render: the change event below reaches the host, which
+    // re-orders folder-wide and rebuilds the page synchronously
   }
 
-  // When on, flagged conversations always sort above unflagged ones (the
-  // active sort runs once per partition).
-  get flaggedOnTop() {
-    return this.#flaggedOnTop;
-  }
-
-  set flaggedOnTop(on) {
-    const next = !!on;
-    if (this.#flaggedOnTop === next) {
-      return;
-    }
-    this.#flaggedOnTop = next;
-    this.#render();
-  }
-
-  // When on, the list shows only conversations with unread messages (read
-  // ones are hidden), and expanded conversations only their unread
-  // messages. Purely view-local: #rows keeps everything, so turning the
-  // toggle off (or a flag rollback) brings rows back. Persistence is the
-  // host's job via the "unread-changed" event.
+  // When on, the page arrives pre-filtered from the host (conversations
+  // without unread mail are already gone); the view additionally shows only
+  // the unread messages inside an expanded conversation. The toggle event
+  // persists and re-renders through the host.
   get unreadOnly() {
     return this.#unreadOnly;
   }
@@ -1203,7 +1152,8 @@ class ListView extends HTMLElement {
       return;
     }
     this.#unreadOnly = next;
-    this.#render();
+    // no local re-render: the host re-filters the folder and rebuilds the
+    // page synchronously when the event below lands
     this.dispatchEvent(new CustomEvent('unread-changed', {
       detail: {on: next},
       bubbles: true,
@@ -1389,6 +1339,38 @@ class ListView extends HTMLElement {
       ? {page: pager.page, pageSize: pager.pageSize, total: Number(pager.total) || 0}
       : null;
     this.#updatePager();
+  }
+
+  // Header-indexing progress (header-index.mjs, via the host): a folder's
+  // first read parses every message's header slice — on big folders that is
+  // worth waiting for, so a non-dismissable dialog rides the parse. Small
+  // totals stay invisible (the parse is over before it would matter); the
+  // dialog opens at the first report that crosses PROGRESS_MIN and stays
+  // until progressDone(). DOM writes are throttled — the final update
+  // always lands.
+  progress({done = 0, total = 0} = {}) {
+    if (!(total >= PROGRESS_MIN)) {
+      return;
+    }
+    const now = performance.now();
+    if (!this.#progressShown) {
+      this.#progressShown = true;
+      this.#indexDialog.showModal();
+    }
+    else if (done < total && now - this.#progressAt < 50) {
+      return;
+    }
+    this.#progressAt = now;
+    this.#progressBar.max = total;
+    this.#progressBar.value = Math.min(done, total);
+    this.#progressCount.textContent = done + ' / ' + total;
+  }
+
+  progressDone() {
+    if (this.#progressShown) {
+      this.#progressShown = false;
+      this.#indexDialog.close();
+    }
   }
 
   #updatePager() {
@@ -1674,14 +1656,15 @@ class ListView extends HTMLElement {
     this.#updateActions();
   }
 
-  // Toolbar select-all: acts on the rows currently visible. Checking checks
-  // every visible message; unchecking (any click while some are checked)
-  // clears the whole selection.
+  // Toolbar select-all: acts on the rows currently visible (the whole page —
+  // unread-only and flagged-on-top filtering happened host-side already).
+  // Checking checks every visible message; unchecking (any click while some
+  // are checked) clears the whole selection.
   #toggleAll() {
     if (this.#mode !== 'ready') {
       return;
     }
-    const visible = this.#visibleRows();
+    const visible = this.#rows;
     const anyChecked = visible.some(thread => thread.messages.some(item => this.#selected.has(item.uid)));
     if (anyChecked) {
       this.#selected = new Set();
@@ -1702,7 +1685,7 @@ class ListView extends HTMLElement {
   // Selected set of every visible message uid; drives the toolbar checkbox.
   #visibleUids() {
     const uids = [];
-    for (const thread of this.#visibleRows()) {
+    for (const thread of this.#rows) {
       for (const item of thread.messages) {
         uids.push(item.uid);
       }
@@ -1750,7 +1733,7 @@ class ListView extends HTMLElement {
       this.#updateActions();
       return;
     }
-    if (!this.#rows.length || (this.#unreadOnly && !this.#rows.some(thread => thread.unread > 0))) {
+    if (!this.#rows.length) {
       this.#status.hidden = false;
       this.#status.classList.remove('error');
       this.#retryButton.hidden = true;
@@ -1760,7 +1743,7 @@ class ListView extends HTMLElement {
       return;
     }
     const nodes = [];
-    for (const thread of this.#sortedRows()) {
+    for (const thread of this.#rows) {
       nodes.push(this.#threadRow(thread));
       if (this.#expanded.has(thread.uids[0])) {
         const messages = this.#unreadOnly
@@ -1775,30 +1758,6 @@ class ListView extends HTMLElement {
     this.#updateActions();
   }
 
-  // Threads the unread-only filter lets through; the full set stays in
-  // #rows so the filter is reversible at any time.
-  #visibleRows() {
-    return this.#unreadOnly ? this.#rows.filter(thread => thread.unread > 0) : this.#rows;
-  }
-
-  // View-local sorting: reorders only the threads currently built into the
-  // list (the loaded page). `#rows` keeps its natural newest-first order, so
-  // switching back to "Newest first" needs no stored copy. With
-  // `flaggedOnTop`, the active comparator (or natural order) runs once per
-  // partition and flagged conversations are placed first.
-  #sortedRows() {
-    const rows = this.#visibleRows();
-    if (this.#flaggedOnTop) {
-      const flagged = [];
-      const rest = [];
-      for (const thread of rows) {
-        (thread.flagged ? flagged : rest).push(thread);
-      }
-      return [...this.#sortPartition(flagged), ...this.#sortPartition(rest)];
-    }
-    return this.#sortPartition(rows);
-  }
-
   // Re-render without losing keyboard focus: the row that had focus (thread
   // row by data-key, message row by data-uid) is focused again if it is
   // still part of the new rendering.
@@ -1811,39 +1770,6 @@ class ListView extends HTMLElement {
       ? this.#grid.querySelector('.row.thread[data-key="' + key + '"]')
       : (uid != null ? this.#grid.querySelector('.row.sub[data-uid="' + uid + '"]') : null);
     again?.focus({preventScroll: true});
-  }
-
-  #sortPartition(rows) {
-    if (!this.#sortMode) {
-      return rows;
-    }
-    const [key, dir] = this.#sortMode.split('-');
-    const cmp = this.#comparator(key, dir === 'desc');
-    // Array.prototype.sort is stable; comparators also tiebreak on UID, so
-    // the result is fully deterministic.
-    return [...rows].sort(cmp);
-  }
-
-  #comparator(key, desc) {
-    switch (key) {
-      case 'subject': {
-        const val = t => (t.subject || '').trim().toLowerCase();
-        return textComparator(val, desc);
-      }
-      case 'sender': {
-        const val = t => senderName(t.from).trim().toLowerCase();
-        return textComparator(val, desc);
-      }
-      case 'date': {
-        const val = t => {
-          const d = new Date(t.date || '');
-          return isNaN(d.getTime()) ? null : d.getTime();
-        };
-        return numberComparator(val, desc);
-      }
-      default:
-        return () => 0;
-    }
   }
 
   // Shift-click range: rows are in visible render order, so the range walks

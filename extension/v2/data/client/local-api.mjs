@@ -6,8 +6,9 @@
 // and every mutation is a file operation inside the root handle:
 //
 //   listDirs/count lists  → account-tree walk (MaildirStore.listFolders)
-//   threads/bodies/search → per-message header parse (headers.mjs); bodies
-//                           parse fully with postal-mime only on demand
+//   threads/bodies/search → per-message headers via the persistent index
+//                           (.headers.json, header-index.mjs); bodies parse
+//                           fully with postal-mime only on demand
 //   listThreadsDelta()    → the post-sync in-place reconcile's read: a uid
 //                           +flag sweep over the filenames diffed against a
 //                           per-folder cache of the last full read — only
@@ -44,12 +45,9 @@ import {
 } from '../sync/maildir.mjs';
 import {delimiterFor} from '../sync/client/delimiter.mjs';
 import {loadSnapshot, msgidOf} from '../sync/snapshot.mjs';
-import {messageMeta} from './headers.mjs';
+import {hydrateMeta} from './header-index.mjs';
 import {groupThreads} from './threads.mjs';
 import postalMime from '/core/parser/postal-mime.mjs';
-
-const HEADER_BYTES = 65536;
-const MAX_META_MESSAGES = 2000; // header-parse cap for one folder read
 
 // ---- resync reports (worker bookkeeping) -------------------------------------
 //
@@ -70,11 +68,15 @@ function reportEdit(payload) {
   }
 }
 
-// ---- per-message metadata (re-parsed on demand; no cache files) ---------------
+// ---- per-message metadata (persistent per-folder header index) ---------------
 
-// subject/from/date/threads re-parse per folder read (cheap header slices,
-// capped so gigantic mailboxes degrade gracefully); mutations just notify the
-// views, whose refetch re-parses fresh disk truth.
+// subject/from/date/threading headers come from the folder's .headers.json
+// sidecar (header-index.mjs): known uids serve from the cache with no
+// message-file read, unknown ones parse their header slice once and join
+// the index. No cap: every row carries metadata, so the views can sort the
+// whole folder by date. Mutations just notify the views, whose refetch
+// reconciles fresh disk truth (flags live in the filenames, header content
+// never changes under one uid).
 
 // Rows for one folder: uid/flags from the filenames, subject/from/date from
 // the header block. \\Deleted rows leave every view.
@@ -121,22 +123,12 @@ async function folderRows(store, account, folder) {
   return {rows, entries};
 }
 
-// Fill the header-derived fields of the rows. Cap: gigantic folders degrade
-// gracefully (rows without metadata still list and open fine). The header
-// slices ride the fs gateway (core/fs.mjs) like every other read.
-async function withMeta(rows, store) {
-  const slice = rows.slice(0, MAX_META_MESSAGES);
-  await Promise.all(slice.map(async row => {
-    try {
-      const file = await store.fs.reader.read(row.entry.path);
-      const bytes = new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer());
-      Object.assign(row, messageMeta(bytes));
-    }
-    catch {
-      // unreadable/partial body: the row keeps uid+flags (flag truth) only
-    }
-  }));
-  return rows;
+// Fill the header-derived fields of the rows through the persistent
+// per-folder index (header-index.mjs). Cheap after the first read of a
+// folder: known uids come straight from .headers.json. `prune` only on
+// FULL-folder reads — subset reads must never shrink the index.
+async function withMeta(rows, store, opts = {}) {
+  return hydrateMeta(rows, store.fs, opts);
 }
 
 // Raw RFC822 of one message, resilient to the maildir flag-rename races:
@@ -305,8 +297,8 @@ export function apiForStore(store, accountId) {
 
     /**
      * Rows of the open dir (or an explicit fromUid/toUid range), newest uid
-     * first, \\Deleted rows gone. Headers re-parse on every call (cheap
-     * slice reads — the same truth listThreads() renders).
+     * first, \\Deleted rows gone. Headers come from the persistent index
+     * (subset reads never prune it).
      */
     async listFiles({page = 0, pageSize = 20, fromUid, toUid} = {}) {
       if (!selected) throw new Error('openDir() first');
@@ -320,10 +312,16 @@ export function apiForStore(store, accountId) {
       return summarize(await withMeta(rows.slice(start, start + pageSize), store));
     },
 
-    async listThreads() {
+    /**
+     * Conversations of the open dir, newest thread first (threads.mjs).
+     * A full-folder read: the index prunes against it, and the first read
+     * of a cold folder parses every header — report {done, total} through
+     * `onProgress` so the view can show the indexing progress.
+     */
+    async listThreads({onProgress = null} = {}) {
       if (!selected) throw new Error('openDir() first');
       const {rows} = await folderRows(store, accountId, selected);
-      const threads = groupThreads(await withMeta(rows, store));
+      const threads = groupThreads(await withMeta(rows, store, {prune: true, onProgress}));
       // seed the delta cache from the full read: the rows are fresh,
       // meta-parsed folderRows shape — the next delta only diffs. Eager is
       // fine here (unlike the delta path): these rows are the disk truth
@@ -480,8 +478,9 @@ export function apiForStore(store, accountId) {
         query,
         allFolders = false,
         onPage = null,
+        onProgress = null,   // header-indexing {done, total} per folder read
       } = options ?? {};
-      return searchFolders(store, accountId, allFolders ? null : (dir ?? selected), query, onPage);
+      return searchFolders(store, accountId, allFolders ? null : (dir ?? selected), query, onPage, onProgress);
     },
 
     async listDirCounts(onProgress) {
@@ -725,8 +724,8 @@ function skeletonRow(entry, folder) {
 
 // Seed rows for the delta cache from one listLocal() result, same
 // shape/semantics as folderRows(): \Deleted gone from the entries,
-// interlopers in (they never trip the \Deleted gate there), meta parsed,
-// newest first.
+// interlopers in (they never trip the \Deleted gate there), meta parsed
+// (a FULL-folder read — the index prunes against it), newest first.
 async function deltaRows(local, folder, store) {
   const rows = [];
   for (const entry of local.entries.values()) {
@@ -739,7 +738,7 @@ async function deltaRows(local, folder, store) {
     rows.push(skeletonRow(interloper, folder));
   }
   rows.sort((a, b) => b.uid - a.uid);
-  await withMeta(rows, store);
+  await withMeta(rows, store, {prune: true});
   return rows;
 }
 
@@ -756,7 +755,7 @@ async function removeFolderDir(store, folder) {
 
 // ---- folder-scoped local search ------------------------------------------------
 
-async function searchFolders(store, accountId, onlyDir, query, onPage) {
+async function searchFolders(store, accountId, onlyDir, query, onPage, onProgress = null) {
   const terms = parseQuery(query);
   if (!terms.length) {
     return [];
@@ -776,7 +775,9 @@ async function searchFolders(store, accountId, onlyDir, query, onPage) {
       }
       catch {}
     }
-    for (const row of await withMeta(rows, store)) {
+    // full-folder read (the index prunes against it); the first sweep of a
+    // cold folder parses every header — progress rides onProgress
+    for (const row of await withMeta(rows, store, {prune: true, onProgress})) {
       if (row.flags.includes('\\Deleted')) {
         continue;
       }
@@ -789,7 +790,10 @@ async function searchFolders(store, accountId, onlyDir, query, onPage) {
 }
 
 // ThreadSummary[] of matching rows, tagged with their folder (the views show
-// the folder name on all: imports results like the old mirror search did)
+// the folder name on all: imports results like the old mirror search did).
+// The rows arrive hydrated (searchFolders' per-folder reads indexed them) —
+// no re-hydration here: a subset re-run would prune nothing anyway, but it
+// would also parse nothing, so this is a pure grouping pass.
 async function listThreadsFromRows(store, accountId, rows) {
   const byFolder = new Map();
   for (const row of rows) {
@@ -802,7 +806,7 @@ async function listThreadsFromRows(store, accountId, rows) {
   }
   const out = [];
   for (const [folder, list] of byFolder) {
-    const threads = groupThreads(await withMeta(list, store));
+    const threads = groupThreads(list);
     for (const t of threads) {
       out.push({...t, dir: folder});
     }

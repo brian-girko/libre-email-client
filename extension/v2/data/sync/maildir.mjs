@@ -630,6 +630,10 @@ export async function removeMessage(fs, entry) {
 /**
  * Deletes every message file of a Maildir (resync). The folder itself and
  * the .uidvalidity file survive; callers decide whether that marker stays.
+ * The client's header-index sidecar (.headers.json) goes WITH the messages:
+ * a wiped folder is about to be re-pulled under possibly re-used uids, and
+ * a surviving cache could serve the new files the old headers while the
+ * .uidvalidity marker is momentarily absent (clearUidValidity runs after).
  * @returns {Promise<number>} files removed
  */
 export async function wipeFolder(fs, maildir) {
@@ -655,6 +659,10 @@ export async function wipeFolder(fs, maildir) {
       catch {}
     }
   }
+  try {
+    await fs.writer.remove(maildir.dir + '/.headers.json', {quiet: true});
+  }
+  catch {}
   return n;
 }
 

@@ -561,4 +561,23 @@ const afterCommit = await deltaApi.listThreadsDelta();
 assert.equal(afterCommit.changed, false);
 ok('flag reconcile also lands on commit only (no in-place cache flip)');
 
+// ---- 9. the header-index sidecar follows the messages it caches -------------
+//
+// store.wipe() (the UIDVALIDITY resync) must remove <folder>/.headers.json:
+// the folder is about to be re-pulled under possibly re-used uids, and the
+// resync clears .uidvalidity first, so a surviving cache could serve the
+// new files the old headers while the marker is absent. .uidvalidity itself
+// survives the wipe (the caller decides).
+
+// the listThreads runs above already wrote the sidecar through the real
+// gateway; assert it exists, then wipe and check it went with the mail
+const sidecar = 'acc/INBOX/.headers.json';
+assert.ok(await deltaFs.reader.exists(sidecar), 'sanity: listThreads wrote the sidecar');
+const wipedFiles = await deltaStore.wipe('INBOX');
+assert.equal(wipedFiles, 1, 'the message file went');
+assert.equal(await deltaFs.reader.exists(sidecar), false, 'the sidecar went with it');
+// (this fixture never wrote a .uidvalidity — only the sync engine's pull
+// path does; the wipe leaves it alone either way, maildir.wipeFolder only
+// sweeps tmp/new/cur plus the sidecar)
+
 console.log(`fs-gateway.test: all ${n} checks pass`);

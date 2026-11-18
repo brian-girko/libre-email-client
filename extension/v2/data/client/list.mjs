@@ -5,6 +5,7 @@ import {enqueue, uidBusy} from './jobs.mjs';
 import {currentDirs} from './dirs.mjs';
 import {writeFiles} from '/core/native/native-client.mjs';
 import {STAR_COLORS, starFlagOps} from './star-colors.mjs';
+import {SORT_MODES, flattenThreads, orderRows, rowKey} from './list-order.mjs';
 import * as counters from './counters.mjs';
 import * as logger from './logger.mjs';
 
@@ -314,21 +315,42 @@ async function runMovePickerAction(id, name, uids, token) {
   );
 }
 
-const SORT_MODES = ['', 'date-asc', 'subject-asc', 'subject-desc', 'sender-asc', 'sender-desc'];
-
 async function readPageSize() {
   const res = await chrome.storage.local.get({'ui.mailPageSize': 50});
   const n = Number(res['ui.mailPageSize']);
   return Number.isInteger(n) && n >= 1 && n <= 500 ? n : 50;
 }
 
-// apply persisted view prefs (sort order, flagged-on-top, unread-only) to the component
+// apply persisted view prefs (sort order, flagged-on-top, unread-only,
+// conversations vs single messages) to the host state and the component.
+// The host owns ordering and pagination (orderRows/flattenThreads below);
+// the component renders the page it is given. `syncingPrefs` mutes the
+// change-event listeners while the values are being restored (a change
+// event fired during restore must not render stale rows mid-load).
+let view = {sortMode: '', flaggedOnTop: false, unreadOnly: false, threadMode: true};
+let syncingPrefs = false;
+
 async function applyViewPrefs() {
-  const sort = await getPref('mailSort', '');
-  el.sortMode = SORT_MODES.includes(sort) ? sort : '';
-  el.flaggedOnTop = !!(await getPref('mailFlaggedTop', false));
-  el.unreadOnly = !!(await getPref('mailUnreadOnly', false));
-  el.threadMode = (await getPref('mailThreadMode', true)) !== false;
+  const [sort, flaggedTop, unreadOnly, threadMode] = await Promise.all([
+    getPref('mailSort', ''),
+    getPref('mailFlaggedTop', false),
+    getPref('mailUnreadOnly', false),
+    getPref('mailThreadMode', true)
+  ]);
+  view = {
+    sortMode: SORT_MODES.includes(sort) ? sort : '',
+    flaggedOnTop: !!flaggedTop,
+    unreadOnly: !!unreadOnly,
+    threadMode: threadMode !== false
+  };
+  syncingPrefs = true;
+  try {
+    el.sortMode = view.sortMode;
+    el.unreadOnly = view.unreadOnly;
+  }
+  finally {
+    syncingPrefs = false;
+  }
 }
 
 // active search state; null = normal folder view
@@ -347,14 +369,83 @@ async function clearSearch() {
   await load(accountId, dirName);
 }
 
-// The ThreadSummary rows the view currently shows. Every load()/sync() that
-// re-renders the folder updates it; page>0 syncs anchor to it so the rows
-// the user reads stay put while pages shift underneath.
+// The rows the current page shows, taken from the ordered folder.
 let lastRows = [];
 
-// Threads grouped locally per folder read (threads.mjs), so paging is a pure
-// slice of that list: one page holds `pageSize` conversations.
-// refresh: re-reads the folder from the disk truth (no caching anywhere).
+// The full folder (or search results): every conversation of the last read,
+// unordered here — ordering applies per render so pref changes are instant.
+let lastThreads = [];
+
+// True only while the view holds rows of the CURRENT folder/search: set at
+// the start of a load/search (so a mid-read pref toggle cannot repaint the
+// previous folder's rows over a loading or error state) and on every
+// successful render.
+let listReady = false;
+
+// Folder-wide view ordering: flat mode reshapes conversations into
+// per-message rows first, then the unread-only filter, the flagged-on-top
+// partition and the active sort apply (list-order.mjs).
+function orderedRows() {
+  const rows = view.threadMode ? lastThreads : flattenThreads(lastThreads);
+  return orderRows(rows, view);
+}
+
+// Order first, paginate second: the whole folder (or search result set) is
+// sorted, then the page slices out of the ordered list. Threaded mode pages
+// by conversations, flat mode by messages; unread-only shrinks the pool
+// before both. A sort/filter change keeps the page number (clamped to the
+// last page); only its contents move with the new order.
+function render({sync = false, anchor = null} = {}) {
+  const rows = orderedRows();
+  if (search) {
+    // search results show unpaginated
+    lastRows = rows;
+    el.build(rows);
+    el.setPager(null);
+    listReady = true;
+    return;
+  }
+  const total = rows.length;
+  totalPages = Math.max(1, Math.ceil(total / pageSize));
+  // anchor: after a background reconcile, deeper pages stay pinned to the
+  // row that headed the view before (wherever the reorder ranked it) — no
+  // rows re-derived underneath a reading user. The live first page just
+  // slides with the order: new mail lands where the sort ranks it.
+  if (anchor && anchor.page > 0 && anchor.key > 0) {
+    const index = rows.findIndex(row => rowKey(row) === anchor.key);
+    if (index >= 0) {
+      page = Math.min(Math.floor(index / pageSize), totalPages - 1);
+    }
+  }
+  if (page >= totalPages) {
+    page = totalPages - 1;
+  }
+  if (page < 0) {
+    page = 0;
+  }
+  lastRows = rows.slice(page * pageSize, (page + 1) * pageSize);
+  if (sync) {
+    el.sync(lastRows);
+  }
+  else {
+    el.build(lastRows);
+  }
+  el.setPager({page, pageSize, total});
+  listReady = true;
+}
+
+// Re-order + re-page from memory after a pref change. A no-op while the
+// view does not hold current rows (loading, error, nothing loaded) so a
+// toolbar/dialog toggle can never repaint stale rows or clobber an error.
+function rerender() {
+  if (!listReady) {
+    return;
+  }
+  render();
+}
+
+// Threads grouped locally per folder read (threads.mjs). refresh: re-reads
+// the folder from the disk truth (no caching anywhere).
 async function load(id, name, {refresh = false} = {}) {
   const token = ++loadToken;
   if (id !== accountId || name !== dirName) {
@@ -362,8 +453,10 @@ async function load(id, name, {refresh = false} = {}) {
   }
   accountId = id;
   dirName = name;
-  // a folder/account change invalidates the running search
+  // a folder/account change invalidates the running search; the view no
+  // longer holds current rows until this read renders
   search = null;
+  listReady = false;
   el.loading();
   if (!accountId || !name) {
     el.error('No directory selected');
@@ -387,19 +480,29 @@ async function load(id, name, {refresh = false} = {}) {
     if (token !== loadToken) {
       return;
     }
-    const threads = await api.listThreads({refresh});
+    let threads;
+    try {
+      // the first read of a big folder parses every header slice — the view
+      // shows a progress dialog once the parse count is worth waiting for.
+      // A superseded read (a newer load raced it) neither paints progress
+      // nor closes the winner's dialog.
+      threads = await api.listThreads({refresh, onProgress: p => {
+        if (token === loadToken) {
+          el.progress(p);
+        }
+      }});
+    }
+    finally {
+      if (token === loadToken) {
+        el.progressDone();
+      }
+    }
     if (token !== loadToken) {
       return;
     }
-    totalPages = Math.max(1, Math.ceil(threads.length / pageSize));
-    if (page >= totalPages) {
-      page = totalPages - 1;
-    }
-    const rows = threads.slice(page * pageSize, (page + 1) * pageSize);
+    lastThreads = threads;
     counters.reconcile(accountId, name, folderTotals(threads));
-    lastRows = rows;
-    el.build(rows);
-    el.setPager({page, pageSize, total: threads.length});
+    render();
   }
   catch (e) {
     if (token !== loadToken) {
@@ -445,15 +548,12 @@ async function sync(id, name) {
       return;   // the winning read re-diffs the same disk truth and renders it
     }
     commit();   // only the read holding the newest token installs its rows
-    totalPages = Math.max(1, Math.ceil(threads.length / pageSize));
-    if (page >= totalPages) {
-      page = totalPages - 1;
-    }
-    const rows = visibleThreads(threads);
+    lastThreads = threads;
     counters.reconcile(accountId, name, folderTotals(threads));
-    lastRows = rows;
-    el.sync(rows);
-    el.setPager({page, pageSize, total: threads.length});
+    // anchor the page on the row that heads the view now (page>0 only —
+    // see render()); the in-place reconcile keeps selection and scroll
+    const anchor = lastRows.length ? {page, key: rowKey(lastRows[0])} : null;
+    render({sync: true, anchor});
   }
   catch (e) {
     if (token !== loadToken) {
@@ -464,27 +564,6 @@ async function sync(id, name) {
     console.warn('folder sync failed', e);
     el.status('Sync failed: ' + (e?.message || String(e)), true);
   }
-}
-
-// Threads the current page shows after an in-place reconcile:
-//   - page 0 is the live inbox: new mail lands where the sort ranks it and
-//     the page overflow slides off the bottom (pager total grows);
-//   - deeper pages stay anchored to the thread currently at the top of the
-//     view (its group, wherever the reshuffle ranked it) — no rows are
-//     re-derived underneath a reading user; a page emptied by deletions
-//     falls back to the plain slice.
-function visibleThreads(threads) {
-  if (page <= 0 || lastRows.length === 0) {
-    return threads.slice(page * pageSize, (page + 1) * pageSize);
-  }
-  const key = Number(lastRows[0].uids?.[0]);
-  if (Number.isInteger(key) && key > 0) {
-    const index = threads.findIndex(t => Number(t.uids[0]) === key);
-    if (index >= 0) {
-      return threads.slice(index, index + pageSize);
-    }
-  }
-  return threads.slice(page * pageSize, (page + 1) * pageSize);
 }
 
 // Light refresh of the currently open folder, without a folder change: the
@@ -512,14 +591,30 @@ async function runSearch(id, name, query, scope) {
       return;
     }
     const all = scope === 'all';
-    const results = await api.search({dir: name, query, allFolders: all});
+    listReady = false;
+    let results;
+    try {
+      // an all-folders search hydrates every folder (first run indexes the
+      // whole account) — same progress dialog as the folder load
+      results = await api.search({dir: name, query, allFolders: all,
+        onProgress: p => {
+          if (token === loadToken) {
+            el.progress(p);
+          }
+        }});
+    }
+    finally {
+      if (token === loadToken) {
+        el.progressDone();
+      }
+    }
     if (token !== loadToken) {
       return;
     }
     search = {query, scope};
     await applyViewPrefs();
-    el.build(results);
-    el.setPager(null);
+    lastThreads = results;
+    render();
     el.status(
       results.length
         ? `Search "${query}" — ${results.length} ${all ? 'threads in all folders' : 'conversations in ' + name}`
@@ -534,12 +629,14 @@ async function runSearch(id, name, query, scope) {
   }
 }
 
+// Page changes slice out of the already-ordered folder (render()) — no disk
+// re-read, no token bump; the load path owns the folder truth.
 function gotoPage(next) {
   if (!accountId || !dirName || next < 0 || next >= totalPages || next === page) {
     return;
   }
   page = next;
-  load(accountId, dirName);
+  render();
 }
 
 function changePage(delta) {
@@ -633,16 +730,22 @@ function init(element) {
   el.addEventListener('page-next', () => changePage(1));
   el.addEventListener('page-last', () => gotoPage(totalPages - 1));
   el.addEventListener('sort-changed', e => {
-    setPref('mailSort', e.detail?.mode ?? '');
+    if (syncingPrefs) {
+      return;
+    }
+    const mode = SORT_MODES.includes(e.detail?.mode) ? e.detail.mode : '';
+    setPref('mailSort', mode);
+    view.sortMode = mode;
+    rerender();   // folder-wide reorder; the page number stays, contents move
   });
   el.addEventListener('unread-changed', e => {
-    setPref('mailUnreadOnly', !!e.detail?.on);
-  });
-  el.addEventListener('thread-changed', e => {
-    setPref('mailThreadMode', e.detail?.on !== false);
-    if (accountId && dirName) {
-      load(accountId, dirName);
+    if (syncingPrefs) {
+      return;
     }
+    const on = !!e.detail?.on;
+    setPref('mailUnreadOnly', on);
+    view.unreadOnly = on;
+    rerender();   // folder-wide filter; the page number stays, contents move
   });
   el.addEventListener('refresh', async () => {
     // toolbar refresh = re-render the mails view from the disk truth only
@@ -685,4 +788,20 @@ function init(element) {
   });
 }
 
-export {init, load, sync, syncCurrent, runSearch, clearSearch, isSearching};
+// Settings-dialog toggle (index.mjs's client prefs): conversations vs
+// single messages. The unit of pagination changes with it, so the page
+// re-slices from memory — no folder re-read. Without loaded rows the pref
+// is only persisted (the next load() picks it up); a load/search in flight
+// is left alone (rerender()'s listReady guard).
+async function setThreadMode(on) {
+  view.threadMode = on !== false;
+  await setPref('mailThreadMode', view.threadMode);
+  if (listReady) {
+    rerender();
+  }
+  else if (accountId && dirName && !search) {
+    await load(accountId, dirName);
+  }
+}
+
+export {init, load, sync, syncCurrent, runSearch, clearSearch, isSearching, setThreadMode};

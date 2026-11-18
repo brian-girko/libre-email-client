@@ -6,7 +6,8 @@ import {initFontScale} from './font-scale.mjs';
 import {init as initDirs, load as loadDirs, refresh as refreshDirs,
   refreshCounts, currentAccount as treeAccount} from './dirs.mjs';
 import {loadAccounts} from '../sync/client/accounts.mjs';
-import {init as initList, load as loadList, runSearch, clearSearch, isSearching} from './list.mjs';
+import {init as initList, load as loadList, runSearch, clearSearch, isSearching,
+  setThreadMode} from './list.mjs';
 import {init as initPreview, refresh as refreshPreview} from './preview.mjs';
 import {init as initAccounts, refreshAccounts} from './accounts.mjs';
 import {init as initResize} from './resize.mjs';
@@ -136,9 +137,9 @@ explorerOpen.addEventListener('click', () => {
 //
 // The same style of preferences dialog the sync client carries: one gear
 // button on the status bar (the footer) opens a Cancel/Save dialog whose
-// checkboxes drive the list view's view toggles (unreadOnly / threadMode —
-// their change events persist and reload the folder through list.mjs) and
-// the folder tree's auto-expansion (ui.dirsExpandSub).
+// checkboxes drive the list view's view toggles (unreadOnly — its change
+// event persists and re-renders through list.mjs; threadMode via
+// setThreadMode) and the folder tree's auto-expansion (ui.dirsExpandSub).
 
 const emailsView = document.getElementById('emails');
 const prefsDialog = document.getElementById('client-prefs');
@@ -162,10 +163,10 @@ async function openClientPrefs() {
 function saveClientPrefs() {
   const unread = prefsInputs.get('unread').checked;
   const single = prefsInputs.get('single').checked;
-  // one write per pref; the list view's own change events persist the
-  // mail list toggles too (and re-render / reload the folder on change only)
+  // one write per pref; the unread toggle re-renders through the list view's
+  // own change event, the message/thread mode through setThreadMode
   emailsView.unreadOnly = unread;
-  emailsView.threadMode = !single;
+  setThreadMode(!single);
   const expand = prefsInputs.get('expand').checked;
   setPref('dirsExpandSub', expand).catch(e =>
     console.error('[client] settings save failed:', e));
