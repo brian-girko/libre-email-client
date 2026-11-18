@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 
-const {buildCriteria} = await import('../extension/core/rust-imap-client/api.mjs');
+const {buildCriteria} = await import('../extension/v2/core/rust-imap-client/api.mjs');
 
 // --- criteria builder -------------------------------------------------------
 assert.equal(buildCriteria(''), '', 'empty input -> empty criteria');

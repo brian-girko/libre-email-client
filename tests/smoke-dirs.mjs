@@ -13,7 +13,7 @@ const view = await readFile(new URL('../extension/data/client/components/directo
 const host = await readFile(new URL('../extension/data/client/dirs.mjs', import.meta.url), 'utf8');
 const wrapper = await readFile(new URL('../extension/data/client/mail.mjs', import.meta.url), 'utf8');
 const facade = await readFile(new URL('../rust-client/js/api.mjs', import.meta.url), 'utf8');
-const deployed = await readFile(new URL('../extension/core/rust-imap-client/api.mjs', import.meta.url), 'utf8');
+const deployed = await readFile(new URL('../extension/v2/core/rust-imap-client/api.mjs', import.meta.url), 'utf8');
 const server = await readFile(new URL('../server/imap-test-server.mjs', import.meta.url), 'utf8');
 
 // static wiring: directory-view component

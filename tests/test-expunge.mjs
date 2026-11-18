@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {readFile} from 'node:fs/promises';
 import {startImapTestServer} from '../server/imap-test-server.mjs';
-import {createMailApi} from '../extension/core/rust-imap-client/api.mjs';
+import {createMailApi} from '../extension/v2/core/rust-imap-client/api.mjs';
 
 const require = createRequire(import.meta.url);
 const {startWsBridge} = require('../server/ws-to-tls.js');
@@ -37,7 +37,7 @@ const api = await createMailApi({
   accountId: 'test-account',
   cachePolicy: 'epoch',
   wasmBytes: new Uint8Array(
-    await readFile(new URL('../extension/core/rust-imap-client/mail_core_bg.wasm', import.meta.url))
+    await readFile(new URL('../extension/v2/core/rust-imap-client/mail_core_bg.wasm', import.meta.url))
   ),
 });
 
@@ -85,7 +85,7 @@ try {
     accountId: 'test-account',
     cachePolicy: 'epoch',
     wasmBytes: new Uint8Array(
-      await readFile(new URL('../extension/core/rust-imap-client/mail_core_bg.wasm', import.meta.url))
+      await readFile(new URL('../extension/v2/core/rust-imap-client/mail_core_bg.wasm', import.meta.url))
     ),
   });
   try {

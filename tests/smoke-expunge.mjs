@@ -11,9 +11,9 @@ import {readFile} from 'node:fs/promises';
 
 const lib = await readFile(new URL('../rust-client/src/lib.rs', import.meta.url), 'utf8');
 const glueDts = await readFile(new URL('../rust-client/pkg/mail_core_bg.wasm.d.ts', import.meta.url), 'utf8');
-const glue = await readFile(new URL('../extension/core/rust-imap-client/mail_core.mjs', import.meta.url), 'utf8');
+const glue = await readFile(new URL('../extension/v2/core/rust-imap-client/mail_core.mjs', import.meta.url), 'utf8');
 const apiSource = await readFile(new URL('../rust-client/js/api.mjs', import.meta.url), 'utf8');
-const apiDeployed = await readFile(new URL('../extension/core/rust-imap-client/api.mjs', import.meta.url), 'utf8');
+const apiDeployed = await readFile(new URL('../extension/v2/core/rust-imap-client/api.mjs', import.meta.url), 'utf8');
 const server = await readFile(new URL('../server/imap-test-server.mjs', import.meta.url), 'utf8');
 
 // rust core: UID EXPUNGE with UIDPLUS guard and safe fallback

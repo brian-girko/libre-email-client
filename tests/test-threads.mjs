@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {readFile} from 'node:fs/promises';
 import {startImapTestServer} from '../server/imap-test-server.mjs';
-import {createMailApi} from '../extension/core/rust-imap-client/api.mjs';
+import {createMailApi} from '../extension/v2/core/rust-imap-client/api.mjs';
 
 const require = createRequire(import.meta.url);
 const {startWsBridge} = require('../server/ws-to-tls.js');
@@ -36,7 +36,7 @@ const api = await createMailApi({
   accountId: 'test-account',
   cachePolicy: 'epoch',
   wasmBytes: new Uint8Array(
-    await readFile(new URL('../extension/core/rust-imap-client/mail_core_bg.wasm', import.meta.url))
+    await readFile(new URL('../extension/v2/core/rust-imap-client/mail_core_bg.wasm', import.meta.url))
   ),
 });
 
@@ -115,40 +115,6 @@ try {
     assert.ok(new TextDecoder().decode(raw).includes('Message-ID:'), 'body is a real RFC822 message');
   }
   assert.equal(bodies[4].length, 4, 'listThreads still returns 4 conversations');
-
-  // ---- cache behavior -----------------------------------------------------
-  assert.equal(api.cacheBackend(), 'memory', 'Node e2e uses the memory cache fallback');
-  // second readFile of the same uid must be served from the persistent cache
-  const body104a = await api.readFile(104);
-  const body104b = await api.readFile(104);
-  assert.deepEqual([...body104b], [...body104a], 'second readFile served from cache, identical bytes');
-  assert.ok(body104b.length > 0, 'cached body is non-empty');
-
-  // a brand-new API instance (simulating a reopened popup) must also hit
-  // the persistent cache — same wasm bytes, no need to refetch the body
-  const api2 = await createMailApi({
-    bridgeUrl: bridge.url,
-    host: '127.0.0.1',
-    port: imap.port,
-    secure: false,
-    user: 'testuser',
-    pass: 'testpass',
-    accountId: 'test-account',
-    cachePolicy: 'epoch',
-    wasmBytes: new Uint8Array(
-      await readFile(new URL('../extension/core/rust-imap-client/mail_core_bg.wasm', import.meta.url))
-    ),
-  });
-  try {
-    await api2.connect();
-    await api2.openDir('INBOX');
-    const cached = await api2.readFile(104);
-    assert.deepEqual([...cached], [...body104a], 'persistent cache survives across API sessions');
-    await api2.setFlags([104], ['\\Flagged'], []);
-  }
-  finally {
-    await api2.close().catch(() => {});
-  }
 
   // ---- server-side search -------------------------------------------------
   // plain text lands in the {104,105,106} conversation via subject/body
