@@ -744,7 +744,12 @@ async function deltaRows(local, folder, store) {
 
 // remove the Maildir triple + .uidvalidity of one folder (leaf deletions only)
 async function removeFolderDir(store, folder) {
-  const direction = dirNameFor(folder);
+  // the store's own delimiter: a nested name must spell the flat Maildir
+  // dir exactly as the store does ("Parent/Sub" on a '.'-hierarchy account
+  // is the flat "Parent.Sub") — the '/' default maps a '.'- or
+  // '\'-hierarchy name onto a path that does not exist, the remove
+  // silently misses and the folder is back at the next tree read
+  const direction = dirNameFor(folder, store.delimiter);
   try {
     await store.fs.writer.remove(joinPath(store.account, direction), {recursive: true});
   }

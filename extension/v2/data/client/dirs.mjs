@@ -180,6 +180,18 @@ function currentAccount() {
   return accountId;
 }
 
+// The account's hierarchy delimiter as the tree currently serves it — the
+// fs-event router's reverse-mapping input (folderFor(segs[1], this) turns
+// the flat Maildir dir segment back into the server folder name, which is
+// what decides whether an event touches the OPEN dir's mails view).
+// listDirs() stamps store.delimiter on every entry, so the first entry
+// that carries one is the account's stamp; '/' until the tree loads (flat
+// servers and never-synced accounts spell no hierarchy at all).
+function currentDelimiter() {
+  const dirs = Array.isArray(el?.dirs) ? el.dirs : [];
+  return dirs.find(d => d?.delimiter)?.delimiter || '/';
+}
+
 /**
  * Adopt the folder the load() flow would have opened: the saved pref, else
  * INBOX, else the first folder — selected on the tree, persisted, and
@@ -622,5 +634,5 @@ async function deleteDir(e) {
   });
 }
 
-export {init, load, currentDirs, currentAccount, refreshTree as refresh,
-  refreshCounts};
+export {init, load, currentDirs, currentAccount, currentDelimiter,
+  refreshTree as refresh, refreshCounts};

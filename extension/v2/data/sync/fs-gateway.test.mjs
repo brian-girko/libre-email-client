@@ -460,6 +460,39 @@ assert.deepEqual(intoOpen.calls,
   ['mails-view(delta INBOX)', 'dir-view(counts Work, INBOX)']);
 ok('move INTO the open dir deltas without a mail view (src dir counted first)');
 
+// sub-folder spelling: the flat Maildir dir segment maps back to the server
+// name with the account's OWN delimiter — a '.'-hierarchy account's
+// "Parent.Sub" used to classify as the '/'-spelled "Parent/Sub", missing
+// the open dir and leaving its rows stale until a page refresh
+const dotMove = c(ev('move', `acc/Parent.Sub/cur/${name(9)}`, `acc/INBOX/cur/${name(9)}`),
+  {account: 'acc', dir: 'Parent.Sub', delimiter: '.'});
+assert.deepEqual(dotMove.calls,
+  ['mails-view(delta Parent.Sub)', 'dir-view(counts Parent.Sub, INBOX)', 'mail-view(uid 9)']);
+ok('dot-delimiter subfolder move OUT of the open dir deltas + mail view');
+
+const dotInto = c(ev('move', `acc/INBOX/cur/${name(9)}`, `acc/Parent.Sub/cur/${name(9)}`),
+  {account: 'acc', dir: 'Parent.Sub', delimiter: '.'});
+assert.deepEqual(dotInto.calls,
+  ['mails-view(delta Parent.Sub)', 'dir-view(counts INBOX, Parent.Sub)']);
+ok('move INTO an open dot-delimiter subfolder deltas too');
+
+const backMove = c(ev('move', `acc/Parent.Sub/cur/${name(9)}`, `acc/INBOX/cur/${name(9)}`),
+  {account: 'acc', dir: 'Parent\\Sub', delimiter: '\\'});
+assert.deepEqual(backMove.calls,
+  ['mails-view(delta Parent\\Sub)', 'dir-view(counts Parent\\Sub, INBOX)', 'mail-view(uid 9)']);
+ok('backslash-delimiter subfolder spelling roundtrips the same way');
+
+const slashFlat = c(ev('move', `acc/Parent%2eSub/cur/${name(9)}`, `acc/INBOX/cur/${name(9)}`),
+  {account: 'acc', dir: 'Parent.Sub', delimiter: '/'});
+assert.deepEqual(slashFlat.calls,
+  ['mails-view(delta Parent.Sub)', 'dir-view(counts Parent.Sub, INBOX)', 'mail-view(uid 9)']);
+ok('a literal dot in a /-hierarchy name (%2e-escaped on disk) still matches');
+
+const wrongStamp = c(ev('move', `acc/Parent.Sub/cur/${name(9)}`, `acc/INBOX/cur/${name(9)}`),
+  {account: 'acc', dir: 'Parent.Sub', delimiter: '/'});
+assert.ok(!wrongStamp.calls.some(s => s.startsWith('mails-view')));
+ok('a mismatched delimiter misses the open dir — the mapping is delimiter-driven');
+
 const noDir = c(ev('create', `acc/INBOX/cur/${name(7)}`), {account: 'acc', dir: null});
 assert.deepEqual(noDir.calls, ['dir-view(counts INBOX)']);
 assert.equal(c(ev('create', 'acc/INBOX'), {account: null, dir: null}).match, 'unselected');

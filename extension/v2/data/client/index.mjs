@@ -4,7 +4,7 @@ import './components/logger-view.js';
 import {initTheme} from './theme.mjs';
 import {initFontScale} from './font-scale.mjs';
 import {init as initDirs, load as loadDirs, refresh as refreshDirs,
-  refreshCounts, currentAccount as treeAccount} from './dirs.mjs';
+  refreshCounts, currentAccount as treeAccount, currentDelimiter as treeDelimiter} from './dirs.mjs';
 import {loadAccounts} from '../sync/client/accounts.mjs';
 import {init as initList, load as loadList, runSearch, clearSearch, isSearching,
   setThreadMode} from './list.mjs';
@@ -261,10 +261,15 @@ function currentDirName() {
 //                         picker re-enumerates even when nothing is open)
 // account: the tree's own account (dirs.currentAccount) — set as soon as
 // loadDirs() runs, so a first sync's events are 'mine' before any folder
-// exists; dir: the dir-selected mirror (an open folder genuinely needed).
+// exists; dir: the dir-selected mirror (an open folder genuinely needed);
+// delimiter: the tree's hierarchy stamp (dirs.currentDelimiter) — the flat
+// Maildir dir segment maps back to the server folder name with it, so the
+// classifier's open-dir check agrees with the tree's spelling on sub
+// folders ('/' until the first listDirs lands).
 initFsEvents({
   account: treeAccount,
   dir: currentDirName,
+  delimiter: treeDelimiter,
   calls: {
     dirView: refreshDirs,
     dirCounts: refreshCounts,

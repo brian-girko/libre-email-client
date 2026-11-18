@@ -55,9 +55,13 @@ const MAX_WAIT_MS = 1000; // forced fire mid-burst (progressive sync updates)
  * dir. Pure — no chrome, no DOM — so tests can drive it directly.
  * @param {{type?: string, origin?: string, operation?: string, src?: string,
  *   dest?: string|null}} msg the runtime message
- * @param {{account?: string|null, dir?: string|null}} ctx the currently
- *   selected account id (== the maildir slug) and open dir (server folder
- *   name spelling, as the tree serves it), both nullable
+ * @param {{account?: string|null, dir?: string|null, delimiter?: string}}
+ *   ctx the currently selected account id (== the maildir slug), the open
+ *   dir (server folder name spelling, as the tree serves it) and the
+ *   account's IMAP hierarchy delimiter — the flat Maildir dir segment maps
+ *   back to the server name WITH it (folderFor(segs[1], delimiter)), so
+ *   the open-dir check agrees with the tree's spelling; account/dir
+ *   nullable, delimiter defaults to '/'
  * @returns {{match: 'mine'|'other'|'unselected', slug: string|null,
  *   dirs: string[], calls: string[], actions: object[], note: string|null}}
  *   dirs = affected server folder names; actions = machine-readable view
@@ -67,7 +71,7 @@ const MAX_WAIT_MS = 1000; // forced fire mid-burst (progressive sync updates)
  *   preview.refresh, accounts-view → accounts.refreshAccounts);
  *   note = why nothing would be called (null otherwise)
  */
-export function classifyEvent(msg, {account = null, dir = null} = {}) {
+export function classifyEvent(msg, {account = null, dir = null, delimiter = '/'} = {}) {
   const verdict = {
     match: 'mine', slug: null, dirs: [], calls: [], actions: [], note: null
   };
@@ -150,7 +154,11 @@ export function classifyEvent(msg, {account = null, dir = null} = {}) {
       unclassified.hit = true;   // a stray file outside the triple
       continue;
     }
-    const dirName = folderFor(segs[1], '/');
+    // the flat Maildir dir segment back to the server folder name — with
+    // the account's OWN delimiter (the hardcoded '/' spelled a
+    // '.'-hierarchy account's "Parent.Sub" as "Parent/Sub", which never
+    // matched the open dir and left its rows stale until a refresh)
+    const dirName = folderFor(segs[1], delimiter);
     if (!verdict.dirs.includes(dirName)) {
       verdict.dirs.push(dirName);
     }
@@ -215,7 +223,7 @@ function toSegs(path) {
 
 let calls = null;   // {dirView, dirCounts, mailsDelta, mailView,
                     //  accountsView} — injected
-let ctx = () => ({});   // {account, dir} getters, evaluated per event
+let ctx = () => ({});   // {account, dir, delimiter} getters, evaluated per event
 
 const timers = {};
 let pendingUids = new Set();
@@ -306,20 +314,23 @@ function route(msg) {
 }
 
 /**
- * Installs the router. account/dir are GETTER functions evaluated per
- * event — account from the folder tree (dirs.mjs, valid before any folder
- * is selected), dir mirrored from the dir-selected event; the calls object
- * carries the view callables — any entry may be absent, that view simply
- * never refreshes from events.
- * @param {{account?: Function, dir?: Function, calls?: {
+ * Installs the router. account/dir/delimiter are GETTER functions evaluated
+ * per event — account from the folder tree (dirs.mjs, valid before any
+ * folder is selected), dir mirrored from the dir-selected event, delimiter
+ * the tree's hierarchy stamp (dirs.mjs currentDelimiter(), '/' until the
+ * first listDirs lands); the calls object carries the view callables — any
+ * entry may be absent, that view simply never refreshes from events.
+ * @param {{account?: Function, dir?: Function, delimiter?: Function,
+ *   calls?: {
  *   dirView?: Function, dirCounts?: Function, mailsDelta?: Function,
  *   mailView?: Function, accountsView?: Function}}} wiring
  */
-export function init({account, dir, calls: injected} = {}) {
+export function init({account, dir, delimiter, calls: injected} = {}) {
   calls = injected ?? null;
   ctx = () => ({
     account: typeof account === 'function' ? account() : (account ?? null),
-    dir: typeof dir === 'function' ? dir() : (dir ?? null)
+    dir: typeof dir === 'function' ? dir() : (dir ?? null),
+    delimiter: (typeof delimiter === 'function' ? delimiter() : delimiter) || '/'
   });
   // same-context events (the client's own edits) + the runtime bus
   // (engine, sync panel, other client windows) — one router for both
