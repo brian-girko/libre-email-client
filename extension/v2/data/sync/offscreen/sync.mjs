@@ -441,6 +441,28 @@ export function createSync(mail, store, {account = null, log = console.log, onPr
     return msgid ? (tombByMsgid.get(msgid) ?? null) : null;
   }
 
+  // ---- pending pulls: this engine's own uncommitted downloads ------------
+  // The journal (.pending-pulls.json) is written BEFORE each pull chunk's
+  // files land, so a run that dies mid-chunk leaves files whose uids the
+  // next run's classifier can recognize as its own leftovers — never as
+  // locally-born mail to re-upload. Loaded once per plan (the apply side
+  // only appends); the commit prunes entries it resolved.
+  const pullOrphans = new Map();   // `${folder}/${uid}` → entry
+  async function loadPendingPulls() {
+    pullOrphans.clear();
+    let entries = [];
+    try {
+      entries = await store.loadPendingPulls();
+    }
+    catch {}
+    for (const e of entries) {
+      if (e && typeof e.folder === 'string' && e.folder &&
+          Number.isInteger(Number(e.uid)) && Number(e.uid) > 0) {
+        pullOrphans.set(`${e.folder}/${Number(e.uid)}`, e);
+      }
+    }
+  }
+
   async function select(name, {force = false} = {}) {
     if (selected !== name || force) {
       selected = name;
@@ -869,6 +891,11 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
       emitLog('plan',
         `tombstones: ${tombByUid.size} locally deleted message(s) remembered`);
     }
+    await loadPendingPulls();
+    if (pullOrphans.size) {
+      emitLog('plan',
+        `uncommitted pulls: ${pullOrphans.size} message(s) from a failed run — their files are never re-uploaded`);
+    }
     const {snap, folders, allFolders = []} = survey;
     // Star-color keywords diff like any standard flag. Once a server proves
     // it rejects keyword STOREs (flagsServer exec records starKeywords:false
@@ -888,6 +915,27 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
     // every pending move is planned as the capability-free append+delete
     // fallback instead of a doomed MOVE retry — see pushServerMove below.
     const noMoveServer = prefs.moveSupported === false;
+
+    /**
+     * The journal hit that vouches "this engine wrote the file in a run
+     * that never committed": folder + uid + the folder's CURRENT
+     * uidvalidity must all agree — a uidvalidity change retires every old
+     * entry (uids are not comparable across the epoch line).
+     * `uidvalidity` overrides the lookup when the check runs against a
+     * folder the survey knows under another key (the interloper sweep
+     * checks the SOURCE folder's epoch).
+     */
+    function pulledOrphan(folder, entry, uidvalidity) {
+      const hit = pullOrphans.get(`${folder}/${Number(entry?.uid)}`);
+      if (!hit) {
+        return null;
+      }
+      const vv = uidvalidity ?? folders.get(folder)?.uidvalidity ?? null;
+      if (vv == null || hit.uidvalidity == null || Number(hit.uidvalidity) !== Number(vv)) {
+        return null;
+      }
+      return hit;
+    }
 
     const ops = [];
     const conflicts = [];
@@ -1572,6 +1620,18 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
 
     function classifyLocalBorn(name, entry, messages, serverIds, whyQuiet) {
       return (async () => {
+        // this engine's own uncommitted download: the run that pulled the
+        // file never committed, and another client deleted the mail on the
+        // server inside the window — the uid is gone from both sides, so
+        // the local-born rule below would mistake the orphan for fresh
+        // local mail and re-upload the deleted message. The journal wins:
+        // the server's deletion stands, the orphan copy drops.
+        if (pulledOrphan(name, entry)) {
+          entry.claimed = true;
+          ops.push({kind: 'purgeLocal', folder: name, uid: entry.uid ?? 0, entry});
+          warnings.push(`${name}: "${entry.fileName}" is an uncommitted engine pull whose message the server deleted elsewhere — local copy dropped, never uploaded`);
+          return;
+        }
         let raw = null;
         try {
           raw = await store.readFile(entry);
@@ -1653,6 +1713,19 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
      * @returns {Promise<boolean>} true when an op was planned
      */
     async function appendOrphanInterloper(folder, src, entry) {
+      // this engine's own uncommitted download (a filter-routed landing or
+      // an arrival whose run died before the commit): the source uid is
+      // gone everywhere because ANOTHER client deleted the mail in the
+      // window — never upload the orphan; the server's deletion wins and
+      // the stale copy drops
+      if (pulledOrphan(src, entry, folders.get(src)?.uidvalidity)) {
+        entry.claimed = true;
+        claimedInterlopers.add(entry);
+        ops.push({kind: 'purgeLocal', folder, uid: entry.uid, entry});
+        await sweepDuplicates(folder, entry);
+        warnings.push(`${folder}: foreign file from "${src}" is an uncommitted engine pull the server deleted elsewhere — stale copy dropped: ${entry.fileName}`);
+        return true;
+      }
       let raw = null;
       try {
         raw = await store.readFile(entry);
@@ -2106,6 +2179,23 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
             }
           }
         }
+        // journal the chunk BEFORE its files land: a run that dies
+        // mid-chunk leaves files whose uids the snapshot does not know —
+        // the journal is what keeps the next run from classifying them as
+        // locally-born uploads (another client may have deleted the mail
+        // on the server inside the window). Entries for uids whose fetch
+        // failed are harmless: no file, nothing to protect.
+        try {
+          await store.addPendingPulls(chunk.map(sop => ({
+            folder,
+            uid: Number(sop.uid),
+            uidvalidity: survey.folders.get(folder)?.uidvalidity ?? null,
+            at: new Date().toISOString()
+          })));
+        }
+        catch (e) {
+          emitLog('apply', `pending-pull journal write FAILED (${e?.message || e}) — pulls continue, the orphan guard degrades`, 'warn');
+        }
         const pulled = [];
         for (const sop of chunk) {
           const raw = sop.raw ?? landed.get(Number(sop.uid)) ?? null;
@@ -2556,6 +2646,10 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
     // post-apply server rows per folder — what the tombstone prune checks
     // against at commit time ("is the deleted message still on the server?")
     const postServers = new Map();
+    // folders whose snapshot entry THIS run (re)wrote — the only folders
+    // whose pending-pull journal entries can be spent at commit (a scoped
+    // run's restricted extras and every never-surveyed folder keep theirs)
+    const committedFolders = new Set();
     // In a scoped run the destination folder of a NATIVE move (done by
     // another client — e.g. INBOX → Trash) is never surveyed, so no mining
     // matches it and the only folder's phase-(A) diff cannot be relocated.
@@ -2620,6 +2714,17 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
             // destination while the bytes are in hand (the snapshot keeps
             // describing the SERVER row — INBOX/uid — either way)
             const dest = (await routeLanding(raw, F.name, uid)) ?? F.name;
+            // journal the arrival before its file lands — a run that dies
+            // right after leaves an orphan the journal must vouch
+            try {
+              await store.addPendingPulls([{
+                folder: F.name,
+                uid,
+                uidvalidity: F.uidvalidity ?? null,
+                at: new Date().toISOString()
+              }]);
+            }
+            catch {}
             await store.writeMessage(dest, uid, knownFlags(row.flags), raw,
               dest === F.name ? {} : {fmd5: md5hex(F.name)});
             if (F.name.toUpperCase() === 'INBOX') {
@@ -2715,6 +2820,7 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
         // re-deriving the carried uid as a live server row forever)
         entry.carried = carried;
       }
+      committedFolders.add(F.name);
       snapOut.folders[F.name] = entry;
       emitLog('post', `${F.name}: ${Object.keys(messages).length} message(s), uidvalidity=${uidvalidity}, uidnext=${uidnext}`);
     }
@@ -2745,6 +2851,26 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
     }
     await store.saveState(snapOut);
     emitLog('sync', `committed state: ${Object.values(snapOut.folders).reduce((n, f) => n + Object.keys(f.messages).length, 0)} message(s) total`);
+    // pending-pull journal prune, ONLY on a committed run: an entry is spent
+    // when its folder's snapshot entry was (re)written this run AND the
+    // committed snapshot now tracks its uid (the pull landed in K). A folder
+    // this run never rewrote (a scoped run's restricted extras, a
+    // never-surveyed dir) keeps every entry — its files are still
+    // uncommitted orphans — and so does a uid that left the server MID-run
+    // (a third-party expunge between this run's pull and its commit): its
+    // file is on disk with no snapshot record, and dropping the entry would
+    // let the next run upload the deleted mail back.
+    let journalCleared = 0;
+    try {
+      journalCleared = await store.clearPendingPulls(entry => committedFolders.has(entry.folder) &&
+        Object.prototype.hasOwnProperty.call(snapOut.folders[entry.folder]?.messages ?? {}, String(entry.uid)));
+    }
+    catch (e) {
+      emitLog('sync', `pending-pull journal prune FAILED: ${e?.message || e}`, 'warn');
+    }
+    if (journalCleared) {
+      emitLog('sync', `pending-pull journal: ${journalCleared} committed pull(s) cleared`);
+    }
     // tombstone prune, ONLY on a committed run: an entry is spent when its
     // message is no longer on the server (pushed as a confirmed server
     // delete, or gone on its own) or when the snapshot has handed its uid to

@@ -21,6 +21,13 @@ data/sync/
                    handles; every mutation emits an fs-event tagged with the
                    caller's prepare() origin)
   snapshot.mjs   ← .sync-state.json (uid → {msgid, flags, size} last-good view)
+  tombstones.mjs ← .tombstones.json: locally deleted mail the sync must
+                   never re-add (written at deletion time, pruned at commit)
+  pending-pulls.mjs ← .pending-pulls.json: this engine's own uncommitted
+                   downloads — the memory that keeps an interrupted run's
+                   files from being re-uploaded when another client deletes
+                   the mail on the server in the window (see the
+                   partially-applied-runs section below)
   offscreen/     ← the sync engine, running inside the SHARED offscreen
                     host document (/offscreen/index.html, manager.mjs);
                     the module here is loaded on its first routed message
@@ -598,6 +605,30 @@ folder resync: local files are wiped, everything re-pulled. The **Discard
 local copy** button does the same on demand (plus a `lastSyncAt = null`
 stamp in storage.local) — use it once if a pull was cut off by the older
 message-grammar bug or the folder layout changes.
+
+**Pending-pull journal (`.pending-pulls.json`):** an interrupted run's
+pulled files are on disk while the snapshot stays untouched, so their
+uids are known to neither K nor (after ANOTHER client deleted the mail on
+the server in the window) the survey — exactly the shape the local-born
+rule mistakes for mail that originated here, re-uploading the deleted
+message (the reported "the offline client pushed deleted emails back to
+the server" bug). The journal closes that window: BEFORE each pull chunk's
+files land (and before every post-apply arrival write) the engine records
+`{folder, uid, uidvalidity}` — the folder keyed is the one whose UID space
+the uid belongs to, a filter-routed landing included — so a crashed run can
+never leave an unremembered file behind. The classifier consults it before
+any local-born APPEND: a journaled file whose uid left both the server and
+the snapshot is an uncommitted engine pull the server deleted elsewhere —
+the orphan copy drops with a warning (`uncommitted engine pull`), never
+re-uploaded; the same veto covers the interloper sweep's orphan marker
+(a routed pull that never committed). Matching requires the folder's
+CURRENT uidvalidity to agree, so a folder rebuild retires every old entry
+— uids are not comparable across the epoch line. At commit time the
+journal prunes ONLY entries it resolved: the folder's snapshot entry must
+have been (re)written this run AND the committed snapshot must now track
+the uid; a scoped run's unsurveyed dirs keep their entries, and so does a
+uid a third party expunged mid-run (its file is on disk with no snapshot
+record — dropping the entry would let the next run resurrect the mail).
 
 **Mining & volume, visibly:** after the survey, the plan records the
 identity of every uid the snapshot does not know — for cross-folder move

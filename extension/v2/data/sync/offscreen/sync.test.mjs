@@ -193,12 +193,52 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed',
   };
 }
 
-function mockStore(snapshot, listings, delimiter = '/', failRenames = false, prefs = {}) {
+function mockStore(snapshot, listings, delimiter = '/', failRenames = false, prefs = {}, pendingPulls = []) {
   const saved = [];
+  // the pending-pull journal (.pending-pulls.json): in-memory, seeded per
+  // scenario; addPendingPulls merges (a re-pull replaces), clearPendingPulls
+  // keeps what the engine's predicate rejects — mirroring MaildirStore
+  const journal = structuredClone(pendingPulls);
   return {
     delimiter,
     saved,
     prefs,
+    // the live journal view + every addPendingPulls/clearPendingPulls call,
+    // for the lifecycle assertions (what was journaled when, what survived
+    // a failed commit)
+    journal,
+    journalAdds: [],
+    journalClears: [],
+    async loadPendingPulls() {
+      return structuredClone(journal);
+    },
+    async addPendingPulls(entries) {
+      for (const raw of entries ?? []) {
+        const folder = typeof raw?.folder === 'string' && raw.folder ? raw.folder : null;
+        const uid = Number(raw?.uid);
+        if (!folder || !Number.isInteger(uid) || uid <= 0) {
+          continue;
+        }
+        this.journalAdds.push({folder, uid, uidvalidity: raw.uidvalidity ?? null});
+        const entry = {folder, uid, uidvalidity: raw.uidvalidity ?? null, at: raw.at ?? null};
+        const i = journal.findIndex(e => e.folder === folder && Number(e.uid) === uid);
+        if (i >= 0) {
+          journal[i] = entry;
+        }
+        else {
+          journal.push(entry);
+        }
+      }
+      return (entries ?? []).length;
+    },
+    async clearPendingPulls(removeFn = null) {
+      const kept = removeFn ? journal.filter(e => !removeFn(e)) : [];
+      const removed = journal.length - kept.length;
+      this.journalClears.push(removed);
+      journal.length = 0;
+      journal.push(...kept);
+      return removed;
+    },
     // every writeMessage call the engine makes — {folder, uid, flags, bytes,
     // fmd5|null}: pull-time routing lands in the DESTINATION dir with the
     // SOURCE folder's md5, unrouted pulls land in their folder unmarked
@@ -452,6 +492,190 @@ function dirState(uidvalidity, uidnext, rows, highestModSeq = null) {
     'the marker is uploaded to the folder it sits in');
   assert.ok(!plan.warnings.some(w => w.includes('left unmatched')),
     'no "left unmatched" warning: ' + JSON.stringify(plan.warnings));
+}
+
+// ---- scenario P1: an uncommitted engine pull the server deleted ----------
+// The reported bug's shape: this engine pulled uid 5 in a run that never
+// committed (the client went offline mid-sync), another client deleted the
+// mail on the server in the window, so uid 5 is gone from BOTH the server
+// and the snapshot while the file sits in INBOX. The local-born rule alone
+// re-uploads the deleted mail (the control below locks that in); the
+// pending-pull journal vouches the file as this engine's own download and
+// the orphan copy drops instead — never pushed back to the server.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {7: {msgid: m7, flags: []}}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+  const journal = [{folder: 'INBOX', uid: 5, uidvalidity: 1000, at: '2026-11-21T00:00:00.000Z'}];
+
+  // control — the pre-fix behavior: no journal, the orphan reads as
+  // locally-born mail and the plan re-uploads it
+  const control = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog});
+  {
+    const {plan} = await control.plan();
+    const appendOp = plan.ops.find(o => o.kind === 'append');
+    assert.ok(appendOp, 'without the journal the orphan is re-uploaded: ' +
+      JSON.stringify(plan.ops.map(describeOp)));
+    assert.equal(appendOp.folder, 'INBOX');
+    assert.equal(appendOp.entry?.uid, 5);
+  }
+
+  // the fix: the journal vouches the file → one purgeLocal, never an append
+  const engine = createSync(mockMail(server),
+    mockStore(snapshot, listings, '/', false, {}, journal), {log: quietLog});
+  const {plan} = await engine.plan();
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'the orphaned engine pull is dropped, never uploaded: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].folder, 'INBOX');
+  assert.equal(plan.ops[0].uid, 5);
+  assert.ok(plan.warnings.some(w => w.includes('uncommitted engine pull')),
+    'the orphan warning is narrated: ' + JSON.stringify(plan.warnings));
+}
+
+// ---- scenario P2: committed K — the same deletion is a plain purgeLocal -----
+// The steady-state regression: when the snapshot still records the uid (the
+// offline client's last sync committed), a server-side delete by another
+// client must drop the local copy — one purgeLocal op, never an append, a
+// deleteServer or a pull.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}, 7: {msgid: m7, flags: []}
+      }}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+  const engine = createSync(mockMail(server), mockStore(snapshot, listings), {log: quietLog});
+  const {plan} = await engine.plan();
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'a server-side delete reaches the local mirror as one purge: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].folder, 'INBOX');
+  assert.equal(plan.ops[0].uid, 5);
+}
+
+// ---- scenario P3: the reported bug, end to end — pull, crash, delete -------
+// Run 1 pulls uid 5 but dies before the snapshot commit (the client went
+// offline): the file is on disk, the journal remembers it, the snapshot does
+// not. Another client deletes uid 5 on the server. Run 2 must purge the local
+// orphan — the pre-fix engine APPENDed the deleted mail back to the server.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {INBOX: {uidvalidity: 1000, uidnext: 9, messages: {}}}
+  };
+  const listings = new Map([
+    ['INBOX', listing([])]
+  ]);
+
+  // run 1: the pull lands, the commit dies — a crash right before the
+  // snapshot rewrite
+  const store = mockStore(snapshot, listings);
+  store.saveState = async () => {
+    throw new Error('mock-fs: state save failed');
+  };
+  const engine1 = createSync(mockMail(server), store, {log: quietLog});
+  await assert.rejects(engine1.run({dry: false}), /state save failed/);
+  assert.ok(store.written.some(w => w.folder === 'INBOX' && w.uid === 5),
+    'run 1 landed the pulled file on disk');
+  assert.ok(store.journalAdds.some(e => e.folder === 'INBOX' && e.uid === 5 && e.uidvalidity === 1000),
+    'run 1 journaled the pull before the file landed');
+  assert.equal(store.journal.length, 1,
+    'the failed run leaves its journal entry behind: ' + JSON.stringify(store.journal));
+
+  // run 2: uid 5 is gone from the server (another client deleted it), the
+  // file survived run 1 — the orphan must drop, never re-upload
+  const server2 = new Map([
+    ['INBOX', dirState(1000, 9, [])]
+  ]);
+  const listings2 = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+  const store2 = mockStore(snapshot, listings2, '/', false, {}, store.journal);
+  const engine2 = createSync(mockMail(server2), store2, {log: quietLog});
+  const {plan} = await engine2.plan();
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'the deleted mail is dropped locally, never pushed back: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].uid, 5);
+}
+
+// ---- scenario P4: an uncommitted ROUTED pull — the marker never uploads -----
+// Same window, filter-routed shape: run 1 wrote the pulled message straight
+// into its destination with the SOURCE folder's FMD5 and died before the
+// commit; another client deleted the source uid on the server. The marker is
+// an uncommitted engine pull, not a sole-copy pending move — the orphan drops
+// instead of the append scenario C plans for a genuinely local move.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const m9 = await idOf('m9');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[7, 'm7']])],
+    ['Silent.Broken Links', dirState(2000, 11, [[9, 'm9']])]
+  ]);
+  // uid 5 is NOT in the snapshot — the routed pull never committed
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {7: {msgid: m7, flags: []}}},
+      'Silent.Broken Links': {uidvalidity: 2000, uidnext: 11, messages: {9: {msgid: m9, flags: []}}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])],
+    ['Silent.Broken Links', listing([
+      fileEntry('f9', 9, md5hex('Silent.Broken Links'), rawOf('m9'))
+    ], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+  const journal = [{folder: 'INBOX', uid: 5, uidvalidity: 1000, at: '2026-11-21T00:00:00.000Z'}];
+
+  const engine = createSync(mockMail(server),
+    mockStore(snapshot, listings, '/', false, {}, journal), {log: quietLog});
+  const {plan} = await engine.plan();
+
+  assert.ok(!plan.ops.some(o => o.kind === 'append'),
+    'the uncommitted routed pull is never uploaded: ' + JSON.stringify(plan.ops.map(describeOp)));
+  const purge = plan.ops.find(o => o.kind === 'purgeLocal' && o.folder === 'Silent.Broken Links');
+  assert.ok(purge, 'the stale marker copy drops: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(purge.uid, 5);
+  assert.ok(plan.warnings.some(w => w.includes('uncommitted engine pull')),
+    'the orphan warning is narrated: ' + JSON.stringify(plan.warnings));
 }
 
 // ---- scenario E: size-adopted destination message with a null msgid --------

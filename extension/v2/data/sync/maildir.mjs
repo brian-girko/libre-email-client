@@ -41,6 +41,7 @@
 
 import {loadSnapshot, saveSnapshot} from './snapshot.mjs';
 import {loadTombstones as loadTombstoneList, saveTombstones as saveTombstoneList, tombKey, tombstoneEntry} from './tombstones.mjs';
+import {loadPendingPulls as loadPendingPullList, savePendingPulls as savePendingPullList, pullKey, pendingPullEntry} from './pending-pulls.mjs';
 
 const FLAG_LETTERS = new Map([
   ['\\Seen', 'S'],
@@ -790,6 +791,59 @@ export class MaildirStore {
     const removed = existing.length - kept.length;
     if (removed) {
       await saveTombstoneList(this.fs, this.account, kept);
+    }
+    return removed;
+  }
+
+  /**
+   * The account's pending-pull journal (<slug>/.pending-pulls.json):
+   * messages this engine pulled in runs that never committed. Written
+   * before each pull chunk's files land, consulted by the classifier
+   * before any local-born upload is planned, pruned by the engine at
+   * commit time. Missing/corrupt → [] — advisory memory, never worth
+   * failing a sync (see ./pending-pulls.mjs for why it exists).
+   * @returns {Promise<object[]>}
+   */
+  async loadPendingPulls() {
+    return loadPendingPullList(this.fs, this.account);
+  }
+
+  /**
+   * Merges entries into the pending-pull journal (keyed by folder/uid — a
+   * re-pull of the same uid replaces the earlier entry: the fresh pull's
+   * uidvalidity epoch and timestamp are the truth).
+   * @param {object[]} entries {folder, uid, uidvalidity?, at?}
+   * @returns {Promise<number>} entries merged
+   */
+  async addPendingPulls(entries) {
+    const existing = await loadPendingPullList(this.fs, this.account);
+    const byKey = new Map(existing.map(e => [pullKey(e.folder, e.uid), e]));
+    let merged = 0;
+    for (const raw of entries ?? []) {
+      const entry = pendingPullEntry(raw);
+      if (!entry) {
+        continue;
+      }
+      byKey.set(pullKey(entry.folder, entry.uid), entry);
+      merged++;
+    }
+    await savePendingPullList(this.fs, this.account, [...byKey.values()]);
+    return merged;
+  }
+
+  /**
+   * Removes journal entries. With no predicate the whole list is cleared;
+   * with one, an entry the predicate accepts is removed (the sync engine's
+   * commit-time prune keeps everything it could not resolve).
+   * @param {(entry: object) => boolean} [removeFn]
+   * @returns {Promise<number>} entries removed
+   */
+  async clearPendingPulls(removeFn = null) {
+    const existing = await loadPendingPullList(this.fs, this.account);
+    const kept = removeFn ? existing.filter(e => !removeFn(e)) : [];
+    const removed = existing.length - kept.length;
+    if (removed) {
+      await savePendingPullList(this.fs, this.account, kept);
     }
     return removed;
   }
