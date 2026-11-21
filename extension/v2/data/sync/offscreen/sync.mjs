@@ -463,6 +463,38 @@ export function createSync(mail, store, {account = null, log = console.log, onPr
     }
   }
 
+  /**
+   * Pending-pull journal records for uids whose files are ABOUT to land
+   * or adopt a fresh identity — the pull chunks, the post-apply arrivals,
+   * and the kept-copy renames (pairing, relocate) that stamp a file with
+   * a uid no snapshot record knows yet. A null uidvalidity is SKIPPED
+   * with a warning instead of journaled: the classifier's orphan match
+   * requires the folder's epoch, so an entry without it can never be
+   * recognized later — a record that cannot vouch is false comfort, and
+   * the warning keeps the degraded guard visible instead of silent.
+   */
+  async function journalPulls(folder, uids, uidvalidity) {
+    if (!uids?.length) {
+      return;
+    }
+    if (uidvalidity == null) {
+      emitLog('apply',
+        `pending-pull journal skipped for ${folder}: no uidvalidity — the orphan guard cannot vouch for ${uids.length} pull(s)`, 'warn');
+      return;
+    }
+    try {
+      await store.addPendingPulls(uids.map(uid => ({
+        folder,
+        uid: Number(uid),
+        uidvalidity,
+        at: new Date().toISOString()
+      })));
+    }
+    catch (e) {
+      emitLog('apply', `pending-pull journal write FAILED (${e?.message || e}) — pulls continue, the orphan guard degrades`, 'warn');
+    }
+  }
+
   async function select(name, {force = false} = {}) {
     if (selected !== name || force) {
       selected = name;
@@ -2185,17 +2217,8 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
         // locally-born uploads (another client may have deleted the mail
         // on the server inside the window). Entries for uids whose fetch
         // failed are harmless: no file, nothing to protect.
-        try {
-          await store.addPendingPulls(chunk.map(sop => ({
-            folder,
-            uid: Number(sop.uid),
-            uidvalidity: survey.folders.get(folder)?.uidvalidity ?? null,
-            at: new Date().toISOString()
-          })));
-        }
-        catch (e) {
-          emitLog('apply', `pending-pull journal write FAILED (${e?.message || e}) — pulls continue, the orphan guard degrades`, 'warn');
-        }
+        await journalPulls(folder, chunk.map(sop => Number(sop.uid)),
+          survey.folders.get(folder)?.uidvalidity ?? null);
         const pulled = [];
         for (const sop of chunk) {
           const raw = sop.raw ?? landed.get(Number(sop.uid)) ?? null;
@@ -2331,6 +2354,14 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
             break;
           }
           case 'relocate': {
+            // the file adopts the DESTINATION uid another client's server
+            // move assigned — no snapshot record knows it until the
+            // commit, so journal it before the rename: a run that dies in
+            // between leaves the file under an unremembered uid, and a
+            // third-party delete of the destination uid in that window
+            // must never re-upload the kept copy as locally-born mail
+            await journalPulls(op.toFolder, [Number(op.toUid)],
+              survey.folders.get(op.toFolder)?.uidvalidity ?? null);
             await store.moveMessage(op.folder, op.entry, op.toFolder, op.toUid);
             if (op.msgid) {
               recMsgid.set(`${op.toFolder}/${op.toUid}`, op.msgid);
@@ -2540,6 +2571,14 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
           // identity from the local copy FIRST — a read failure must not
           // leave a renamed file without a snapshot msgid
           id = await msgidOf(await store.readFile(m.entry));
+          // the fresh uid is unremembered the moment the file adopts it
+          // (the journal entry that vouches the pull is keyed by the OLD
+          // source uid) — journal the DESTINATION uid before the rename: a
+          // run that dies between the rename and the commit leaves an
+          // orphan the next run must recognize as this engine's own copy
+          // (a third party deleting the destination uid in that window
+          // must never turn the kept copy into a locally-born re-upload)
+          await journalPulls(F.name, [Number(hit.uid)], F.uidvalidity ?? null);
           await store.moveMessage(F.name, m.entry, F.name, hit.uid,
             {flags: knownFlags(post.get(hit.uid)?.flags ?? [])});
         }
@@ -2716,15 +2755,7 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
             const dest = (await routeLanding(raw, F.name, uid)) ?? F.name;
             // journal the arrival before its file lands — a run that dies
             // right after leaves an orphan the journal must vouch
-            try {
-              await store.addPendingPulls([{
-                folder: F.name,
-                uid,
-                uidvalidity: F.uidvalidity ?? null,
-                at: new Date().toISOString()
-              }]);
-            }
-            catch {}
+            await journalPulls(F.name, [Number(uid)], F.uidvalidity ?? null);
             await store.writeMessage(dest, uid, knownFlags(row.flags), raw,
               dest === F.name ? {} : {fmd5: md5hex(F.name)});
             if (F.name.toUpperCase() === 'INBOX') {

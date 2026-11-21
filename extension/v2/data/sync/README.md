@@ -616,7 +616,18 @@ the server" bug). The journal closes that window: BEFORE each pull chunk's
 files land (and before every post-apply arrival write) the engine records
 `{folder, uid, uidvalidity}` — the folder keyed is the one whose UID space
 the uid belongs to, a filter-routed landing included — so a crashed run can
-never leave an unremembered file behind. The classifier consults it before
+never leave an unremembered file behind. Kept-copy renames journal too:
+the post-apply pairing of a replayed server MOVE and the `relocate` op
+(a move another client did server-side) both stamp a local file with the
+destination's FRESH uid, which no snapshot record knows until the commit —
+the fresh uid is journaled BEFORE the file adopts it, so a run that dies
+between the rename and the commit leaves an orphan the next run still
+recognizes as its own (a third party deleting the destination uid inside
+that window must never turn the kept copy into a locally-born re-upload).
+A record whose folder has no uidvalidity is SKIPPED with a warning
+instead of written: the orphan match requires the epoch, so an entry
+without it could never vouch — false comfort, made visible instead of
+silent. The classifier consults it before
 any local-born APPEND: a journaled file whose uid left both the server and
 the snapshot is an uncommitted engine pull the server deleted elsewhere —
 the orphan copy drops with a warning (`uncommitted engine pull`), never

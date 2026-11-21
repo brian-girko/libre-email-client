@@ -678,6 +678,205 @@ function dirState(uidvalidity, uidnext, rows, highestModSeq = null) {
     'the orphan warning is narrated: ' + JSON.stringify(plan.warnings));
 }
 
+// ---- scenario P5: pairing-rename orphan — the fresh uid is journaled -----
+// A replayed server MOVE keeps the local copy and the post-apply pairing
+// renames it to the destination's FRESH uid. A run that dies between the
+// rename and the commit leaves the file under a uid no snapshot record
+// knows — the journal entry that vouched the original pull is keyed by the
+// OLD source uid and can no longer match the file. The rename therefore
+// journals the DESTINATION uid before the file adopts it: another client
+// deleting the destination uid in that window must never turn the kept
+// copy into a locally-born re-upload.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])],
+    ['Work', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {5: {msgid: m5, flags: []}}},
+      'Work': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  // run 1: the replayed MOVE lands, the pairing renames the kept copy to
+  // the fresh uid 11, the commit dies right before the snapshot rewrite
+  const store = mockStore(snapshot, listings);
+  store.saveState = async () => {
+    throw new Error('mock-fs: state save failed');
+  };
+  const engine1 = createSync(mockMail(server), store, {log: quietLog});
+  await assert.rejects(engine1.run({dry: false}), /state save failed/);
+  assert.ok(store.moves.some(m => m.dstFolder === 'Work' && m.uid === 11),
+    'run 1 renamed the kept copy to the fresh destination uid: ' + JSON.stringify(store.moves));
+  assert.ok(store.journalAdds.some(e => e.folder === 'Work' && e.uid === 11 && e.uidvalidity === 2000),
+    'the rename journaled the FRESH uid before the file adopted it: ' + JSON.stringify(store.journalAdds));
+  assert.ok(store.journal.some(e => e.folder === 'Work' && Number(e.uid) === 11),
+    'the failed run leaves the fresh uid\'s entry behind: ' + JSON.stringify(store.journal));
+
+  // run 2: another client deleted the destination uid on the server — the
+  // renamed file must drop, never re-upload
+  const server2 = new Map([
+    ['INBOX', dirState(1000, 9, [])],
+    ['Work', dirState(2000, 12, [])]
+  ]);
+  const listings2 = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([
+      fileEntry(makeFilename('Work', 11), 11, md5hex('Work'), rawOf('m5'))
+    ])]
+  ]);
+
+  // control — without the fresh uid's journal entry (the pre-fix shape)
+  // the renamed file reads as locally-born mail and the plan re-uploads it
+  const control = createSync(mockMail(server2), mockStore(snapshot, listings2), {log: quietLog});
+  {
+    const {plan} = await control.plan();
+    assert.ok(plan.ops.some(o => o.kind === 'append' && o.folder === 'Work'),
+      'without the fresh uid\'s entry the kept copy is re-uploaded: ' +
+      JSON.stringify(plan.ops.map(describeOp)));
+  }
+
+  // the fix: the entry vouches the file → one purgeLocal, never an append
+  const engine2 = createSync(mockMail(server2),
+    mockStore(snapshot, listings2, '/', false, {}, store.journal), {log: quietLog});
+  const {plan} = await engine2.plan();
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'the pairing-rename orphan is dropped, never uploaded: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].folder, 'Work');
+  assert.equal(plan.ops[0].uid, 11);
+  assert.ok(plan.warnings.some(w => w.includes('uncommitted engine pull')),
+    'the orphan warning is narrated: ' + JSON.stringify(plan.warnings));
+}
+
+// ---- scenario P6: relocate orphan — the adopted uid is journaled ---------
+// Another client moved the message server-side (INBOX/5 → Trash/10); the
+// plan relocates the local copy onto the fresh uid and the run dies before
+// the commit. A third party deleting Trash/10 inside that window leaves the
+// file under a uid no snapshot record knows — the relocate journals the
+// DESTINATION uid before the file adopts it, so the orphan drops instead
+// of re-uploading.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [])],
+    ['Trash', {status: {folder: 'x', exists: 1, uidvalidity: 3000, uidnext: 21},
+      rows: new Map([[10, {flags: [], subject: 'm5', from: null, date: null, size: rawOf('m5').length, messageId: m5}]]),
+      raws: new Map([[10, rawOf('m5')]])}]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {5: {msgid: m5, flags: []}}},
+      'Trash': {uidvalidity: 3000, uidnext: 21, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry(makeFilename('INBOX', 5), 5, md5hex('INBOX'), rawOf('m5'))
+    ])],
+    ['Trash', listing([])]
+  ]);
+
+  // run 1: the relocate renames the copy into Trash as uid 10, the commit
+  // dies right before the snapshot rewrite
+  const store = mockStore(snapshot, listings);
+  store.saveState = async () => {
+    throw new Error('mock-fs: state save failed');
+  };
+  const engine1 = createSync(mockMail(server), store, {log: quietLog});
+  await assert.rejects(engine1.run({dry: false}), /state save failed/);
+  assert.ok(store.moves.some(m => m.srcFolder === 'INBOX' && m.dstFolder === 'Trash' && m.uid === 10),
+    'run 1 relocated the copy to the fresh uid: ' + JSON.stringify(store.moves));
+  assert.ok(store.journalAdds.some(e => e.folder === 'Trash' && e.uid === 10 && e.uidvalidity === 3000),
+    'the relocate journaled the DESTINATION uid before the file adopted it: ' + JSON.stringify(store.journalAdds));
+  assert.ok(store.journal.some(e => e.folder === 'Trash' && Number(e.uid) === 10),
+    'the failed run leaves the adopted uid\'s entry behind: ' + JSON.stringify(store.journal));
+
+  // run 2: a third client deleted Trash/10 — the relocated file must drop,
+  // never re-upload
+  const server2 = new Map([
+    ['INBOX', dirState(1000, 9, [])],
+    ['Trash', dirState(3000, 21, [])]
+  ]);
+  const listings2 = new Map([
+    ['INBOX', listing([])],
+    ['Trash', listing([
+      fileEntry(makeFilename('Trash', 10), 10, md5hex('Trash'), rawOf('m5'))
+    ])]
+  ]);
+
+  // control — without the adopted uid's journal entry (the pre-fix shape)
+  const control = createSync(mockMail(server2), mockStore(snapshot, listings2), {log: quietLog});
+  {
+    const {plan} = await control.plan();
+    assert.ok(plan.ops.some(o => o.kind === 'append' && o.folder === 'Trash'),
+      'without the adopted uid\'s entry the relocated copy is re-uploaded: ' +
+      JSON.stringify(plan.ops.map(describeOp)));
+  }
+
+  // the fix: the entry vouches the file → one purgeLocal, never an append
+  const engine2 = createSync(mockMail(server2),
+    mockStore(snapshot, listings2, '/', false, {}, store.journal), {log: quietLog});
+  const {plan} = await engine2.plan();
+  assert.deepEqual(plan.ops.map(o => o.kind), ['purgeLocal'],
+    'the relocate orphan is dropped, never uploaded: ' + JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(plan.ops[0].folder, 'Trash');
+  assert.equal(plan.ops[0].uid, 10);
+  assert.ok(plan.warnings.some(w => w.includes('uncommitted engine pull')),
+    'the orphan warning is narrated: ' + JSON.stringify(plan.warnings));
+}
+
+// ---- scenario P7: an entry from ANOTHER epoch never vetoes ---------------
+// The orphan match requires the folder's CURRENT uidvalidity to agree —
+// uids are not comparable across a folder rebuild, and a stale-epoch entry
+// could otherwise drop a file whose uid the rebuilt folder handed to
+// DIFFERENT mail. The veto must miss and the classifier fall through to
+// the normal rules — the guard fails toward upload (keeping a possibly
+// stray copy), never toward silent local deletion. This is the discipline
+// the write side enforces too: a record without an epoch is skipped with a
+// warning instead of written inert (journalPulls).
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {7: {msgid: m7, flags: []}}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([
+      fileEntry('f5', 5, md5hex('INBOX'), rawOf('m5')),
+      fileEntry('f7', 7, md5hex('INBOX'), rawOf('m7'))
+    ])]
+  ]);
+  // uid 5's entry carries a PRE-rebuild epoch: it must not vouch now
+  const journal = [{folder: 'INBOX', uid: 5, uidvalidity: 999, at: '2026-11-21T00:00:00.000Z'}];
+
+  const engine = createSync(mockMail(server),
+    mockStore(snapshot, listings, '/', false, {}, journal), {log: quietLog});
+  const {plan} = await engine.plan();
+  const appendOp = plan.ops.find(o => o.kind === 'append');
+  assert.ok(appendOp, 'a stale-epoch entry never vetoes the local-born rule: ' +
+    JSON.stringify(plan.ops.map(describeOp)));
+  assert.equal(appendOp.entry?.uid, 5);
+  assert.ok(!plan.warnings.some(w => w.includes('uncommitted engine pull')),
+    'no orphan warning for a stale-epoch entry: ' + JSON.stringify(plan.warnings));
+}
+
 // ---- scenario E: size-adopted destination message with a null msgid --------
 // The destination holds the moved message (canonical local file + server
 // row) but its snapshot msgid is null — a size-adopted row that never
