@@ -17,6 +17,10 @@
         <button id="download-btn" type="button" disabled>Download</button>
         <button id="rename-btn" type="button" disabled>Rename</button>
         <button id="delete-btn" type="button" disabled>Delete</button>
+        <button id="archive-btn" type="button" disabled
+          title="Pack the selected Maildir into a zip archive and download it">Create ZIP Archive</button>
+        <button id="clear-btn" type="button" disabled
+          title="Delete all mails of the selected Maildir (asks for confirmation)">Clear Mails in Maildir</button>
         <span class="spacer"></span>
         <form id="new-dir-form">
           <input id="new-dir-name" type="text" placeholder="Folder name"
@@ -44,7 +48,8 @@
       <p class="note">The explorer browses the storage root of this extension
         (internal storage or the directory granted in the picker interface).
         Browsing is read-only; write actions (delete, rename, new folder,
-        new maildir, import) ask for write permission on first use.</p>
+        new maildir, import, clearing a Maildir) ask for write permission
+        on first use. Create ZIP Archive only reads.</p>
     </div>
   </section>
   <script type="module" src="index.js"></script>

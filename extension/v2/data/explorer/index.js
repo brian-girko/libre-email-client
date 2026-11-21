@@ -12,13 +12,17 @@
 // ranges, Space toggles the focused row); a double click opens it —
 // directories are entered, files are downloaded. The toolbar offers
 // download, delete and rename for the selection plus always-available
-// new-folder, new-maildir and import actions. Write access is requested
-// lazily on the first mutating action.
+// new-folder, new-maildir and import actions. When the single selection is
+// a Maildir (the cur/new/tmp triple), two more actions light up: the
+// maildir is packed into a downloadable zip archive (data/explorer/
+// zip.mjs), and its mails can be cleared after a confirmation. Write
+// access is requested lazily on the first mutating action.
 
 'use strict';
 
 import {initTheme} from '/data/client/theme.mjs';
 import {prepare, joinPath} from '/core/fs.mjs';
+import {zipMaildir} from './zip.mjs';
 import {
   MODE_EXTERNAL,
   getStorageMode,
@@ -46,6 +50,8 @@ const newFolderBtn = document.getElementById('new-folder-btn');
 const newMaildirBtn = document.getElementById('new-maildir-btn');
 const importBtn = document.getElementById('import-btn');
 const importInput = document.getElementById('import-input');
+const archiveBtn = document.getElementById('archive-btn');
+const clearBtn = document.getElementById('clear-btn');
 
 const e2msg = e => e?.message || String(e);
 
@@ -294,6 +300,59 @@ function updateToolbar() {
   downloadBtn.disabled = !count;
   deleteBtn.disabled = !count;
   renameBtn.disabled = count !== 1;
+  syncMaildirButtons();
+}
+
+// ---- maildir-only actions --------------------------------------------------
+//
+// Create ZIP Archive and Clear Mails in Maildir apply to exactly one
+// selected entry that is a Maildir (the cur/new/tmp triple — the same shape
+// the sync store's maildirOf() probes). Whether a directory is a Maildir is
+// probed asynchronously on every selection change: the buttons stay
+// disabled until the probe confirms, and a selection that moved on
+// invalidates the answer through the sequence guard.
+
+let busy = false;          // an archive/clear run is in flight
+let maildirProbeSeq = 0;
+let maildirPick = null;    // the one selected entry that is a Maildir
+
+/** the cur/new/tmp triple test, kind-checked stats through the gateway */
+async function isMaildir(dirPath) {
+  if (!fs) {
+    return false;
+  }
+  try {
+    const parts = await Promise.all(['cur', 'new', 'tmp']
+      .map(sub => fs.reader.stat(joinPath(dirPath, sub))));
+    return parts.every(st => st.exists && st.kind === 'directory');
+  }
+  catch {
+    return false;
+  }
+}
+
+function syncMaildirButtons() {
+  maildirPick = null;
+  const seq = ++maildirProbeSeq;
+  archiveBtn.disabled = true;
+  clearBtn.disabled = true;
+  const entries = selectedEntries();
+  const single = entries.length === 1 && entries[0].kind === 'directory'
+    ? entries[0]
+    : null;
+  if (!single) {
+    return;
+  }
+  isMaildir(joinPath(currentDirPath(), single.name)).then(ok => {
+    if (seq !== maildirProbeSeq || !ok || !selection.has(single.name)) {
+      return;   // the selection moved on while this probe ran
+    }
+    maildirPick = single;
+    if (!busy) {
+      archiveBtn.disabled = false;
+      clearBtn.disabled = false;
+    }
+  }).catch(() => {});
 }
 
 function selectOnly(entry) {
@@ -533,17 +592,23 @@ async function deleteSelected() {
   }
 }
 
+// One blob → one browser download (the shared tail of the download and the
+// archive actions).
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
 async function downloadEntry(entry) {
   try {
     const file = await fs.reader.read(joinPath(currentDirPath(), entry.name));
-    const url = URL.createObjectURL(file);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = entry.name;
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    saveBlob(file, entry.name);
     return true;
   }
   catch (e) {
@@ -571,6 +636,129 @@ async function downloadSelected() {
   }
   setStatus('Downloaded ' + ok + ' file' + (ok === 1 ? '' : 's') +
     (skipped ? ' — ' + skipped + ' folder' + (skipped > 1 ? 's' : '') + ' skipped' : ''), ok ? 'ok' : 'bad');
+}
+
+// Packs the selected Maildir into a zip and hands it to the browser's
+// download. Read-only: no write access is needed, the tmp/ scratch files
+// and the rebuildable .headers.json cache stay out of the archive (the
+// tmp/ directory itself ships, so the maildir shape is complete —
+// data/explorer/zip.mjs holds the writer and the layout rules).
+async function archiveMaildir() {
+  const pick = maildirPick;
+  if (!pick || busy) {
+    return;
+  }
+  busy = true;
+  archiveBtn.disabled = true;
+  clearBtn.disabled = true;
+  try {
+    setStatus('Preparing archive…', '');
+    const blob = await zipMaildir(fs, joinPath(currentDirPath(), pick.name), pick.name, {
+      onProgress: ({files, total}) => setStatus('Archiving ' + pick.name + '… ' +
+        files + ' of ' + total + ' file' + (total === 1 ? '' : 's'), '')
+    });
+    saveBlob(blob, pick.name + '.zip');
+    setStatus('Archive downloaded: ' + pick.name + '.zip (' + sizeText(blob.size) + ')', 'ok');
+  }
+  catch (e) {
+    setStatus('Archive failed: ' + e2msg(e), 'bad');
+  }
+  finally {
+    busy = false;
+    updateToolbar();
+  }
+}
+
+// Every file under the Maildir's live dirs (cur/ + new/, recursively) —
+// the count for the confirmation dialog and the removal list for the clear.
+async function listMaildirFiles(dirPath) {
+  const out = [];
+  const walk = async base => {
+    for (const {name, kind} of await fs.reader.list(base)) {
+      if (kind === 'directory') {
+        await walk(base + '/' + name);
+      }
+      else {
+        out.push(base + '/' + name);
+      }
+    }
+  };
+  for (const sub of ['cur', 'new']) {
+    try {
+      await walk(joinPath(dirPath, sub));
+    }
+    catch (e) {
+      if (e?.name !== 'NotFoundError') {
+        throw e;
+      }
+    }
+  }
+  return out;
+}
+
+// Deletes every message file of the selected Maildir after a confirmation.
+// Plain file removal, exactly like the explorer's Delete: no tombstone is
+// written, so a syncing account will offer the deletions on the server at
+// the next run (the engine's purge gate asks, declining keeps the server
+// copies). The folder itself with its cur/new/tmp shell and the
+// .uidvalidity marker stay — the same shape the resync's wipeFolder leaves.
+async function clearMaildir() {
+  const pick = maildirPick;
+  if (!pick || busy) {
+    return;
+  }
+  const dirPath = joinPath(currentDirPath(), pick.name);
+  let mails;
+  try {
+    mails = await listMaildirFiles(dirPath);
+  }
+  catch (e) {
+    return setStatus('Could not read the maildir: ' + e2msg(e), 'bad');
+  }
+  if (!mails.length) {
+    return setStatus(pick.name + ' holds no mails — nothing to clear.', '');
+  }
+  if (!await ensureWriteAccess()) {
+    return setStatus('Write permission denied for the storage root.', 'bad');
+  }
+  const question = 'Clear all mails in “' + pick.name + '”?\n\n' +
+    'This deletes ' + mails.length + ' message file' + (mails.length === 1 ? '' : 's') +
+    ' from cur/ and new/ in the local storage. The folder itself, its\n' +
+    'cur/new/tmp structure and the tmp/ contents stay. This cannot be undone.\n\n' +
+    'If this account syncs, the next sync will offer to delete the same\n' +
+    'mails on the server too — declining there keeps the server copies.';
+  if (!window.confirm(question)) {
+    return setStatus('Clear cancelled.', '');
+  }
+  busy = true;
+  archiveBtn.disabled = true;
+  clearBtn.disabled = true;
+  let removed = 0;
+  let failed = 0;
+  for (const filePath of mails) {
+    try {
+      if (await fs.writer.remove(filePath)) {
+        removed++;
+      }
+    }
+    catch (e) {
+      failed++;
+      setStatus('Could not delete ' + filePath + ': ' + e2msg(e), 'bad');
+    }
+  }
+  // the header-index sidecar goes with the mails (the resync's wipeFolder
+  // removes it the same way) — quiet, it is a cache, not mail
+  try {
+    await fs.writer.remove(dirPath + '/.headers.json', {quiet: true});
+  }
+  catch {}
+  await render();
+  busy = false;
+  updateToolbar();
+  if (!failed) {
+    setStatus('Cleared ' + removed + ' mail' + (removed === 1 ? '' : 's') +
+      ' from ' + pick.name, 'ok');
+  }
 }
 
 function startRename(entry) {
@@ -707,6 +895,8 @@ async function importFiles(files) {
 
 deleteBtn.addEventListener('click', deleteSelected);
 downloadBtn.addEventListener('click', downloadSelected);
+archiveBtn.addEventListener('click', archiveMaildir);
+clearBtn.addEventListener('click', clearMaildir);
 renameBtn.addEventListener('click', () => {
   const entries = selectedEntries();
   if (entries.length === 1) {
