@@ -2156,4 +2156,68 @@ const emptyFolders = () => ({
     'the snapshot is unchanged');
 }
 
+// ---- scenario R1: incremental survey + new mail still routes --------------
+// A committed snapshot exists (run 1 clean, no filters). New mail arrives
+// (uid 9, subject matches the filter). Run 2 runs with a route finder:
+// the survey's tier-2 flag sweep covers the known region, the fresh uid
+// region is envelope-fetched, and the new message must be ROUTED into
+// Work — exactly like a first-sync pull. Regression guard for the
+// incremental survey (flag-only sweeps + CONDSTORE skip): the cheap
+// paths must never hide fresh INBOX mail from the pull-time router.
+{
+  const known1 = await idOf('k1');
+  const server = new Map([
+    ['INBOX', {
+      status: {folder: 'x', exists: 2, uidvalidity: 1000, uidnext: 10, highestModSeq: '101'},
+      rows: new Map([
+        [5, {flags: ['\\Seen'], subject: 'k1', from: null, date: null, size: rawOf('k1').length}],
+        [9, {flags: [], subject: 'routed', from: null, date: null, size: rawOfSubject('r9', 'routed').length}]
+      ]),
+      raws: new Map([
+        [5, rawOf('k1')],
+        [9, rawOfSubject('r9', 'routed')]
+      ])
+    }],
+    ['Work', dirState(2000, 2, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      INBOX: {uidvalidity: 1000, uidnext: 9, highestModSeq: '100', messages: {
+        5: {msgid: known1, flags: ['\\Seen'], size: rawOf('k1').length}
+      }},
+      Work: {uidvalidity: 2000, uidnext: 2, messages: {}}
+    }
+  };
+  const listings = new Map([
+    ['INBOX', listing([fileEntry('f5', 5, md5hex('INBOX'), rawOf('k1'), ['\\Seen'])])],
+    ['Work', listing([])]
+  ]);
+  const store = mockStore(snapshot, listings);
+  const mail = mockMail(server);
+  const engine = createSync(mail, store,
+    {log: quietLog, route: raw => routeMessage(raw, {
+      filters: [MOVE_TO_WORK], accountId: null
+    })});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the incremental run is clean');
+  assert.deepEqual(
+    store.written.map(w => [w.folder, w.uid, w.fmd5 === md5hex('INBOX') ? 'SOURCE' : 'own']),
+    [['Work', 9, 'SOURCE']],
+    'the fresh uid under the flag-only survey still routes into Work: ' +
+    JSON.stringify(store.written));
+  assert.ok(mail.flagsCalls >= 1,
+    'the survey actually took the incremental path (flag fetch(es) issued)');
+  assert.deepEqual(engine.routeStats(), {moved: 1, kept: 0, unmatched: 0, failed: 0},
+    'route counters: 1 move under the incremental survey');
+  assert.deepEqual([...engine.landedInboxUids()], [9],
+    'the routed pull is "received" for the post-sync pass');
+  const snap = store.saved[0];
+  assert.equal(snap.folders.INBOX.messages[9].msgid, await idOf('r9'),
+    'the snapshot keeps the server-row identity (INBOX/uid 9)');
+  assert.equal(snap.folders.INBOX.highestModSeq, '101',
+    "the pre-survey modseq persists for the next run's CONDSTORE probe");
+}
+
 console.log('sync.test: all scenarios pass');

@@ -79,6 +79,14 @@ runs are separate families never merged into each other):
   account is queued or already running;
 - a full request folds every queued folder-based job of the same
   account+family, and dedupes against a queued twin of its own;
+- filter parity on every fold/drop that absorbs one job into another:
+  a surviving bare job (an interface submission) adopts the absorbed
+  request's filter list — in-flight full runs get it for their post-sync
+  pass (their pull-time router is already fixed), queued survivors get
+  the full effect (pull-time routing + the pass). A filter-carrying
+  request must never be swallowed by a bare run: the window's INBOX
+  pulls would land unfiltered, and no later run re-filters them — the
+  pass only ever covers a run's own landed pulls;
 - `discard` jobs are never merged and never folded away; the running job
   is never merged into (Stop is its only end).
 

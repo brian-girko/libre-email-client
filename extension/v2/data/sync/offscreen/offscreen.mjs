@@ -570,6 +570,15 @@ function adoptFilters(target, incoming) {
  *   incoming rid leaves the queue (its view unpins via the broadcast)
  * - a full request folds away every pending folder-based job of the same
  *   account+family ahead of itself, and dedupes against a queued twin
+ * - full-on-full parity: an incoming full request carrying a filter list
+ *   must never be swallowed by a BARE full run — a bare in-flight job
+ *   adopts the list (its post-sync pass reads job.filters when the run
+ *   settles, exactly like the dir-on-full case below), and a bare queued
+ *   twin adopts it too (its pull-time route finder is built from
+ *   job.filters when the run starts). Without this, a bare interface
+ *   submission eats the scheduler's or the client's filtered run, the
+ *   window's INBOX pulls land unfiltered, and nothing ever re-filters
+ *   them — the pass only ever covers a run's own landed pulls
  * - discard jobs ride past untouched
  * Every folding decision is narrated on the queue log.
  * @returns {'queued'|'merged'|'dropped'} what became of the request
@@ -633,12 +642,27 @@ function mergeQueue(msg) {
   }
   else if (FULL_KINDS.has(kind)) {
     if (FULL_KINDS.has(activeJob?.kind) && sameAcc(activeJob)) {
+      // best-effort filter parity, same as the dir-on-full case above: the
+      // in-flight run's pull-time route finder is fixed, but its post-sync
+      // pass reads job.filters when the run settles — attaching now still
+      // filters its landed pulls (a bare interface run must not swallow a
+      // filter-carrying request whole)
+      if (adoptFilters(activeJob, msg)) {
+        engineLog('queue',
+          `${describeJob(msg)} dropped — an identical full run is in flight for this account (its filter list adopted)`);
+        return 'dropped';
+      }
       engineLog('queue',
         `${describeJob(msg)} dropped — an identical full run is in flight`);
       return 'dropped';
     }
     const dupIdx = queue.findIndex(j => j !== activeJob && FULL_KINDS.has(j.kind) && sameAcc(j));
     if (dupIdx >= 0) {
+      // the queued twin must not run bare when the dropped request carried
+      // a filter list — unlike the in-flight case, this one is full parity:
+      // the adoption lands BEFORE the run starts, so its pull-time route
+      // finder routes the new INBOX pulls on the spot
+      adoptFilters(queue[dupIdx], msg);
       engineLog('queue',
         `${describeJob(msg)} dropped — already queued (${describeJob(queue[dupIdx])})`);
       return 'dropped';
