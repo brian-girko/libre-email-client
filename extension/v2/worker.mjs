@@ -55,8 +55,8 @@ import '/sync-scheduler.mjs';
 // sending {cmd: 'iface-open', type, redirect?}. The worker broadcasts
 // {cmd: 'exists', type} — if a page of that type is open, it responds
 // {ok: true} and sends {cmd: 'focus'}; the worker then focuses the
-// existing tab (or closes it and redirects the source tab when
-// redirect is true). If no page responds, the worker opens a new tab
+// existing tab and raises its window to the front (or closes it and
+// redirects the source tab when redirect is true). If no page responds, the worker opens a new tab
 // (or redirects the source tab).
 
 const IFACE_URLS = {
@@ -70,6 +70,22 @@ const IFACE_URLS = {
 // with redirect: true is received and the target interface is already
 // open. Consumed when the target page sends {cmd: 'focus'}.
 const pendingRedirects = new Map();
+
+// Bring a tab's window to the front: tabs.update({active: true}) only
+// switches tabs INSIDE the tab's own window — with the click coming from
+// another window that window stays on top unless the owning window is
+// raised too. A minimized window needs an explicit restore first:
+// focused alone does not unminimize it on every platform.
+function raiseWindow(winId) {
+  if (winId == null) {
+    return;
+  }
+  chrome.windows.get(winId)
+    .then(win => chrome.windows.update(winId, win?.state === 'minimized'
+      ? {state: 'normal', focused: true}
+      : {focused: true}))
+    .catch(() => {});   // the window may be gone by now — nothing to raise
+}
 
 function openInterface(type, {redirect = false, sourceTabId = null, query = null} = {}) {
   const url = IFACE_URLS[type];
@@ -175,20 +191,25 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     respond({ok: true});
     return false;
   }
-  // a page confirmed it is alive (responded to exists): focus its tab,
-  // or close it and redirect the source tab when a redirect is pending.
-  // The page names its own interface in msg.type — the worker cannot
-  // read sender.tab.url (no 'tabs' permission).
+  // a page confirmed it is alive (responded to exists): focus its tab and
+  // raise its window, or close it and redirect the source tab when a
+  // redirect is pending. The page names its own interface in msg.type —
+  // the worker cannot read sender.tab.url (no 'tabs' permission).
   if (msg?.cmd === 'focus') {
     if (sender.tab && msg.type) {
       const pending = pendingRedirects.get(msg.type);
       if (pending) {
         pendingRedirects.delete(msg.type);
         chrome.tabs.remove(sender.tab.id);
-        chrome.tabs.update(pending.sourceTabId, {url: pending.url});
+        // the redirect target becomes the visible page: activate it and
+        // raise its window, like the plain focus path does
+        chrome.tabs.update(pending.sourceTabId, {url: pending.url, active: true})
+          .then(tab => raiseWindow(tab?.windowId))
+          .catch(() => {});
       }
       else {
         chrome.tabs.update(sender.tab.id, {active: true});
+        raiseWindow(sender.tab.windowId);
       }
     }
     return false;
