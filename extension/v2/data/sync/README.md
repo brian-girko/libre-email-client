@@ -23,6 +23,10 @@ data/sync/
   snapshot.mjs   ← .sync-state.json (uid → {msgid, flags, size} last-good view)
   tombstones.mjs ← .tombstones.json: locally deleted mail the sync must
                    never re-add (written at deletion time, pruned at commit)
+  watcher.mjs    ← the fs-event → tombstone parser feeding the running
+                   engines when a message file is deleted while a session
+                   runs (the gateway spells removals 'delete'; the parsing
+                   is pure and unit-tested — watcher.test.mjs)
   pending-pulls.mjs ← .pending-pulls.json: this engine's own uncommitted
                    downloads — the memory that keeps an interrupted run's
                    files from being re-uploaded when another client deletes
@@ -766,22 +770,49 @@ tombstone file BEFORE the message file is removed
 (`MaildirStore.addTombstones` — the msgid is the same identity the snapshot
 carries, so a resync keeps matching it), and the offscreen's fs-event
 watcher feeds any message-file removal that lands under the active
-account's dir straight into the running engines (`noteTombstones`).
+account's dir straight into the running engines (`noteTombstones`). The
+watcher's parsing lives in `watcher.mjs` (pure, unit-tested) and keys on
+the gateway's REAL operation name — removals are `'delete'` (the fs
+gateway's vocabulary is `'create' | 'change' | 'delete' | 'move'`); an
+earlier filter asked for `'remove'` and never matched a single event, so
+the instant feed was dead code and mid-run deletions were seen only at
+chunk boundaries, when the durable tombstone existed at all.
 
 The engine consults the list at three levels: the classifier turns a
 tombstoned uid into a `deleteServer` op instead of a pull (both the
 "no snapshot record" and the "deleted locally, edited on server"
 branches — the `confirmPurge` gate still asks), the pull writers re-check
-before every write (per pull chunk the file is re-read, so a mid-run
-purge is caught even without the watcher; resync pulls match by msgid
-only, since a resync invalidates uids), and the post-apply arrivals are
-checked the same way. The prune at commit time removes ONLY the entries
-the run resolved — a message no longer on the server, or a uid the
-snapshot has since handed to a different identity. Everything still on
-the server under the same identity (a declined purge gate, a mid-run
-skip, a folder a scoped run never surveyed) stays, so the next run is
-protected too and the deleted mail can never quietly return. A failed
-run never commits, and therefore never prunes.
+before every write (the file is re-read per pull chunk — at the chunk
+boundary AND again after the chunk's fetches, immediately before its
+writes — so a mid-run purge is caught even without the watcher; resync
+pulls match by msgid only, since a resync invalidates uids), and the
+post-apply pass reloads the file per folder before it pairs kept copies
+and re-fetches arrivals, checked the same way. A skip never skips the
+snapshot: the server still serves the message, so its row is committed
+WITH the identity the fetched raw parsed — the next run then classifies
+"in K, gone locally, still on the server" and plans the gated
+`deleteServer` instead of re-planning the pull forever. The same reload
+feeds the kept-copy pairing's veto: a moved copy deleted locally mid-run
+leaves a tombstone keyed by the folder it sat in under its OLD uid —
+when the pairing falls back (unreadable/missing/ambiguous copy), exactly
+one unclaimed fresh uid is pinned as "not re-fetchable" and the arrival
+branch skips the download, so the replayed move cannot resurrect the
+deleted mail under its fresh uid. The prune at commit time removes ONLY
+the entries the run resolved — a message no longer on the server, or a
+uid the snapshot has since handed to a different identity. Everything
+still on the server under the same identity (a declined purge gate, a
+mid-run skip, a folder a scoped run never surveyed) stays, so the next
+run is protected too and the deleted mail can never quietly return. A
+failed run never commits, and therefore never prunes.
+
+Two things the mid-run story deliberately cannot cover: a deletion made
+OUTSIDE the fs gateway (an OS file manager dragging a file out of a
+picked external directory) emits no fs-event at all — the FS Access API
+does not report external changes — and lands at the next plan's local
+re-listing as the ordinary missing-file diff (the gated `deleteServer`);
+and a tombstone whose msgid could not be parsed can only match by
+folder+uid, so a message that changed uids under it (a server MOVE)
+relies on the pairing veto above, not on identity.
 
 **A replayed MOVE keeps the bytes.** A server MOVE assigns a fresh UID, so
 the pending-move file can't simply be re-used — but the bytes are already

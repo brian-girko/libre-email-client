@@ -1943,6 +1943,13 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
     // fresh destination uid and renames it in place — the copy stays local,
     // no re-download
     const movedKeeps = [];
+    // fresh uids this run must NOT re-fetch: the moved copy they belong to
+    // was deleted locally mid-run (a purge whose tombstone the per-folder
+    // reload below picked up) and the pairing fell back — re-fetching the
+    // fresh uid would resurrect the deleted mail before the run ends.
+    // Keyed `${folder}/${uid}`; pinned by pairMovedKeeps' fallback, spent
+    // by the arrivals branch before its FETCH.
+    const tombSkip = new Set();
     // Server-row mutations THIS run made, per folder — the post-apply pass
     // derives most of its state from these instead of re-sweeping the whole
     // UID space (see postRows below). `appends` counts messages this run
@@ -2120,6 +2127,11 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
         onProgress?.({phase: 'apply', op: op.kind, folder: op.folder, done: ++done, total: ops.length});
         emitLog('apply',
           `skipped pull ${op.folder}/${op.uid}: deleted locally (tombstone) — left on the server`);
+        // the skipped row's snapshot identity: the commit still records the
+        // server row (the message stays on the server — its deletion
+        // replays as the next run's gated deleteServer), and the identity
+        // keeps that row from degrading to msgid null
+        recMsgid.set(`${op.folder}/${op.uid}`, mid);
         return false;
       }
       // the finder decides the destination on the spot: a routed message
@@ -2219,6 +2231,12 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
         // failed are harmless: no file, nothing to protect.
         await journalPulls(folder, chunk.map(sop => Number(sop.uid)),
           survey.folders.get(folder)?.uidvalidity ?? null);
+        // the chunk-boundary reload above ran BEFORE this chunk's
+        // fetches — a purge landing while the network was busy (the
+        // fs-event watcher is the instant path; this is the catch-up)
+        // must be honored before the first write resurrects the mail the
+        // user deleted
+        await loadTombstones();
         const pulled = [];
         for (const sop of chunk) {
           const raw = sop.raw ?? landed.get(Number(sop.uid)) ?? null;
@@ -2536,9 +2554,28 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
         .map(([uid, row]) => ({uid, size: row.size != null ? Number(row.size) : null, used: false}));
       for (const m of pend) {
         const fallback = async why => {
-          emitLog('apply',
-            `moved ${m.from}/${m.oldUid} → ${F.name}: ${why} — ` +
-            'copy dropped, the fresh uid is re-fetched', 'warn');
+          let line = `moved ${m.from}/${m.oldUid} → ${F.name}: ${why} — ` +
+            'copy dropped, the fresh uid is re-fetched';
+          // the moved copy was deleted locally while this run applied it
+          // (the client's purge, or any removal the fs-event watcher fed
+          // in): re-fetching the fresh uid would resurrect the mail the
+          // user deleted before the run ends. The tombstone is keyed by
+          // the folder the file sat in under its OLD uid — the arrival
+          // branch's by-uid check cannot match the fresh uid, and its
+          // msgid fallback only fires once the raw is in hand. When the
+          // folder holds exactly ONE unclaimed fresh uid the veto can pin
+          // it before any download; otherwise the msgid check remains the
+          // guard.
+          if (tombFor(F.name, m.oldUid)) {
+            const unclaimed = fresh.filter(c => !c.used &&
+              !recMsgid.has(`${F.name}/${c.uid}`));
+            if (unclaimed.length === 1) {
+              tombSkip.add(`${F.name}/${unclaimed[0].uid}`);
+              line = `moved ${m.from}/${m.oldUid} → ${F.name}: ${why} — ` +
+                'deleted locally (tombstone); the fresh uid is not re-fetched';
+            }
+          }
+          emitLog('apply', line, 'warn');
           if (!await store.removeMessage(m.entry)) {
             // best effort: the stale marker rides to the next run, where
             // the final sweep purges it by msgid (the message is served
@@ -2727,6 +2764,13 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
       if (!restricted) {
         await store.writeUidValidity(F.name, uidvalidity);
       }
+      // deletions that landed while this run was applying: the pairing and
+      // the arrival re-fetches below must consult a FRESH tombstone view.
+      // The pull chunks re-read per chunk, but this pass never did — a
+      // pending-move copy purged mid-run fell back to a re-fetch that
+      // resurrected exactly the mail the user deleted, "before the sync
+      // is over".
+      await loadTombstones();
       // pair the run's replayed moves BEFORE the arrival branch: paired
       // uids land in recMsgid, so only UNPAIRED new uids are re-fetched
       await pairMovedKeeps(F, post);
@@ -2735,34 +2779,52 @@ async function serverRowsFor(f, current, {uidvalidity, uidnext, exists, highestM
         const key = `${F.name}/${uid}`;
         if (!F.server.has(uid) && !recMsgid.has(key)) {
           try {
-            await select(F.name);
-            const raw = (await guardedFetch(mail.readMail(uid),
-              `post-pull ${F.name}/${uid}`)).raw;
-            const mid = await msgidOf(raw);
-            // an arrival is checked against the tombstones like any pull —
-            // a resync'd folder has untrustworthy uids, so identity by
-            // msgid only there
-            if (tombFor(F.name, uid, mid, {byUid: !F.resync})) {
+            // a by-uid tombstone hit (or a pairing veto pinned above)
+            // skips the re-fetch outright — no raw download for mail the
+            // user deleted mid-run. A skip must NOT skip the snapshot row
+            // below: the server still serves the message, so the next run
+            // has to see "in K, gone locally, still on the server" and
+            // plan the gated deleteServer (the classifier's tombstone
+            // branch) — a skipped row left out of K would re-plan the
+            // pull on every run and resurrect the deleted mail.
+            if (tombSkip.has(key) ||
+                tombFor(F.name, uid, null, {byUid: !F.resync})) {
               summary.skipped++;
               emitLog('apply',
                 `skipped ${key} (arrived): deleted locally (tombstone) — left on the server`);
-              continue;
             }
-            recMsgid.set(key, mid);
-            // arrivals route like the run's own pulls: the finder picks the
-            // destination while the bytes are in hand (the snapshot keeps
-            // describing the SERVER row — INBOX/uid — either way)
-            const dest = (await routeLanding(raw, F.name, uid)) ?? F.name;
-            // journal the arrival before its file lands — a run that dies
-            // right after leaves an orphan the journal must vouch
-            await journalPulls(F.name, [Number(uid)], F.uidvalidity ?? null);
-            await store.writeMessage(dest, uid, knownFlags(row.flags), raw,
-              dest === F.name ? {} : {fmd5: md5hex(F.name)});
-            if (F.name.toUpperCase() === 'INBOX') {
-              landedInbox.add(uid);
+            else {
+              await select(F.name);
+              const raw = (await guardedFetch(mail.readMail(uid),
+                `post-pull ${F.name}/${uid}`)).raw;
+              const mid = await msgidOf(raw);
+              // an arrival is checked against the tombstones like any pull —
+              // a resync'd folder has untrustworthy uids, so identity by
+              // msgid only there
+              if (tombFor(F.name, uid, mid, {byUid: !F.resync})) {
+                summary.skipped++;
+                emitLog('apply',
+                  `skipped ${key} (arrived): deleted locally (tombstone) — left on the server`);
+                recMsgid.set(key, mid);   // the skipped row keeps its identity for the commit
+              }
+              else {
+                recMsgid.set(key, mid);
+                // arrivals route like the run's own pulls: the finder picks the
+                // destination while the bytes are in hand (the snapshot keeps
+                // describing the SERVER row — INBOX/uid — either way)
+                const dest = (await routeLanding(raw, F.name, uid)) ?? F.name;
+                // journal the arrival before its file lands — a run that dies
+                // right after leaves an orphan the journal must vouch
+                await journalPulls(F.name, [Number(uid)], F.uidvalidity ?? null);
+                await store.writeMessage(dest, uid, knownFlags(row.flags), raw,
+                  dest === F.name ? {} : {fmd5: md5hex(F.name)});
+                if (F.name.toUpperCase() === 'INBOX') {
+                  landedInbox.add(uid);
+                }
+                folderOf(F.name).added++;
+                emitLog('apply', `pulled ${F.name}/${uid} (arrived during the run)`);
+              }
             }
-            folderOf(F.name).added++;
-            emitLog('apply', `pulled ${F.name}/${uid} (arrived during the run)`);
           }
           catch (e) {
             summary.skipped++;

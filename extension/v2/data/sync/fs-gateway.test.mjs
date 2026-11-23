@@ -594,6 +594,59 @@ const afterCommit = await deltaApi.listThreadsDelta();
 assert.equal(afterCommit.changed, false);
 ok('flag reconcile also lands on commit only (no in-place cache flip)');
 
+// ---- 8c. a \Deleted interloper leaves every view ------------------------------
+//
+// The reported bug: deleting a routed/moved message (the client's Trash or
+// purge on a pending-move marker file — a foreign-FMD5 interloper) never
+// removed the row, because folderRows()/listThreadsDelta() served
+// interlopers UNCONDITIONALLY ("they never trip the \Deleted gate").
+// During a sync every reconcile burst re-served the deleted mail — "the
+// email returns back before the sync is over". \Deleted must leave every
+// view for interlopers exactly like it does for regular rows (the badge
+// already counts them as deleted).
+
+{
+  const {md5hex} = await import('/data/sync/maildir.mjs');
+  const viewRoot = new MockDir(null, 'view-root');
+  const viewFs = await prepare('view-test', {handle: viewRoot, fresh: true});
+  const viewStore = new MaildirStore(viewFs, 'acc2');
+  await viewStore.open();
+  const mail = new TextEncoder().encode('From: v@x.y\r\n\r\nview me\r\n');
+  await viewStore.writeMessage('Work', 21, ['\\Seen'], mail);
+  // the pending-move marker: a foreign FMD5 (INBOX's) in Work — the shape a
+  // routed pull or a local Trash move lands
+  await viewStore.writeMessage('Work', 22, [], mail, {fmd5: md5hex('INBOX')});
+  drain();
+
+  const viewApi = apiForStore(viewStore, 'acc2');
+  await viewApi.openDir('Work');
+  const uidsOf = threads => threads.flatMap(t => t.uids).sort((a, b) => a - b);
+  const before = await viewApi.listThreads();
+  assert.deepEqual(uidsOf(before), [21, 22],
+    'sanity: the regular row and the marker are both visible before');
+
+  // the delete: the T letter renames the marker in place, FMD5 preserved —
+  // it STAYS an interloper, exactly the shape that used to linger
+  const marker = [...(await viewStore.listLocal('Work')).interlopers]
+    .find(e => e.uid === 22);
+  await viewStore.renameMessage('Work', marker, {flags: ['\\Deleted']});
+  drain();
+
+  const deltaRead = await viewApi.listThreadsDelta();
+  assert.equal(deltaRead.changed, true, 'the delete must reach the reconcile');
+  assert.deepEqual(deltaRead.removed, [22],
+    'the delta drops the deleted marker — the row never returns with the ' +
+    'sync\'s reconcile bursts: ' + JSON.stringify(deltaRead.removed));
+  deltaRead.commit();
+
+  const after = await viewApi.listThreads();
+  assert.deepEqual(uidsOf(after), [21],
+    'the full read keeps the deleted marker out too');
+  assert.equal(await viewApi.readFlags(22), null,
+    'the preview side reconciles the deleted marker away');
+  ok('\\Deleted interlopers leave every view (deleted routed mail stays deleted)');
+}
+
 // ---- 9. the header-index sidecar follows the messages it caches -------------
 //
 // store.wipe() (the UIDVALIDITY resync) must remove <folder>/.headers.json:

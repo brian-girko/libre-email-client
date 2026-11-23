@@ -193,7 +193,7 @@ function mockMail(server, {failMove = false, moveError = 'mock-fs: move failed',
   };
 }
 
-function mockStore(snapshot, listings, delimiter = '/', failRenames = false, prefs = {}, pendingPulls = []) {
+function mockStore(snapshot, listings, delimiter = '/', failRenames = false, prefs = {}, pendingPulls = [], tombstones = []) {
   const saved = [];
   // the pending-pull journal (.pending-pulls.json): in-memory, seeded per
   // scenario; addPendingPulls merges (a re-pull replaces), clearPendingPulls
@@ -237,6 +237,38 @@ function mockStore(snapshot, listings, delimiter = '/', failRenames = false, pre
       this.journalClears.push(removed);
       journal.length = 0;
       journal.push(...kept);
+      return removed;
+    },
+    // the tombstone list (.tombstones.json): seeded per scenario, merged
+    // by addTombstones (a mid-run purge hook) and pruned by the engine's
+    // commit-time clearTombstones — mirroring MaildirStore's semantics so
+    // the mid-run deletion scenarios can pin what the engine saw, when
+    tomb: structuredClone(tombstones),
+    async loadTombstones() {
+      return structuredClone(this.tomb);
+    },
+    async addTombstones(entries) {
+      for (const raw of entries ?? []) {
+        const folder = typeof raw?.folder === 'string' && raw.folder ? raw.folder : null;
+        const uid = Number(raw?.uid);
+        if (!folder || !Number.isInteger(uid) || uid <= 0) {
+          continue;
+        }
+        const entry = {folder, uid, msgid: raw.msgid ?? null, at: raw.at ?? null};
+        const i = this.tomb.findIndex(e => e.folder === folder && Number(e.uid) === uid);
+        if (i >= 0) {
+          this.tomb[i] = entry;
+        }
+        else {
+          this.tomb.push(entry);
+        }
+      }
+      return (entries ?? []).length;
+    },
+    async clearTombstones(removeFn = null) {
+      const kept = removeFn ? this.tomb.filter(e => !removeFn(e)) : [];
+      const removed = this.tomb.length - kept.length;
+      this.tomb = kept;
       return removed;
     },
     // every writeMessage call the engine makes — {folder, uid, flags, bytes,
@@ -2641,6 +2673,137 @@ const emptyFolders = () => ({
     'the snapshot keeps the server-row identity (INBOX/uid 9)');
   assert.equal(snap.folders.INBOX.highestModSeq, '101',
     "the pre-survey modseq persists for the next run's CONDSTORE probe");
+}
+
+// ---- scenario T1: a purge landing mid-chunk must not be re-written ---------
+// The user deletes a message WHILE the run applies its pulls: the client's
+// purge writes the durable tombstone during the chunk's network fetch —
+// after the chunk-boundary reload, before the writes. The old engine
+// checked only in-memory maps loaded at the boundary, so the write
+// re-created the file and the deleted mail returned before the run ended.
+// The write phase now re-reads the tombstone file after the fetches, the
+// skip keeps the row's identity for the commit, and the next run plans the
+// gated deleteServer instead of a pull.
+{
+  const m5 = await idOf('m5');
+  const m7 = await idOf('m7');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5'], [7, 'm7']])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {}}}
+  };
+  const listings = new Map([['INBOX', listing([])]]);
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  // the user's purge lands while the chunk's FETCH is in flight — after
+  // the boundary reload, before the writes (in the real extension the
+  // fixed fs-event watcher is the instant path; this pins the boundary
+  // fallback that must catch up before the first write)
+  const baseReadMails = mail.readMails.bind(mail);
+  mail.readMails = async uids => {
+    const out = await baseReadMails(uids);
+    await store.addTombstones([{folder: 'INBOX', uid: 5, msgid: m5,
+      at: new Date().toISOString()}]);
+    return out;
+  };
+  const lines = [];
+  const engine = createSync(mail, store, {log: l => lines.push(l)});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.deepEqual(store.written.map(w => w.uid), [7],
+    'the purged uid 5 is NOT re-written — only uid 7 lands: ' +
+    JSON.stringify(store.written));
+  assert.equal(summary.skipped, 1, 'the purge is accounted as a skip');
+  assert.ok(lines.some(l => l.content.includes(
+      'skipped pull INBOX/5: deleted locally (tombstone)')),
+    'the skip is narrated');
+  // the deleted mail stays deleted: the snapshot still records the server
+  // row WITH its identity, so the next run classifies "in K, gone locally,
+  // still on the server" → the gated deleteServer, never a re-pull
+  const snap = store.saved[0];
+  assert.equal(snap.folders.INBOX.messages[5].msgid, m5,
+    'the skipped row keeps its identity for the next run');
+  // and the tombstone survives the commit (the message is still on the
+  // server under the same identity — the prune only clears resolved ones)
+  assert.deepEqual(store.tomb.map(e => `${e.folder}/${e.uid}`), ['INBOX/5'],
+    'the tombstone survives: the server copy is still there to guard');
+}
+
+// ---- scenario T2: a purged pending-move copy is not re-fetched -------------
+// The replayed server MOVE assigns the moved message a FRESH uid, and the
+// kept local copy is paired onto it. When the user purges that copy while
+// the run applies (the client's purge tombstone keyed by the folder the
+// file sat in under its OLD uid), the pairing falls back — and the old
+// fallback re-FETCHED the fresh uid, resurrecting the deleted mail before
+// the run ended. The fallback now consults the tombstone (the per-folder
+// post-apply reload keeps it fresh), pins the one unclaimed fresh uid, and
+// the arrival branch skips the fetch — leaving the server copy for the
+// next run's gated deleteServer.
+{
+  const m5 = await idOf('m5');
+  const server = new Map([
+    ['INBOX', dirState(1000, 9, [[5, 'm5']])],
+    ['Work', dirState(2000, 11, [])]
+  ]);
+  const snapshot = {
+    version: 2, lastSyncAt: null,
+    folders: {
+      'INBOX': {uidvalidity: 1000, uidnext: 9, messages: {
+        5: {msgid: m5, flags: []}
+      }},
+      'Work': {uidvalidity: 2000, uidnext: 11, messages: {}}
+    }
+  };
+  const interloperName = makeFilename('INBOX', 5, [], {unique: 'u5', fmd5: md5hex('INBOX')});
+  const listings = new Map([
+    ['INBOX', listing([])],
+    ['Work', listing([], [
+      fileEntry(interloperName, 5, md5hex('INBOX'), rawOf('m5'))
+    ])]
+  ]);
+
+  const mail = mockMail(server);
+  const store = mockStore(snapshot, listings);
+  // the purge lands while the run replays the move: the marker file goes
+  // (unreadable from here on) and the durable tombstone is written under
+  // the folder the file sat in with its OLD uid
+  const baseMoveMail = mail.moveMail.bind(mail);
+  const marker = listings.get('Work').interlopers[0];
+  mail.moveMail = async (uid, mailbox) => {
+    const fresh = await baseMoveMail(uid, mailbox);
+    marker.raw = null;   // the file is gone: no size, no bytes to keep
+    await store.addTombstones([{folder: 'Work', uid: 5, msgid: m5,
+      at: new Date().toISOString()}]);
+    return fresh;
+  };
+  const lines = [];
+  const engine = createSync(mail, store, {log: l => lines.push(l)});
+  const {summary} = await engine.run({dry: false});
+
+  assert.equal(summary.failed, 0, 'the run is clean');
+  assert.equal(summary.serverMoves, 1, 'the pending move replayed on the server');
+  assert.deepEqual(store.written, [],
+    'the fresh uid is NOT re-fetched — the deleted mail never returns: ' +
+    JSON.stringify(store.written));
+  assert.deepEqual(store.moves, [], 'no blind pairing rename either');
+  assert.equal(mail.fetches, 0,
+    'the pairing veto skipped the download of the purged copy');
+  assert.ok(lines.some(l => l.content.includes(
+      'deleted locally (tombstone); the fresh uid is not re-fetched')),
+    'the fallback names the tombstone instead of announcing a re-fetch');
+  assert.ok(lines.some(l => l.content.includes(
+      'skipped Work/11 (arrived): deleted locally (tombstone)')),
+    'the arrival branch skips the pinned fresh uid');
+  // the snapshot tracks the fresh uid (the server still serves it there),
+  // so the NEXT run plans the gated deleteServer for the moved copy —
+  // the local deletion wins through the gate, never a re-pull
+  const snap = store.saved[0];
+  assert.ok(snap.folders.Work.messages[11],
+    'the fresh uid is in the snapshot — the next run sees the deletion diff');
 }
 
 console.log('sync.test: all scenarios pass');

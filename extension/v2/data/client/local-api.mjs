@@ -79,7 +79,9 @@ function reportEdit(payload) {
 // never changes under one uid).
 
 // Rows for one folder: uid/flags from the filenames, subject/from/date from
-// the header block. \\Deleted rows leave every view.
+// the header block. \\Deleted rows leave every view — interlopers
+// (routed/moved marker files) included: a locally deleted message must
+// disappear once, not reappear with every sync's reconcile burst.
 async function folderRows(store, account, folder) {
   const local = await store.listLocal(folder);
   if (!local) {
@@ -106,6 +108,14 @@ async function folderRows(store, account, folder) {
     });
   }
   for (const interloper of local.interlopers ?? []) {
+    // \Deleted leaves every view for interlopers too (the module
+    // invariant): a locally deleted routed/moved message must not stay
+    // on (or return to) the list during a sync's reconcile bursts — the
+    // badge already counts them as deleted, and the T letter survives the
+    // rename so the sync still sees the pending move in the filename
+    if ((interloper.flags ?? []).includes('\\Deleted')) {
+      continue;
+    }
     rows.push({
       entry: interloper,
       folder,
@@ -389,7 +399,10 @@ export function apiForStore(store, accountId) {
         };
       }
       // the live uid+flag truth from the filenames; \Deleted rows leave the
-      // view (folderRows() keeps them out), interlopers join by uid as
+      // view (folderRows() keeps them out — interlopers included: a
+      // locally deleted routed/moved message must leave the list exactly
+      // like a regular one, or every sync's reconcile burst would keep
+      // re-serving it), interlopers join by uid as
       // usual. No content reads. All reconciliation lands on a CANDIDATE
       // map — the cache itself only moves on commit().
       const next = new Map(cache.rows);
@@ -400,7 +413,9 @@ export function apiForStore(store, accountId) {
         }
       }
       for (const interloper of local.interlopers ?? []) {
-        live.set(interloper.uid, [...(interloper.flags ?? [])]);
+        if (!(interloper.flags ?? []).includes('\\Deleted')) {
+          live.set(interloper.uid, [...(interloper.flags ?? [])]);
+        }
       }
       let removedUids = [];
       const added = [];
@@ -423,8 +438,9 @@ export function apiForStore(store, accountId) {
         return {changed: false, threads: null, added: [], removed: [], flagged: [],
           commit: null};
       }
-      // new arrivals: build rows, parse their headers only. Interlopers join
-      // regardless of \Deleted — folderRows() serves them the same way.
+      // new arrivals: build rows, parse their headers only. Interlopers
+      // join as folderRows() serves them — \Deleted ones never reach the
+      // live map above, so they are neither added nor kept.
       if (added.length) {
         const byUid = new Map([...local.entries, ...local.interlopers]);
         const fresh = [];
@@ -723,8 +739,10 @@ function skeletonRow(entry, folder) {
 }
 
 // Seed rows for the delta cache from one listLocal() result, same
-// shape/semantics as folderRows(): \Deleted gone from the entries,
-// interlopers in (they never trip the \Deleted gate there), meta parsed
+// shape/semantics as folderRows(): \Deleted gone from the entries AND the
+// interlopers (deleted mail leaves every view — a locally deleted
+// routed/moved message must not linger on or return with a sync's
+// reconcile bursts), meta parsed
 // (a FULL-folder read — the index prunes against it), newest first.
 async function deltaRows(local, folder, store) {
   const rows = [];
@@ -735,6 +753,9 @@ async function deltaRows(local, folder, store) {
     rows.push(skeletonRow(entry, folder));
   }
   for (const interloper of local.interlopers ?? []) {
+    if ((interloper.flags ?? []).includes('\\Deleted')) {
+      continue;
+    }
     rows.push(skeletonRow(interloper, folder));
   }
   rows.sort((a, b) => b.uid - a.uid);
