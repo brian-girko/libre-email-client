@@ -1,6 +1,7 @@
 import '../components/prompt-view.js';
 import '../components/combo-view.js';
 import './components/logger-view.js';
+import './components/compose-view.js';
 import {initTheme} from './theme.mjs';
 import {initFontScale} from './font-scale.mjs';
 import {init as initDirs, load as loadDirs, refresh as refreshDirs,
@@ -16,7 +17,7 @@ import {initFilters, reconcileOpenFolder} from './filters.mjs';
 import {init as initSyncEvents} from './sync-events.mjs';
 import {subscribe as subscribeLog, setStatus as setLogStatus} from './logger.mjs';
 import {init as initSyncRun, requestSync} from './sync-run.mjs';
-import {cancel as cancelJob, dismiss as dismissJob} from './jobs.mjs';
+import {enqueue, cancel as cancelJob, dismiss as dismissJob} from './jobs.mjs';
 import {getPref, setPref} from './prefs.mjs';
 import {init as initFsEvents} from './fs-events.mjs';
 import * as counters from './counters.mjs';
@@ -131,6 +132,87 @@ syncAccountBtn.addEventListener('click', () => {
 const explorerOpen = document.getElementById('explorer-open');
 explorerOpen.addEventListener('click', () => {
   chrome.tabs.create({url: chrome.runtime.getURL('/data/explorer/index.html')});
+});
+
+// ---- compose: toolbar button → floating pane → one local message ------------
+//
+// "Compose" shows the <compose-view> pane: a non-modal, top-layer window
+// anchored bottom-right (Gmail-style) — the page keeps working while a
+// message is written (emails preview, folders switch), and the pane
+// never closes on an outside click. The destination is FROZEN at open
+// time: switching folders (or accounts) while writing does not redirect
+// the message — it lands where the pane's header says it will. The From
+// identity is the options-page registry's user@host — a metadata read
+// (decrypt:false) that never touches a password and never prompts; a
+// directory no configured account claims falls back to the bare slug.
+// Save emits 'compose-save' with the pane's fields and the write runs
+// as a queued job (local-api composeMessage): the file lands in the
+// folder's new/, its fs-event reconciles the views in place, and the
+// dirty report guarantees the next sync's local-born classification
+// APPENDs the message to the server folder.
+
+const composeView = document.getElementById('compose');
+const composeOpenBtn = document.getElementById('compose-open');
+
+// the target the pane's header promised, captured when the pane opened —
+// NOT re-read at save. The user may switch folders or accounts mid-write;
+// the message still goes where the header says (a folder deleted in the
+// meantime fails the job line with the familiar mirror error instead)
+let composeTarget = null;   // {id, dir} or null before the first open
+
+async function composeIdentity(id) {
+  try {
+    const accounts = await loadAccounts(null, {decrypt: false});
+    const acct = accounts.find(a => a.slug === id);
+    if (acct?.user && acct?.host) {
+      // the registry's placeholder label is not a display name worth
+      // putting in a message header — only a real configured one rides
+      const fromName = acct.name && acct.name !== 'Unnamed account'
+        ? acct.name
+        : '';
+      return {from: acct.user + '@' + acct.host, fromName};
+    }
+  }
+  catch {
+    /* no readable registry — the slug stands in as the From address */
+  }
+  return {from: id, fromName: ''};
+}
+
+async function openCompose() {
+  const id = currentAccountId();
+  const dir = currentDirName();
+  if (!id || !dir) {
+    setLogStatus(!id ? 'no account selected' : 'no folder selected',
+      {tone: 'warn', time: Date.now()});
+    return;
+  }
+  const {from, fromName} = await composeIdentity(id);
+  composeTarget = {id, dir};
+  composeView.open({from, fromName, folder: dir});
+}
+
+composeOpenBtn.addEventListener('click', () => {
+  openCompose().catch(e => console.error('[client] compose open failed:', e));
+});
+
+composeView.addEventListener('compose-save', e => {
+  const {id, dir} = composeTarget ?? {};
+  if (!id || !dir) {
+    setLogStatus('no folder selected for the compose pane',
+      {tone: 'warn', time: Date.now()});
+    return;
+  }
+  const fields = e.detail;
+  enqueue({
+    accountId: id,
+    kind: 'mail-compose',
+    label: `Saving message to "${dir}"`,
+    doneLabel: `Saved message to "${dir}" — the next sync uploads it`,
+    run: async api => {
+      await api.composeMessage(dir, fields);
+    }
+  });
 });
 
 // ---- client settings: status bar gear → checkbox dialog ----------------------
@@ -330,5 +412,6 @@ initShortcuts({
   dirs: dirsView,
   list: document.getElementById('emails'),
   preview: document.getElementById('preview'),
-  prompt: document.getElementById('prompt')
+  prompt: document.getElementById('prompt'),
+  overlays: [document.getElementById('compose')]
 });

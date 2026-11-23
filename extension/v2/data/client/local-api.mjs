@@ -27,6 +27,10 @@
 //                           delete = \Deleted flag rename, the sync engine
 //                           replays the server effect from those names
 //   createDir/deleteDir   → {tmp,new,cur} triple create / recursive delete
+//   composeMessage        → one RFC822 file written into new/ (compose.mjs
+//                           builds the bytes from the dialog's fields);
+//                           the sync engine's local-born classification
+//                           APPENDs it to the server folder on the next run
 //
 // Flag truth is the maildir filename info part (S R F T D letters — see
 // data/sync/maildir.mjs): a local change is visible the moment the file
@@ -42,11 +46,13 @@ import {
   MaildirStore,
   dirNameFor,
   normalizeFolderPath,
+  writeMessage as writeFile,
 } from '../sync/maildir.mjs';
 import {delimiterFor} from '../sync/client/delimiter.mjs';
 import {loadSnapshot, msgidOf} from '../sync/snapshot.mjs';
 import {hydrateMeta} from './header-index.mjs';
 import {groupThreads} from './threads.mjs';
+import {buildMessage, sanitizeHtml, htmlToPlain} from './compose.mjs';
 import postalMime from '/core/parser/postal-mime.mjs';
 
 // ---- resync reports (worker bookkeeping) -------------------------------------
@@ -66,6 +72,21 @@ function reportEdit(payload) {
   catch {
     /* extension context gone (reload/close) — the edit itself still ran */
   }
+}
+
+// ---- compose support ---------------------------------------------------------
+
+// Synthetic uids for locally-composed mail: seeded at Date.now() and
+// strictly increasing per session, they sit far above any server's
+// sequential uid space — the sync classifier never mistakes one for a
+// known server row, and the list view (newest uid first) tops out with
+// the message the user just wrote. The placeholder survives only until
+// the next sync's APPEND replaces the file with the canonical copy.
+let composeUidSeq = 0;
+
+function nextComposeUid() {
+  composeUidSeq = Math.max(composeUidSeq + 1, Date.now());
+  return composeUidSeq;
 }
 
 // ---- per-message metadata (persistent per-folder header index) ---------------
@@ -663,6 +684,53 @@ export function apiForStore(store, accountId) {
       }
       await store.folder(name.trim(), {create: true});
       reportEdit({accountId, srcDir: name.trim()});
+    },
+
+    /**
+     * Writes the compose dialog's message into one folder's new/ as a
+     * fresh unread mail file. The html arrives raw from the editor —
+     * sanitizeHtml reduces it to the basic tag set before the bytes are
+     * built, and the plain-text alternative derives from the sanitized
+     * markup. The sync engine then owns the rest: its next run sees a
+     * local-born file, APPENDs the bytes to the server folder, removes
+     * the local file and re-pulls the canonical copy under the server's
+     * uid — the placeholder uid this write returns is interim by design.
+     * @param {string} folder the destination (server-spelled) folder
+     *   name; falls back to the open dir
+     * @param {object} fields the dialog's {from, fromName, to, cc, bcc,
+     *   subject, html[, plain]} — bcc is accepted and never written
+     * @returns {Promise<number>} the interim uid
+     */
+    async composeMessage(folder, fields = {}) {
+      const target = normalizeFolderPath(
+        String(folder ?? selected ?? ''), store.delimiter);
+      if (!target) {
+        throw new Error('composeMessage: a folder is required');
+      }
+      // no silent resurrection: a folder that vanished while the dialog
+      // was open (a background sync deleted it) fails like openDir does
+      const maildir = await store.folder(target, {create: false});
+      if (!maildir) {
+        const err = new Error('no such mailbox: ' + target);
+        err.code = 'mirror';
+        throw err;
+      }
+      // empty body → no DOM parse at all; otherwise the editor's markup is
+      // reduced to the basic tag set and the plain alternative derives
+      // from the sanitized result
+      const rawHtml = String(fields.html ?? '');
+      const html = rawHtml ? sanitizeHtml(rawHtml) : '';
+      const plain = typeof fields.plain === 'string' && fields.plain.length
+        ? fields.plain
+        : (html ? htmlToPlain(html) : '');
+      const raw = buildMessage({...fields, html, plain});
+      const uid = nextComposeUid();
+      // no flags: the file lands in new/ as fresh unread mail
+      await writeFile(store.fs, maildir, target, uid, [], raw);
+      // the write's fs-event reconciles the views; the report marks the
+      // folder so the next scheduled/dir sync uploads the message
+      reportEdit({accountId, srcDir: target});
+      return uid;
     },
 
     async deleteDir(name) {

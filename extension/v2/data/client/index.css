@@ -115,7 +115,8 @@ body {
 
 #search-clear,
 #explorer-open,
-#layout-toggle {
+#layout-toggle,
+#compose-open {
   flex: none;
   min-height: calc(26px * var(--font-scale, 1));
   padding: calc(2px * var(--font-scale, 1)) calc(12px * var(--font-scale, 1));
@@ -247,7 +248,8 @@ body {
 
 #search-clear:hover,
 #explorer-open:hover,
-#layout-toggle:hover {
+#layout-toggle:hover,
+#compose-open:hover {
   border-color: var(--dim);
 }
 

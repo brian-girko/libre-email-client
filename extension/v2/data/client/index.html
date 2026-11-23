@@ -14,6 +14,9 @@
     <directory-view id="dirs" title="Folders — Alt+1 focus · ↑/↓ select · →/← expand/collapse · Enter open"></directory-view>
     <main id="mails">
       <div id="mails-bar">
+        <button id="compose-open" type="button" accesskey="c"
+                title="Compose a new message in the selected folder (C)"
+                aria-label="Compose a new message in the selected folder (C)"><u>C</u>ompose</button>
         <input id="mail-search" type="text" role="searchbox"
                placeholder="Search mail…  from: to: subject: since: …"
                aria-label="Search mail (server-side)" spellcheck="false" autocomplete="off">
@@ -50,6 +53,7 @@
     </main>
   </div>
   <prompt-view id="prompt" hidden></prompt-view>
+  <compose-view id="compose"></compose-view>
   <dialog id="client-prefs">
     <div class="prefs-head">Client settings</div>
     <div class="prefs-row">
